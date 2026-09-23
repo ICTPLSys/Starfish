@@ -1,0 +1,8 @@
+# Legacy and unpublished runtime material is intentionally excluded from the
+# public NonFT source drop.
+/runtime/nonft/benchmark/
+/runtime/nonft/configs/
+/runtime/nonft/docs/
+/runtime/nonft/scripts/
+/runtime/nonft/test/
+/runtime/nonft/tests/
