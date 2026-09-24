@@ -35,9 +35,11 @@ protected:
                 this->idx = GroupSize - 1;
                 this->cursor--;
             } else {
-                index_type offset = (this->idx - (index_type)GroupSize + 1) /
-                                    (index_type)GroupSize;
-                this->idx %= GroupSize;
+                // Keep negative offsets signed and normalize into the group.
+                const index_type group_size = static_cast<index_type>(GroupSize);
+                const index_type offset =
+                    (this->idx - group_size + 1) / group_size;
+                this->idx -= offset * group_size;
                 this->cursor += offset;
             }
         } else if (pos_overflow_ensure || (!ensure && this->idx >= GroupSize)) {

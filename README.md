@@ -25,8 +25,8 @@ will be provided through WireGuard.
 - ✅ Non-FT system code
 - ✅ Design functionality
 - ✅ Recovery functionality
-- ✅ Prepared application code: LLM, BFS, and WC
-- 🔄 Applications being organized: KV, MG, NQ
+- ✅ Prepared application code: LLM, BFS, WC, and MG
+- 🔄 Applications being organized: KV, NQ
 - ✅ One-command run and plotting script
 - 🔄 Carbink — being organized
 - ✅ Hydra

@@ -114,9 +114,16 @@ if [[ "$ENABLE_PAPI" = 1 ]]; then
 else
   PAPI_OPTIONS=(-DPAPI_INCLUDE_DIR:PATH=OFF -DPAPI_LIBRARY:FILEPATH=OFF)
 fi
+APP_OPTIONS=()
+for target in "${TARGETS[@]}"; do
+  case "$target" in
+    mg|test_mg_iterator_boundaries) APP_OPTIONS=(-DFARLIB_BUILD_MG=ON); break ;;
+  esac
+done
+
 configure=(cmake -S "$RUNTIME_DIR" -B "$BUILD_DIR" "${GENERATOR[@]}"
   -DCMAKE_BUILD_TYPE=Release -DFARLIB_BUILD_TESTS=OFF
-  "${PAPI_OPTIONS[@]}" "${HDR_OPTIONS[@]}")
+  "${PAPI_OPTIONS[@]}" "${HDR_OPTIONS[@]}" "${APP_OPTIONS[@]}")
 build=(cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j "$JOBS")
 
 printf 'system: %s\nruntime: %s\nbuild: %s\ntargets: %s\njobs: %s\n' \
