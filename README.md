@@ -1,5 +1,7 @@
 # Starfish Artifact Evaluation
 
+Reproducing this system requires multiple machines connected by 100 Gbps InfiniBand (eight machines in the paper).
+
 🚧 **Notice! This repo is still under construction!**
 
 The code is still being organized and will be filled in ASAP before the Kick
@@ -23,10 +25,11 @@ will be provided through WireGuard.
 - ✅ Non-FT system code
 - ✅ Design functionality
 - ✅ Recovery functionality
-- ✅ Prepared application code: LLaMA, BFS, and MG
-- 🔄 One-command run and plotting script — being organized
+- ✅ Prepared application code: LLM, BFS, and WC
+- 🔄 Applications being organized: KV, MG, NQ
+- ✅ One-command run and plotting script
 - 🔄 Carbink — being organized
-- 🔄 Hydra — being organized
+- ✅ Hydra
 
 ## (2) First functional check
 
