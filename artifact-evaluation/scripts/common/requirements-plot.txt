@@ -1,0 +1,2 @@
+matplotlib>=3.6,<4
+pandas>=1.5,<3  # Original Appendix benchmark-suite script uses pandas.read_csv.

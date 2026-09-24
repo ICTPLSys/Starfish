@@ -330,7 +330,10 @@ size_t get_registered_thread_id() {
         const size_t bytes = static_cast<size_t>(n) < sizeof(record)
                                  ? static_cast<size_t>(n)
                                  : sizeof(record) - 1;
-        (void)::write(STDERR_FILENO, record, bytes);
+        // Role reporting is best effort; a logging failure must not change
+        // worker registration or the benchmark's control flow.
+        const ssize_t written = ::write(STDERR_FILENO, record, bytes);
+        (void)written;
     }
     return client_id;
 }

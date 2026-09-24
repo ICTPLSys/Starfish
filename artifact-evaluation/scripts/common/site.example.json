@@ -1,0 +1,18 @@
+{
+  "name": "two-server-example",
+  "memory_host": "CHANGE_MEMORY_SSH_HOST",
+  "memory_addr": "192.0.2.10",
+  "memory_server_bins": {
+    "nonft": "/path/to/memory/build/nonft/server"
+  },
+  "remote_run_root": "/tmp/starfish-ae-runs",
+  "server_port": 1893,
+  "ib_device": "mlx5_1",
+  "memory_ib_device": "mlx5_1",
+  "server_start_wait_s": 5,
+  "inputs": {
+    "llama": "/path/to/llama2_7b_chat.bin",
+    "llama_tokenizer": "/path/to/tokenizer.bin",
+    "bfs": "/path/to/graph"
+  }
+}

@@ -259,8 +259,11 @@ struct Configure {
     }
     
     void self_check() {
-        std::cerr << max_thread_cnt * qp_count * qp_send_cap << std::endl;
         post_process_config();
+        if (ft_method != "none") {
+            std::cerr << "Error: Non-FT only supports ft_method none" << std::endl;
+            std::abort();
+        }
         // ASSERT(cq_entries >= max_thread_cnt * qp_count * qp_send_cap);
         // ASSERT(server_buffer_size >= client_buffer_size);
         std::cout << "cq_entries " << cq_entries << std::endl;

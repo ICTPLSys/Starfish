@@ -1,8 +1,7 @@
 # Design 1 runtime code
 
-This directory contains only the Region-level Design 1 policy and its direct
-runtime integration. Generic cache, GC, RDMA, and Region-list mechanisms stay
-outside this directory.
+This directory contains Region-level placement policy and its direct runtime
+integration. The Non-FT recipe disables selective backup by design.
 
 ## Data flow
 
@@ -28,23 +27,3 @@ outside this directory.
   while holding the Region placement lock before changing a Region.
 - Physical Region reclassification and object-level fetch placement use
   different names. Do not call both operations promotion or demotion.
-
-## Local style
-
-- Types use `PascalCase`; functions and variables use `snake_case`; constants
-  use `kPascalCase`.
-- Quantities carry units in their names: `_bytes`, `_byte_work`, `_count`,
-  `_cycles`, or `_pct`.
-- Pure policy functions take explicit inputs and return explicit results.
-- Runtime methods separate decision, execution, accounting, and diagnostics.
-- New functions should normally remain below 100 lines.
-- Functional atomics document why acquire/release ordering is required;
-  statistics use relaxed ordering.
-- Existing configuration names and output keys remain stable for experiment
-  reproducibility.
-
-## Tests
-
-Pure policy tests must not require RDMA hardware. Runtime integration tests
-must cover requested-versus-actual placement, backup reconciliation, Region
-reclassification accounting, and shutdown ownership invariants.

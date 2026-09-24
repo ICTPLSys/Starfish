@@ -1,0 +1,157 @@
+#ifndef CONFIG
+#define CONFIG(TYPE, VAR, DEFAULT)
+#endif
+// Configure of RDMA
+CONFIG(int, cq_entries, 1024)
+CONFIG(uint32_t, qp_send_cap, 128)
+CONFIG(uint32_t, qp_recv_cap, 128)
+CONFIG(uint32_t, qp_max_send_sge, 32)
+CONFIG(uint32_t, qp_max_recv_sge, 32)
+CONFIG(uint8_t, qp_max_rd_atomic, 16)
+CONFIG(int /* ibv_mtu */, qp_mtu, IBV_MTU_4096)
+CONFIG(uint8_t, qp_min_rnr_timer, 12 /* 0.64 milliseconds delay */)
+CONFIG(uint8_t, qp_timeout, 8 /* 1048.576 usec (0.00104 sec) */)
+CONFIG(uint8_t, qp_retry_cnt, 7)
+CONFIG(uint8_t, qp_rnr_retry, 7)
+CONFIG(uint8_t, ib_port, 1)
+CONFIG(std::string, ib_device_name, "")
+CONFIG(std::string, server_addr, "127.0.0.1")
+CONFIG(std::string, server_port, "50000")
+
+// Multi-endpoint configuration (backward compatible)
+CONFIG(int, server_count, 1)
+CONFIG(std::string, server_addrs, "")
+CONFIG(std::string, server_ports, "")
+CONFIG(std::string, remote_mapping, "range")  // range | stripe
+CONFIG(size_t, stripe_size_bytes, 0)
+// ---------------------------------------------------------------------------
+// Fault-tolerance / erasure-coding (EC) layout configuration.
+//
+// Phase 1 (this build): ft_method defaults to "none".  "none", "sponge" and
+// "ec_batch" are the only accepted values; an illegal combination (no
+// exclusive_cache, too few servers, not exactly 4+2, a shard size other than
+// the region size, a zero cutoff, an unknown method) fails fast in
+// Configure::self_check() with a clear message and a non-zero exit status.  A
+// *legal* ft_method != none combination is accepted.
+//   sponge   the ported single-object EC stripe layout; the write path and the
+//            ACK are NOT implemented yet.
+//   ec_batch the batched group path: eviction gathers four objects <= the
+//            small-object cutoff, the client encodes RS(4,2) locally with the
+//            ported GF(2^8) codec and writes the six segments to six distinct
+//            endpoints -> server_count >= 6 is required (or >= 7 when
+//            ft_standby_endpoint is enabled). The client-side staging pool
+//            batches objects and tracks completion of all segment writes.
+// ---------------------------------------------------------------------------
+CONFIG(std::string, ft_method, "none")  // none | sponge | ec_batch
+CONFIG(size_t, ft_small_object_cutoff, 4096)
+// Shard size of one EC shard.  Must equal the library's region size
+// (include/cache/region_based_allocator.hpp: RegionSize == 256 KiB); the
+// equality is enforced by a static_assert in
+// include/cache/alloc/small_object_stripe.hpp.
+CONFIG(size_t, ft_small_stripe_shard_size_bytes, 256 * 1024)
+CONFIG(size_t, ft_ec_data_shards, 4)
+CONFIG(size_t, ft_ec_parity_shards, 2)
+// Optional ec_batch standby endpoint.  The endpoint is still configured and
+// connected with server_count at startup, but is excluded from new EC
+// allocations until a live endpoint is reported dead.  -1 keeps the legacy
+// no-standby placement policy.
+CONFIG(int, ft_standby_endpoint, -1)
+
+// Configure of Server & Client
+CONFIG(uint16_t, qp_count, 1)
+CONFIG(size_t, server_buffer_size, 1024 * 1024 * 1024)
+CONFIG(size_t, client_buffer_size, 16 * 1024 * 1024)
+CONFIG(size_t, evict_batch_size, 256 * 1024)
+CONFIG(size_t, check_cq_batch_size, 16)
+CONFIG(size_t, max_thread_cnt, 1)
+// Runtime default: reserve six background workers for evacuation.
+CONFIG(size_t, evacuate_thread_cnt, 6)
+// Runtime default: keep eviction work available to the background path.
+CONFIG(bool, enable_eager_evict, true)
+// Exclusive caching is the default; set 0 explicitly for inclusive-cache comparisons.
+CONFIG(bool, exclusive_cache, true)
+CONFIG(bool, enable_selective_backup, false)
+CONFIG(size_t, remote_backup_budget_bytes, 0)
+CONFIG(size_t, remote_backup_budget_pct, 10)
+CONFIG(std::string, remote_backup_mode, "greedy")  // greedy | segmented | profiled | object_profiled
+// Physical local-allocation bytes reserved for non-evictable resident objects.
+CONFIG(size_t, local_resident_budget_bytes, 0)
+// Profiled mode publishes one behavior-group score per eviction window.
+CONFIG(bool, enable_logical_object_profile, false)
+CONFIG(size_t, logical_object_profile_sample_shift, 6)
+CONFIG(size_t, remote_backup_profile_window_events, 4096)
+CONFIG(size_t, remote_backup_profile_min_score_pct, 50)
+// Online resident-set replanning. Manual mode retains the owner-level test API;
+// automatic mode groups allocations into bounded placement cohorts.
+CONFIG(bool, enable_resident_profile_planner, false)
+// Keep group registration active during initialization, but defer reference
+// sampling and automatic planner scans/publication until the application has
+// entered a profile::start_work()/end_work() interval.
+CONFIG(bool, resident_profile_require_work_phase, false)
+// Freeze periodic replanning after the first committed placement exchange.
+// Workloads without an application-visible phase boundary can use this as a
+// bounded online policy rather than relying on an iteration oracle.
+CONFIG(bool, resident_profile_stop_after_first_commit, false)
+CONFIG(bool, resident_profile_apply_plan, true)
+CONFIG(bool, resident_profile_manual_trigger, false)
+CONFIG(size_t, resident_profile_warmup_ms, 1000)
+CONFIG(size_t, resident_profile_sample_shift, 6)
+// A nonresident owner must be this much hotter to displace resident data.
+CONFIG(size_t, resident_profile_migration_hysteresis_pct, 5)
+CONFIG(size_t, resident_profile_group_bytes, 256 * 1024)
+CONFIG(size_t, resident_profile_interval_ms, 1000)
+// Collect this many real profile snapshots before the first automatic plan.
+CONFIG(size_t, resident_profile_initial_sample_windows, 10)
+// Required predicted saved references per object whose target placement changes.
+CONFIG(size_t, resident_profile_min_benefit_refs_per_replacement_object, 4)
+CONFIG(size_t, resident_profile_write_weight, 2)
+CONFIG(size_t, resident_profile_ema_decay_shift, 1)
+CONFIG(size_t, resident_profile_migration_budget_pct, 5)
+// Optional cap on total object-level promotion + demotion operations in one
+// plan. Zero disables the object-count cap.
+CONFIG(size_t, resident_profile_migration_budget_objects, 0)
+CONFIG(bool, enable_region_resident_placement, false)
+// Rank physical regions by sampled demand accesses and actively exchange
+// whole Resident/Streaming regions. This mode does not bind regions to
+// logical behavior groups.
+CONFIG(bool, enable_region_hotness_placement, false)
+// Use behavior-group history only to choose the R/S generation for future
+// fetch allocations. Whole-region ranking remains the only migration policy.
+CONFIG(bool, enable_region_fetch_hotness_placement, false)
+// "hotness" is the simple baseline. "design1_gain" ranks R placement by
+// predicted avoided fetch bytes minus the paper's predicted saved clean-write
+// work from keeping the group in S with a remote-valid backup.
+CONFIG(std::string, region_fetch_placement_policy, "hotness")
+// Leave this fraction of the hard Resident Region budget unfilled during cold
+// initialization. Metadata-guided fetches may fill the one-time headroom back
+// up to the unchanged hard budget. Periodic planning preserves the current R
+// count instead of repeatedly demoting the newly fetched objects.
+CONFIG(size_t, region_fetch_resident_headroom_pct, 0)
+// Adapt the behavior-group profiling window when consecutive plans keep
+// changing the R/S boundary. The multiplier is relative to the resident
+// planner interval and grows without workload iteration hints.
+CONFIG(size_t, region_fetch_plan_max_window_multiplier, 16)
+// Pause only fallback-intent-driven R/S exchanges after two consecutive
+// target-plan windows whose mismatch reduction is smaller than this
+// percentage of promoted bytes. The independent Region-hotness planner keeps
+// running because its score and purpose are separate.
+CONFIG(size_t, region_fetch_min_reclassify_efficiency_pct, 25)
+// Keep false while regions are shared by all profile groups of the same R/S
+// placement. Group-homogeneous regions are a separate follow-up policy.
+CONFIG(bool, region_placement_bind_groups, false)
+
+// Evacuator mode controls.
+// Runtime default: use the optimized evacuation implementation.
+CONFIG(bool, optimized_evacuator, true)
+// Runtime default: two of the evacuation workers participate in marking.
+CONFIG(size_t, mark_thread_cnt, 2)
+CONFIG(std::string, profiling_method, "disabled")  // disabled | fine_grained | coarse_grained
+CONFIG(size_t, hybrid_profile_local_fast_path_sample_shift, 6)
+CONFIG(size_t, hybrid_profile_frequency_ema_shift, 3)
+CONFIG(size_t, hybrid_profile_frequency_ema_mark_interval, 1)
+CONFIG(std::string, reference_heat_split_mode, "object_count")  // object_count | access_weighted
+CONFIG(bool, enable_full_population_frequency_stats, false)
+CONFIG(size_t, full_population_frequency_scan_period_ms, 1000)
+CONFIG(size_t, evacuate_low_watermark_pct, 20)
+CONFIG(size_t, evacuate_high_watermark_pct, 80)
+CONFIG(size_t, evacuate_release_watermark_pct, 10)

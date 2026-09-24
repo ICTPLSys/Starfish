@@ -43,5 +43,49 @@ before the Kick the Tires deadline.
 
 ## Kick the Tires
 
-Detailed environment-preparation and Kick the Tires instructions will be
-provided in this section.
+Run the following commands from `artifact-evaluation/` on Linux x86-64.
+
+### 1. Check the environment and build
+
+On each server that needs a build, prepare dependencies and build Non-FT:
+
+```bash
+bash scripts/common/setup_environment.sh --with-plot --jobs 4
+bash scripts/common/check_environment.sh --system nonft --mode build
+bash scripts/common/build.sh --system nonft --jobs 4
+```
+
+### 2. Run
+
+Use a compute server and a memory server. `data/site.json` is a local site
+file (not an application or system config): it specifies the memory server's
+SSH host, RDMA address and binary, RDMA devices, and workload input paths.
+It is ignored by Git. Copy the template and edit it for your servers.
+For a quick functional check, run one LLaMA/Non-FT case at 25% local memory:
+
+```bash
+mkdir -p data
+cp -n scripts/common/site.example.json data/site.json
+# Edit data/site.json for your servers and inputs.
+bash scripts/figure9/run.sh --site data/site.json --apps llama \
+  --systems nonft --ratios 25 --repeats 1
+```
+
+To run LLaMA and BFS with Non-FT at all five local-memory ratios:
+
+```bash
+bash scripts/figure9/run.sh --site data/site.json --apps llama,bfs \
+  --systems nonft --ratios 13,25,50,75,100 --repeats 1
+```
+
+### 3. Plot
+
+The runner copies successful measurements to `data/figure9.csv`. Plot them
+with:
+
+```bash
+bash scripts/plot.sh figure9 --input data/figure9.csv
+```
+
+See [the scripts guide](artifact-evaluation/scripts/README.md) for detailed
+server setup, experiment options, and CSV formats.

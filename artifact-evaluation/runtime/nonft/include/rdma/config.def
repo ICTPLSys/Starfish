@@ -32,10 +32,12 @@ CONFIG(size_t, client_buffer_size, 16 * 1024 * 1024)
 CONFIG(size_t, evict_batch_size, 256 * 1024)
 CONFIG(size_t, check_cq_batch_size, 16)
 CONFIG(size_t, max_thread_cnt, 1)
-CONFIG(size_t, evacuate_thread_cnt, 1)
-CONFIG(bool, enable_eager_evict, false)
+CONFIG(size_t, evacuate_thread_cnt, 6)
+CONFIG(bool, enable_eager_evict, true)
 // Exclusive caching is the default; set 0 explicitly for inclusive-cache comparisons.
 CONFIG(bool, exclusive_cache, true)
+// Non-FT accepts an explicit identity in AE recipes but implements no FT mode.
+CONFIG(std::string, ft_method, "none")
 CONFIG(bool, enable_selective_backup, false)
 CONFIG(size_t, remote_backup_budget_bytes, 0)
 CONFIG(size_t, remote_backup_budget_pct, 10)
@@ -107,8 +109,8 @@ CONFIG(size_t, region_fetch_min_reclassify_efficiency_pct, 25)
 CONFIG(bool, region_placement_bind_groups, false)
 
 // Evacuator mode controls.
-CONFIG(bool, optimized_evacuator, false)
-CONFIG(size_t, mark_thread_cnt, 0)
+CONFIG(bool, optimized_evacuator, true)
+CONFIG(size_t, mark_thread_cnt, 2)
 CONFIG(std::string, profiling_method, "disabled")  // disabled | fine_grained | coarse_grained
 CONFIG(size_t, hybrid_profile_local_fast_path_sample_shift, 6)
 CONFIG(size_t, hybrid_profile_frequency_ema_shift, 3)

@@ -1141,7 +1141,7 @@ long time_in_ms() {
 
 void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
               char* prompt, int steps) {
-    char* empty_prompt = "";
+    char empty_prompt[] = "";
     if (prompt == NULL) {
         prompt = empty_prompt;
     }
@@ -1242,6 +1242,10 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 #define PROMPT_TOKENS_MEM_SIZE (PROMPT_TOKENS_SIZE * sizeof(int))
 void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
           char* cli_user_prompt, char* cli_system_prompt, int steps) {
+    FILE* capture_file = nullptr;
+    if (const char* capture_path = std::getenv("FARLIB_CAPTURE_CHAT_OUTPUT")) {
+        capture_file = std::fopen(capture_path, "wb");
+    }
     // buffers for reading the system prompt and user prompt from stdin
     // you'll notice they are soomewhat haphazardly and unsafely set atm
     char system_prompt[SYSTEM_PROMPT_SIZE];
@@ -1342,6 +1346,18 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
             // printf("decode: %lu\n", dend - dstart);
             safe_printf(piece);  // same as printf("%s", piece), but skips
                                  // "unsafe" bytes
+            if (capture_file != nullptr && piece != nullptr &&
+                piece[0] != '\0') {
+                bool capture_piece = true;
+                if (piece[1] == '\0') {
+                    unsigned char byte_val = piece[0];
+                    capture_piece = isprint(byte_val) || isspace(byte_val);
+                }
+                if (capture_piece) {
+                    std::fputs(piece, capture_file);
+                    std::fflush(capture_file);
+                }
+            }
             fflush(stdout);
         }
         if (next == 2) {
@@ -1354,6 +1370,9 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     printf("achieved tok/s: %lf\n",
            static_cast<double>(assistant_tokens) /
                (static_cast<double>(assistant_t) / 2.8 / 1e9));
+    if (capture_file != nullptr) {
+        std::fclose(capture_file);
+    }
     free(prompt_tokens);
 }
 
