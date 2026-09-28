@@ -129,6 +129,8 @@ retry:
         return BUSY;
     }
     if ((retry_count & 63u) == 0) {
+        profile::evict_breakdown::Scope yield_scope(
+            buffer_set.breakdown, profile::evict_breakdown::Stage::BackpressureYield);
         uthread::yield();
     }
     far_obj_t obj = block->obj_meta_data.load();
@@ -175,14 +177,6 @@ retry:
             }
 
             const auto &ft_config = ::FarLib::get_config();
-            // EC (ft_method=ec_batch) candidate gate: every small object must
-            // either be staged into an EC group or abort.  Staging readiness is
-            // checked after the move-lock by stage_ec_batch_object(); a failed
-            // candidate must never fall through to an unprotected flat write.
-            const bool ec_batch_candidate =
-                ft_config.is_ec_batch_mode() &&
-                ft_config.ft_small_object(obj.size);
-
             // Acquire move-lock (invalid bit) to serialize remote_addr mutation and
             // to prevent "interrupt eviction" once remote allocation begins.
             auto lock_state = old_state;
@@ -190,6 +184,14 @@ retry:
             if (!entry->cas_state_weak(old_state, lock_state)) [[unlikely]] {
                 goto retry;
             }
+            // Read the annotation under the SAME move lock as its publication.
+            // Ordinary protected objects still cannot fall back to flat writes
+            // on an EC staging failure; only an explicit annotation opts out.
+            const bool recomputable = entry->is_recomputable();
+            const bool ec_batch_candidate =
+                ft_config.is_ec_batch_mode() && !recomputable;
+            const auto behavior_group = remote_behavior_group(
+                *entry, reinterpret_cast<uintptr_t>(block));
             uint64_t remote_addr = entry->remote_addr();
 
             // Revalidate the clean backup while holding the same move-lock used
@@ -197,11 +199,13 @@ retry:
             // carry a reservation for its former data segment; if that segment
             // is on the failed endpoint, discard only that slot and continue
             // through the ordinary EC/flat writeback path below.  Other dead
-            // segments in the EC group do not affect this entry's own address.
-            if (selective_backup_enabled() && !lock_state.dirty &&
-                remote_addr != FarObjectEntry::RemoteAddrInvalid48 &&
-                entry->has_remote_backup_reservation()) {
-                if (!reuse_ec_recovery_endpoint_is_dead(remote_addr)) {
+            // segments do not invalidate a small object's own data copy. For
+            // split objects, the backup is the whole group, not just its anchor.
+            if (ec_backup_policy::can_reuse_clean_backup(
+                    selective_backup_enabled(), lock_state.dirty,
+                    remote_addr != FarObjectEntry::RemoteAddrInvalid48,
+                    entry->has_remote_backup_reservation())) {
+                if (!reuse_ec_recovery_endpoint_is_dead(remote_addr, obj.size)) {
                     auto remote_state = lock_state;
                     remote_state.invalid = 0;
                     remote_state.state = REMOTE;
@@ -234,10 +238,30 @@ retry:
                 remote_addr = FarObjectEntry::RemoteAddrInvalid48;
             }
 
+            // Recipe objects use the flat allocator, not an EC group.  If a
+            // prior failed write left their remote slot on a dead endpoint,
+            // invalidate and release that slot while the move-lock is still
+            // held.  The following healthy flat allocation is then selected
+            // by the allocator's endpoint-liveness filter; never post a new
+            // WRITE to the stale address.
+            if (recomputable &&
+                remote_addr != FarObjectEntry::RemoteAddrInvalid48 &&
+                reuse_ec_recovery_endpoint_is_dead(remote_addr, obj.size)) {
+                if (entry->has_remote_backup_reservation()) {
+                    entry->set_remote_backup_reservation(false);
+                    release_remote_backup_budget(obj.size);
+                    profile::count_remote_backup_invalidated(obj.size);
+                }
+                entry->set_remote_invalid();
+                remote_allocator.deallocate(remote_addr);
+                remote_addr = FarObjectEntry::RemoteAddrInvalid48;
+            }
+
             // Diagnostics only: count candidates that reach the writeback path.
             // Keep the clean-backup reuse fast path out of these write-gate
             // counters; it does not evaluate or stage an EC write.
-            if (ft_config.is_ec_batch_mode()) {
+            if (ft_config.is_ec_batch_mode() &&
+                (!recomputable || recomputable_diag_enabled_)) {
                 ec_candidate_checked_.fetch_add(1, std::memory_order_relaxed);
                 if (ec_batch_candidate) {
                     ec_candidate_true_.fetch_add(1, std::memory_order_relaxed);
@@ -247,17 +271,9 @@ retry:
             if (!ec_batch_candidate &&
                 remote_addr == FarObjectEntry::RemoteAddrInvalid48) {
                 auto alloc_start = get_cycles();
-                const auto behavior_group = ::FarLib::simple_region_budget::six_enabled()
-                    ? ((::FarLib::simple_region_heat::is_hot(
-                            ::FarLib::simple_region_heat::class_for(
-                                reinterpret_cast<uintptr_t>(block)))
-                            ? 3u
-                            : 0u) +
-                       entry->simple_dirty_class())
-                    : ::FarLib::simple_region_heat::grouping_enabled()
-                    ? ::FarLib::simple_region_heat::class_for(reinterpret_cast<uintptr_t>(block))
-                    : current_behavior_group(*entry);
-                remote_addr = allocate_remote(obj.size, behavior_group);
+                remote_addr = recomputable
+                    ? remote_allocator.allocate_flat(obj.size, behavior_group)
+                    : allocate_remote(obj.size, behavior_group);
                 profile::count_excl_remote_alloc_cycles(get_cycles() - alloc_start);
                 profile::count_excl_remote_alloc(obj.size);
                 entry->set_remote_addr(remote_addr);
@@ -271,6 +287,16 @@ retry:
                                     : behavior_group)));
             }
 
+            // Publish the routing hint before a postable group can complete
+            // and release this entry's write reference.
+            if (ec_batch_candidate &&
+                ::FarLib::simple_region_heat::grouping_enabled()) {
+                entry->set_simple_heat_hot(
+                    ::FarLib::simple_region_heat::is_hot(behavior_group));
+            }
+            const bool direct_source = ec_batch_candidate && buffer_set.direct_builder &&
+                !ec_batch_uses_split(obj.size) && obj.size <= 4096 &&
+                ::FarLib::allocator::try_borrow_ec_write_source(block);
             auto evict_state = lock_state;
             evict_state.invalid = 0;
             evict_state.dirty = 0;
@@ -280,6 +306,7 @@ retry:
             if (six_dirty_routing_enabled())
                 entry->set_six_pending_evict(old_state.dirty);
             if (!entry->cas_state_strong(lock_state, evict_state)) [[unlikely]] {
+                if (direct_source) ::FarLib::allocator::release_ec_write_source(block);
                 goto retry;
             }
             record_backup_group_eviction(obj.size, old_state.dirty);
@@ -288,9 +315,11 @@ retry:
             // The object is staged only after the EVICTING transition, so the
             // entry already owns its write reference before the group that
             // contains it can be posted.
+            buffer_set.staging_original_remote_addr = remote_addr;
             const bool ec_batch_grouped =
                 ec_batch_candidate &&
-                stage_ec_batch_object(block->get_object_ptr(), obj.size, entry);
+                stage_ec_batch_object(buffer_set, block->get_object_ptr(), obj.size, entry,
+                                      behavior_group);
             // Diagnostics only: candidate true, but staging/grouping failed.
             if (ec_batch_candidate && !ec_batch_grouped) {
                 ec_diag_stage_failed_.fetch_add(1, std::memory_order_relaxed);
@@ -304,7 +333,8 @@ retry:
                 // through the allocator, exactly as in the dirty branch below; a
                 // candidate never allocates a flat slot before this point, so
                 // remote_addr is either that old copy or unset.
-                if (remote_addr != FarObjectEntry::RemoteAddrInvalid48) {
+                if (remote_addr != FarObjectEntry::RemoteAddrInvalid48 &&
+                    !buffer_set.last_stage_owns_old_remote) {
                     remote_allocator.deallocate(remote_addr);
                 }
             } else if (!ec_batch_candidate &&
@@ -338,13 +368,22 @@ retry:
                     // ec_batch candidate whose grouping failed: keep the flat
                     // write path alive by allocating after the transition.
                     auto alloc_start = get_cycles();
-                    remote_addr = allocate_remote(obj.size);
+                    remote_addr = recomputable
+                        ? remote_allocator.allocate_flat(obj.size, behavior_group)
+                        : allocate_remote(obj.size, behavior_group);
                     profile::count_excl_remote_alloc_cycles(get_cycles() - alloc_start);
                     profile::count_excl_remote_alloc(obj.size);
                     entry->set_remote_addr(remote_addr);
                 }
                 add_write_request(buffer_set, block->get_object_ptr(),
                                   remote_addr, obj.size);
+                if (recomputable) {
+                    ASSERT(!remote_allocator.small_object_stripe_manager().owns(remote_addr));
+                    if (recomputable_diag_enabled_) {
+                        recomputable_flat_writebacks_.fetch_add(1, std::memory_order_relaxed);
+                        recomputable_flat_write_bytes_.fetch_add(obj.size, std::memory_order_relaxed);
+                    }
+                }
             }
             profile::count_obj_modifed();
             if (old_state.dirty) {
@@ -355,16 +394,54 @@ retry:
             return EVICTING;
         }
 
-        if (old_state.dirty) {
-            profile::count_evac_try_evict_marked_dirty();
+        const auto &inclusive_ft_config = ::FarLib::get_config();
+        const auto behavior_group = remote_behavior_group(
+            *entry, reinterpret_cast<uintptr_t>(block));
+        const bool recomputable = entry->has_recompute_recipe();
+        const bool recipe_rehome = recomputable && old_state.dirty &&
+            entry->remote_addr() != FarObjectEntry::RemoteAddrInvalid48;
+        // A non-zero ref count may still be an in-flight failed/successful
+        // WRITE.  Do not return its remote slot while DMA can still address
+        // it; let the final completion consume the reference first.
+        if (recipe_rehome && old_state.ref_cnt != 0) return BUSY;
+        const bool repair_split_backup =
+            inclusive_ft_config.is_ec_batch_mode() &&
+            ec_batch_uses_split(obj.size) &&
+            reuse_ec_recovery_endpoint_is_dead(entry->remote_addr(), obj.size);
+        if (old_state.dirty || repair_split_backup) {
+            if (old_state.dirty) profile::count_evac_try_evict_marked_dirty();
+            else profile::count_evac_try_evict_marked_clean();
+            uint64_t remote_addr = entry->remote_addr();
+            auto transition_state = old_state;
+            if (recipe_rehome) {
+                // Re-home all recipe dirty retries, not only the endpoint-dead
+                // case: the failed WRITE may have partially modified a
+                // healthy slot, so no old remote bytes are trusted.
+                transition_state.invalid = 1;
+                if (!entry->cas_state_weak(old_state, transition_state))
+                    goto retry;
+                if (entry->has_remote_backup_reservation()) {
+                    entry->set_remote_backup_reservation(false);
+                    release_remote_backup_budget(obj.size);
+                    profile::count_remote_backup_invalidated(obj.size);
+                }
+                entry->set_remote_invalid();
+                remote_allocator.deallocate(remote_addr);
+                remote_addr = FarObjectEntry::RemoteAddrInvalid48;
+            }
+            new_state = transition_state;
             new_state.dirty = 0;
             new_state.state = EVICTING;
             new_state.inc_ref_cnt();  // dec on rdma work completed
             entry->set_client_idx(rdma::thread_info.thread_id);
+            if (inclusive_ft_config.is_ec_batch_mode() && !recomputable &&
+                ::FarLib::simple_region_heat::grouping_enabled()) {
+                entry->set_simple_heat_hot(
+                    ::FarLib::simple_region_heat::is_hot(behavior_group));
+            }
             if (six_dirty_routing_enabled())
                 entry->set_six_pending_evict(old_state.dirty);
-            uint64_t remote_addr = entry->remote_addr();
-            if (!entry->cas_state_weak(old_state, new_state)) [[unlikely]] {
+            if (!entry->cas_state_weak(transition_state, new_state)) [[unlikely]] {
                 goto retry;
             }
             const auto &ft_config = ::FarLib::get_config();
@@ -375,8 +452,7 @@ retry:
             // Staging happens after the EVICTING transition, so the entry
             // already owns its write reference before the group is postable.
             const bool ec_batch_candidate =
-                ft_config.is_ec_batch_mode() &&
-                ft_config.ft_small_object(obj.size);
+                ft_config.is_ec_batch_mode() && !recomputable;
             // Diagnostics only: does this branch even evaluate the EC gate?
             if (ft_config.is_ec_batch_mode()) {
                 ec_candidate_checked_.fetch_add(1, std::memory_order_relaxed);
@@ -384,9 +460,11 @@ retry:
                     ec_candidate_true_.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            buffer_set.staging_original_remote_addr = remote_addr;
             const bool ec_batch_grouped =
                 ec_batch_candidate &&
-                stage_ec_batch_object(block->get_object_ptr(), obj.size, entry);
+                stage_ec_batch_object(buffer_set, block->get_object_ptr(), obj.size, entry,
+                                      behavior_group);
             if (ec_batch_candidate && !ec_batch_grouped) {
                 ec_diag_stage_failed_.fetch_add(1, std::memory_order_relaxed);
                 ERROR("ec_batch: candidate staging failed; refusing flat fallback");
@@ -400,7 +478,8 @@ retry:
                 // goes back only once its last live object is gone), a plain
                 // slot goes through mark_dead().  No allocator metadata is
                 // touched here.
-                if (remote_addr != FarObjectEntry::RemoteAddrInvalid48) {
+                if (remote_addr != FarObjectEntry::RemoteAddrInvalid48 &&
+                    !buffer_set.last_stage_owns_old_remote) {
                     remote_allocator.deallocate(remote_addr);
                 }
             } else if (!ec_batch_candidate &&
@@ -428,11 +507,32 @@ retry:
                     buffer_set, ft_config.map_remote_addr(remote_addr).first,
                     record);
             } else {
+                if (remote_addr == FarObjectEntry::RemoteAddrInvalid48) {
+                    auto alloc_start = get_cycles();
+                    remote_addr = recomputable
+                        ? remote_allocator.allocate_flat(obj.size, behavior_group)
+                        : allocate_remote(obj.size, behavior_group);
+                    profile::count_excl_remote_alloc_cycles(
+                        get_cycles() - alloc_start);
+                    profile::count_excl_remote_alloc(obj.size);
+                    entry->set_remote_addr(remote_addr);
+                }
                 add_write_request(buffer_set, block->get_object_ptr(),
                                   remote_addr, obj.size);
+                if (recomputable) {
+                    ASSERT(!remote_allocator.small_object_stripe_manager().owns(
+                        remote_addr));
+                    if (recomputable_diag_enabled_) {
+                        recomputable_flat_writebacks_.fetch_add(
+                            1, std::memory_order_relaxed);
+                        recomputable_flat_write_bytes_.fetch_add(
+                            obj.size, std::memory_order_relaxed);
+                    }
+                }
             }
             profile::count_obj_modifed();
-            profile::count_dirty_evict_bytes(obj.size);
+            if (old_state.dirty) profile::count_dirty_evict_bytes(obj.size);
+            else profile::count_clean_evict_bytes(obj.size);
             return EVICTING;
         } else {
             profile::count_evac_try_evict_marked_clean();

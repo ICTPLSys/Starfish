@@ -1,0 +1,41 @@
+{
+  "llama": {
+    "repository": "meta-llama/Llama-2-7b-chat",
+    "revision": "617522e5466cec3391aac2de97f4f9d5672ed05b",
+    "exporter_repository": "https://github.com/karpathy/llama2.c.git",
+    "exporter_revision": "350e04fe35433e6d2941dce5a1f53308f87058eb",
+    "files": {
+      "consolidated.00.pth": {
+        "size": 13476925163,
+        "sha256": "6234f92a9191a4887b65a7f14a9692b4af3beffa2a26359869daf36bdf71b8d8"
+      },
+      "params.json": {
+        "size": 102,
+        "git_blob": "6523f76675b50e9cf3a57d1fb135189abcffe1c7"
+      },
+      "tokenizer.model": {
+        "size": 499723,
+        "sha256": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347"
+      },
+      "LICENSE.txt": {
+        "size": 7020,
+        "git_blob": "51089e27e6764fb9f72c06a0f3710699fb6c9448"
+      },
+      "USE_POLICY.md": {
+        "size": 4766,
+        "git_blob": "abbcc199b2d1e4feb5d7e40c0bd67e1b0ce29e97"
+      }
+    }
+  },
+  "bfs": {
+    "url": "https://snap.stanford.edu/data/bigdata/communities/com-friendster.ungraph.txt.gz",
+    "size": 9371322431,
+    "sha256": "2efc60acf958220467b0bfc4ffcd2be9f46804dbfd9899e9796204d0ee41a5c6",
+    "checksum_source": "Archived SNAP download used by the original Friendster preparation",
+    "uncompressed_size": 32364651776,
+    "lines": 1806067139,
+    "nodes": 65608366,
+    "edges": 1806067135,
+    "parts": 32
+  }
+}

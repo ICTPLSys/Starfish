@@ -1,8 +1,7 @@
 # Appendix Figures 14 and 15: benchmark suites
 
 Both appendix plots read CSV files from an explicitly supplied directory.
-Absent access-amplification rows remain blank; they do not become a false
-1.0x value.
+Absent access-amplification rows remain blank.
 
 ```bash
 python3 scripts/appendix/plot.py access --data-dir data/benchmark_suites

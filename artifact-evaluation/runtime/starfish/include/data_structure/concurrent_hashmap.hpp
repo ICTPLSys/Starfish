@@ -23,6 +23,19 @@ namespace FarLib {
 template <typename Key, typename Val, typename Hash = std::hash<Key>>
 class ConcurrentHashMap {
 private:
+    using object_allocated_hook_t = void (*)(far_obj_t);
+    // The legacy allocation hook is intentionally kept unchanged for the
+    // existing applications.  A recipe hook additionally receives the
+    // allocation scope and the caller-owned recipe context/argument.  The
+    // hook runs only after both fields of KVData have been initialized.
+    using object_recipe_hook_t =
+        void (*)(far_obj_t, DereferenceScope &, const void *, uint64_t);
+
+public:
+    using recipe_hook_t = object_recipe_hook_t;
+
+private:
+
     struct KVData {
         Key key;
         Val val;
@@ -74,6 +87,26 @@ private:
     const uint32_t kHashMask_;
     const uint32_t kNumEntries_;
     std::unique_ptr<BucketEntry[]> buckets_;
+    object_allocated_hook_t object_allocated_hook_;
+    object_recipe_hook_t object_recipe_hook_;
+    const void *object_recipe_context_{nullptr};
+
+    void invoke_allocation_hooks(far_obj_t obj, DereferenceScope &scope,
+                                 bool invoke_recipe,
+                                 const void *recipe_context,
+                                 uint64_t recipe_arg) {
+        if (object_allocated_hook_ != nullptr) {
+            object_allocated_hook_(obj);
+        }
+        if (invoke_recipe && object_recipe_hook_ != nullptr &&
+            recipe_context != nullptr) {
+            object_recipe_hook_(obj, scope, recipe_context, recipe_arg);
+        }
+    }
+
+    bool put_impl(const Key &key, Val val, __DMH__, DereferenceScope &scope,
+                  bool invoke_recipe, const void *recipe_context,
+                  uint64_t recipe_arg);
 
     void do_remove(BucketEntry *bucket, BucketEntry *entry);
 
@@ -109,12 +142,29 @@ public:
         }();
         return enabled;
     }
-    ConcurrentHashMap(uint32_t num_entries_shift);
+    ConcurrentHashMap(uint32_t num_entries_shift,
+                      object_allocated_hook_t object_allocated_hook = nullptr,
+                      object_recipe_hook_t object_recipe_hook = nullptr);
     ~ConcurrentHashMap() = default;
+
+    void set_recipe_context(const void *context) {
+        object_recipe_context_ = context;
+    }
+
+    // These layout accessors let an application recipe restore the exact
+    // key/value byte image without making KVData public or rebuilding a map.
+    static constexpr size_t kv_data_size() { return sizeof(KVData); }
+    static constexpr size_t kv_key_offset() { return offsetof(KVData, key); }
+    static constexpr size_t kv_value_offset() {
+        return offsetof(KVData, val);
+    }
+
 
     bool get(const Key &key, Val *val, __DMH__, DereferenceScope &scope,
              bool debug_locked = false);
     bool put(const Key &key, Val val, __DMH__, DereferenceScope &scope);
+    bool put_recipe(const Key &key, Val val, uint64_t recipe_arg,
+                    __DMH__, DereferenceScope &scope);
     bool remove(const Key &key, __DMH__, DereferenceScope &scope);
     template <typename Fn>
     void for_each_locked(Fn &&fn, __DMH__, DereferenceScope &scope);
@@ -144,6 +194,12 @@ public:
         ON_MISS_BEGIN
         ON_MISS_END
         return put(key, val, __on_miss__, scope);
+    }
+    bool put_recipe(const Key &key, Val val, uint64_t recipe_arg,
+                    DereferenceScope &scope) {
+        ON_MISS_BEGIN
+        ON_MISS_END
+        return put_recipe(key, val, recipe_arg, __on_miss__, scope);
     }
     bool remove(const Key &key, DereferenceScope &scope) {
         ON_MISS_BEGIN
@@ -466,6 +522,8 @@ public:
             // Write object.
             data->key = *Context::get_key();
             data->val = Context::get_value();
+            hash_map->invoke_allocation_hooks(final_entry->ptr.obj(), scope,
+                                              false, nullptr, 0);
 
             // Update the bitmap of the final bucket.
             assert(!bucket->has_bitmap(1u << distance_to_orig_bucket));
@@ -799,6 +857,8 @@ public:
             // Write object.
             data->key = std::move(key);
             data->val = std::move(val);
+            map->invoke_allocation_hooks(final_entry->ptr.obj(), scope,
+                                         false, nullptr, 0);
 
             // Update the bitmap of the final bucket.
             assert(!bucket->has_bitmap(1u << distance_to_orig_bucket));
@@ -814,9 +874,13 @@ public:
 
 template <typename Key, typename Val, typename Hash>
 inline ConcurrentHashMap<Key, Val, Hash>::ConcurrentHashMap(
-    uint32_t num_entries_shift)
+    uint32_t num_entries_shift,
+    object_allocated_hook_t object_allocated_hook,
+    object_recipe_hook_t object_recipe_hook)
     : kHashMask_((1 << num_entries_shift) - 1),
-      kNumEntries_((1 << num_entries_shift) + kNeighborhood), size(0) {
+      kNumEntries_((1 << num_entries_shift) + kNeighborhood),
+      object_allocated_hook_(object_allocated_hook),
+      object_recipe_hook_(object_recipe_hook), size(0) {
     assert(((kHashMask_ + 1) >> num_entries_shift) == 1);
     buckets_.reset(new BucketEntry[kNumEntries_]);
 }
@@ -896,9 +960,23 @@ inline bool ConcurrentHashMap<Key, Val, Hash>::get(const Key &key, Val *val,
 }
 
 template <typename Key, typename Val, typename Hash>
-inline bool ConcurrentHashMap<Key, Val, Hash>::put(const Key &key, Val val,
-                                                   __DMH__,
-                                                   DereferenceScope &scope) {
+inline bool ConcurrentHashMap<Key, Val, Hash>::put(
+    const Key &key, Val val, __DMH__, DereferenceScope &scope) {
+    return put_impl(key, std::move(val), __on_miss__, scope, false, nullptr, 0);
+}
+
+template <typename Key, typename Val, typename Hash>
+inline bool ConcurrentHashMap<Key, Val, Hash>::put_recipe(
+    const Key &key, Val val, uint64_t recipe_arg, __DMH__,
+    DereferenceScope &scope) {
+    return put_impl(key, std::move(val), __on_miss__, scope, true,
+                    object_recipe_context_, recipe_arg);
+}
+
+template <typename Key, typename Val, typename Hash>
+inline bool ConcurrentHashMap<Key, Val, Hash>::put_impl(
+    const Key &key, Val val, __DMH__, DereferenceScope &scope,
+    bool invoke_recipe, const void *recipe_context, uint64_t recipe_arg) {
     // 1. get bucket index
     uint32_t hash = get_hash(key);
     uint32_t bucket_idx = hash & kHashMask_;
@@ -1011,6 +1089,8 @@ inline bool ConcurrentHashMap<Key, Val, Hash>::put(const Key &key, Val val,
     // Write object.
     data->key = key;
     data->val = std::move(val);
+    invoke_allocation_hooks(final_entry->ptr.obj(), scope, invoke_recipe,
+                            recipe_context, recipe_arg);
 
     // Update the bitmap of the final bucket.
     assert(!bucket->has_bitmap(1u << distance_to_orig_bucket));
@@ -1119,7 +1199,6 @@ inline void ConcurrentHashMap<Key, Val, Hash>::for_each_readonly_parallel(
     int64_t fetch_reads = 0, fetch_read_bytes = 0;
     int64_t fetch_writes = 0, fetch_write_bytes = 0;
     const auto start = std::chrono::steady_clock::now();
-    wc_object_diag::begin_capture();
     while (next_bucket <= kHashMask_) {
         entries.clear();
         auto part_start = std::chrono::steady_clock::now();
@@ -1154,20 +1233,15 @@ inline void ConcurrentHashMap<Key, Val, Hash>::for_each_readonly_parallel(
             [&](size_t i, auto &scope) {
                 ON_MISS_BEGIN
                 ON_MISS_END
-                auto *wc_sample = wc_object_diag::begin(
-                    visited + i, batches, entries[i]->ptr.obj().obj_id);
                 LiteAccessor<KVData> data =
                     access_entry(entries[i], __on_miss__, scope);
-                wc_object_diag::access_done(wc_sample);
                 assert(!data.is_null());
                 // Copy while the reader scope protects this payload; no far
                 // pointer or accessor escapes to the serial consumer.
                 items[i] = {data->key, data->val};
-                wc_object_diag::finish(wc_sample);
             });
         const auto fetch_stop = std::chrono::steady_clock::now();
         fetch_s += std::chrono::duration<double>(fetch_stop - part_start).count();
-        wc_object_diag::window("parallel_fetch", batches, part_start, fetch_stop);
         fetch_reads += profile::collect_rdma_read_post_count() - r0;
         fetch_read_bytes += profile::collect_rdma_read_post_bytes() - rb0;
         fetch_writes += profile::collect_rdma_write_post_count() - w0;
@@ -1184,7 +1258,6 @@ inline void ConcurrentHashMap<Key, Val, Hash>::for_each_readonly_parallel(
     }
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
-    wc_object_diag::end_capture();
     std::fprintf(stderr,
         "wc_parallel_scan_diag readers=%zu visited=%zu batches=%zu "
         "batch_limit=%zu peak_items=%zu staging_capacity_bytes=%zu "

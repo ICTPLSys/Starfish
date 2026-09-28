@@ -3,9 +3,11 @@
 // GF(2^8) Reed-Solomon codec for the small-object EC stripe (4 data + 2 parity
 // shards, one shard == one remote region).
 //
-// This is the *physical* parity layer that phase 1 deliberately left as a stub
-// (see SmallObjectStripeEncoder at the bottom of small_object_stripe.hpp).  It
-// is a port of G1
+// Production full-group encoding uses ISA-L with the same G1 coefficients and
+// field polynomial. Coefficient expansion is process-once, prewarmed during EC
+// runtime initialization; workers only read the resulting tables. The scalar
+// helpers below remain for legacy delta operations and recovery/reference code.
+// The original scalar arithmetic is a port of G1
 // (starfish-design3-20260824/include/rdma/sponge_rpc.hpp); the mapping is:
 //
 //   G1 site                                       here
@@ -45,9 +47,17 @@
 
 #include <array>
 #include <cassert>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+
+#if __has_include(<isa-l/erasure_code.h>)
+#include <isa-l/erasure_code.h>
+#else
+#include <erasure_code.h>
+#endif
 
 namespace FarLib::cache {
 
@@ -326,35 +336,84 @@ inline void small_object_stripe_combine_bytes(const uint8_t *const *srcs,
 // Encode.
 // ---------------------------------------------------------------------------
 
-// G1 sponge_encode_parity_delta_bytes (sponge_rpc.hpp:890-917), copied apart
-// from the G1-only byte-count guard (G1 caps a batch at 32 KiB; a stripe shard
-// is 256 KiB here).
+namespace detail {
+struct SmallObjectStripeIsaLEncodeTables {
+    alignas(64) uint8_t bytes[32 * kStripeCodecDataShards *
+                              kStripeCodecParityShards]{};
+    alignas(64) uint8_t delta[kStripeCodecDataShards][32 * kStripeCodecParityShards]{};
+
+    SmallObjectStripeIsaLEncodeTables() {
+        // Preserve the exact existing wire/recovery format. No matrix
+        // generation or coefficient expansion is performed per group.
+        uint8_t coefficients[kStripeCodecParityShards * kStripeCodecDataShards] = {
+            1, 1, 1, 1,
+            1, 2, 4, 8,
+        };
+        ec_init_tables(kStripeCodecDataShards, kStripeCodecParityShards,
+                       coefficients, bytes);
+        for (size_t shard = 0; shard < kStripeCodecDataShards; ++shard) {
+            // ISA-L stores 32 expanded bytes per matrix coefficient, row-
+            // major. Gather the two entries of this column without another
+            // coefficient/matrix initialization.
+            std::memcpy(delta[shard], bytes + shard * 32, 32);
+            std::memcpy(delta[shard] + 32,
+                        bytes + (kStripeCodecDataShards + shard) * 32, 32);
+        }
+    }
+};
+
+inline const SmallObjectStripeIsaLEncodeTables &small_object_stripe_isal_tables() {
+    // Thread-safe cold initialization for standalone codec callers. The EC
+    // runtime prewarms this before workers start, so no initialization lock is
+    // taken on its encode path. The tables are immutable after construction.
+    static const SmallObjectStripeIsaLEncodeTables tables;
+    return tables;
+}
+}  // namespace detail
+
+inline void small_object_stripe_initialize_encoder() {
+    (void)detail::small_object_stripe_isal_tables();
+}
+
+// ISA-L incremental encoding uses the SAME generator columns as full encode.
+// Tables are expanded once above, never once per slot/transaction.
 inline bool small_object_stripe_encode_parity_delta(uint8_t data_shard_idx,
                                                     const uint8_t *data_delta,
                                                     size_t byte_count,
                                                     uint8_t *parity0_delta,
                                                     uint8_t *parity1_delta) {
     if (data_shard_idx >= kStripeCodecDataShards || data_delta == nullptr ||
-        parity0_delta == nullptr || parity1_delta == nullptr) {
+        parity0_delta == nullptr || parity1_delta == nullptr ||
+        byte_count > static_cast<size_t>(INT_MAX)) {
         return false;
     }
-    const auto &lut = small_object_stripe_shard_parity_lut(data_shard_idx);
-    if (lut.coef[0] == 1 && lut.coef[1] == 1) {
-        std::memcpy(parity0_delta, data_delta, byte_count);
-        std::memcpy(parity1_delta, data_delta, byte_count);
-        return true;
-    }
-    if (lut.coef[0] == 1) {
-        std::memcpy(parity0_delta, data_delta, byte_count);
-        small_object_stripe_apply_bytes_with_lut(data_delta, byte_count,
-                                                 lut.mul[1], lut.mul16[1],
-                                                 parity1_delta);
-        return true;
-    }
-    small_object_stripe_apply_bytes_with_lut(data_delta, byte_count, lut.mul[0],
-                                             lut.mul16[0], parity0_delta);
-    small_object_stripe_apply_bytes_with_lut(data_delta, byte_count, lut.mul[1],
-                                             lut.mul16[1], parity1_delta);
+    if (byte_count == 0) return true;
+    const auto &tables = detail::small_object_stripe_isal_tables();
+    uint8_t *source[] = {const_cast<uint8_t *>(data_delta)};
+    uint8_t *parity[] = {parity0_delta, parity1_delta};
+    ec_encode_data(static_cast<int>(byte_count), 1, 2,
+                   const_cast<uint8_t *>(tables.delta[data_shard_idx]), source, parity);
+    return true;
+}
+
+// RMW parity accumulation. Reuse the full matrix's existing expanded column
+// directly: old_parity ^= coefficient[column] * data_delta. Outputs already
+// contain old parity; there is no temporary parity-delta write/read pass.
+inline bool small_object_stripe_update_parity(uint8_t data_shard_idx,
+                                              const uint8_t *data_delta,
+                                              size_t byte_count,
+                                              uint8_t *parity0,
+                                              uint8_t *parity1) {
+    if (data_shard_idx >= kStripeCodecDataShards || data_delta == nullptr ||
+        parity0 == nullptr || parity1 == nullptr ||
+        byte_count > static_cast<size_t>(INT_MAX)) return false;
+    if (byte_count == 0) return true;
+    const auto &tables = detail::small_object_stripe_isal_tables();
+    uint8_t *parity[] = {parity0, parity1};
+    ec_encode_data_update(static_cast<int>(byte_count), kStripeCodecDataShards,
+                         kStripeCodecParityShards, data_shard_idx,
+                         const_cast<uint8_t *>(tables.bytes),
+                         const_cast<uint8_t *>(data_delta), parity);
     return true;
 }
 
@@ -368,6 +427,11 @@ inline bool small_object_stripe_encode_shards(
     const void *const data_shards[kStripeCodecDataShards],
     void *const parity_shards[kStripeCodecParityShards], size_t byte_count,
     size_t shard_offset = 0) {
+    if (data_shards == nullptr || parity_shards == nullptr ||
+        byte_count > static_cast<size_t>(INT_MAX) ||
+        shard_offset > std::numeric_limits<size_t>::max() - byte_count) {
+        return false;
+    }
     for (size_t j = 0; j < kStripeCodecDataShards; j++) {
         if (data_shards[j] == nullptr) {
             return false;
@@ -379,37 +443,22 @@ inline bool small_object_stripe_encode_shards(
         }
     }
 
-    for (size_t p = 0; p < kStripeCodecParityShards; p++) {
-        uint8_t *dst = static_cast<uint8_t *>(parity_shards[p]) + shard_offset;
-        bool assigned = false;
-        for (size_t j = 0; j < kStripeCodecDataShards; j++) {
-            const auto &lut = small_object_stripe_shard_parity_lut(
-                static_cast<uint8_t>(j));
-            const uint8_t coef = lut.coef[p];
-            if (coef == 0) {
-                continue;
-            }
-            const uint8_t *src =
-                static_cast<const uint8_t *>(data_shards[j]) + shard_offset;
-            if (coef == 1) {
-                if (assigned) {
-                    small_object_stripe_xor_bytes(src, byte_count, dst);
-                } else {
-                    std::memcpy(dst, src, byte_count);
-                }
-            } else if (assigned) {
-                small_object_stripe_xor_bytes_with_lut(
-                    src, byte_count, lut.mul[p], lut.mul16[p], dst);
-            } else {
-                small_object_stripe_apply_bytes_with_lut(
-                    src, byte_count, lut.mul[p], lut.mul16[p], dst);
-            }
-            assigned = true;
-        }
-        if (!assigned) {
-            std::memset(dst, 0, byte_count);
-        }
+    if (byte_count == 0) return true;
+    uint8_t *data[kStripeCodecDataShards];
+    uint8_t *parity[kStripeCodecParityShards];
+    for (size_t j = 0; j < kStripeCodecDataShards; ++j) {
+        // ISA-L's C interface lacks const qualifiers; it only reads sources
+        // and coefficient tables. Output is directly into the caller's parity.
+        data[j] = const_cast<uint8_t *>(
+            static_cast<const uint8_t *>(data_shards[j]) + shard_offset);
     }
+    for (size_t p = 0; p < kStripeCodecParityShards; ++p) {
+        parity[p] = static_cast<uint8_t *>(parity_shards[p]) + shard_offset;
+    }
+    const auto &tables = detail::small_object_stripe_isal_tables();
+    ec_encode_data(static_cast<int>(byte_count), kStripeCodecDataShards,
+                   kStripeCodecParityShards,
+                   const_cast<uint8_t *>(tables.bytes), data, parity);
     return true;
 }
 

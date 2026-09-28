@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <limits>
 
+#include "cache/entry_frequency.hpp"
+#include "cache/recompute_recipe.hpp"
+
 namespace FarLib {
 namespace allocator::six_group { struct Record; }
 
@@ -76,35 +79,50 @@ private:
     enum PlacementFlag : uint8_t {
         ResidentLocal = 1u << 0,
         RemoteBackupReserved = 1u << 1,
-        SimpleHeatHot = 1u << 2,
+        // Recovery owns bit 2.  Design-2 dirty evidence uses bits 3-7;
+        // keeping all of these in one byte preserves resident snapshots.
+        Recomputable = 1u << 2,
         SimpleDirtyScoreMask = 0x0fu << 3,
         SimpleDirtyScoreKnown = 1u << 7,
     };
     std::atomic<uint8_t> placement_flags{0};
+    // Heat is a routing hint, not placement identity.  Keep it in the one-byte
+    // alignment gap so Recovery's placement bit 2 remains Recomputable.
+    enum RoutingFlag : uint8_t {
+        SimpleHeatHot = 1u << 0,
+    };
+    std::atomic<uint8_t> routing_flags_{0};
     uint32_t logical_owner_id_{0};
     uint32_t resident_group_id_{0};
-    std::atomic<allocator::six_group::Record*> six_binding_{nullptr};
     std::atomic<uint8_t> six_pending_evict_{0};
     bool six_remote_committed_{false};
-    // Uses the two-byte alignment gap before frequency counters.  Zero means
-    // unsampled; the stable handle follows the logical object across entries.
     std::atomic<uint16_t> object_trace_slot_{0};
-    mutable std::atomic<uint32_t> window_frequency{0};
-    mutable std::atomic<uint32_t> ema_frequency{0};
-    mutable std::atomic<uint32_t> published_window_frequency{0};
-    mutable std::atomic<uint32_t> published_ema_frequency{0};
+    // Zero means unsampled; the stable handle follows the logical object
+    // across entries.
+    recompute::Binding recompute_binding_{};
 
-    static constexpr uint64_t MASK_HIGH = ((1L << 16) - 1) << 32;
-    static constexpr uint64_t MASK_LOW = (1L << 32) - 1;
+    static constexpr uint64_t MASK_HIGH = ((1ULL << 16) - 1) << 32;
+    static constexpr uint64_t MASK_LOW = (1ULL << 32) - 1;
     static constexpr uint32_t OFFS_LOW = 32;
 
 public:
+    FarObjectEntry() noexcept : recompute_binding_{} { set_free(); }
+
+    ~FarObjectEntry() {
+        release_recompute_recipe();
+        detail::EntrySixBindingStore::erase(this);
+        reset_frequency_profile();
+    }
+
+    FarObjectEntry(const FarObjectEntry &) = delete;
+    FarObjectEntry &operator=(const FarObjectEntry &) = delete;
+
     // One routing hint in an existing flag byte, not an object access counter.
     // Written under eviction move-lock; safe to read before the fetch CAS.
     bool simple_heat_hot() const {
-        return (placement_flags.load(std::memory_order_relaxed) & SimpleHeatHot)!=0;
+        return (routing_flags_.load(std::memory_order_relaxed) & SimpleHeatHot) != 0;
     }
-    void set_simple_heat_hot(bool hot) { update_placement_flag(SimpleHeatHot,hot); }
+    void set_simple_heat_hot(bool hot) { update_routing_flag(SimpleHeatHot, hot); }
 
     // The dirty dimension is a committed logical-eviction EWMA packed into
     // the spare placement-flag bits.  Zero is the Low prior: the first dirty
@@ -169,9 +187,12 @@ public:
     void set_object_trace_slot(uint16_t slot) {
         object_trace_slot_.store(slot, std::memory_order_relaxed);
     }
-    auto& six_binding() { return six_binding_; }
+    // Compatibility reference for the legacy fixed-six registry.  The
+    // semantic-six path does not call this method and therefore never creates
+    // the sidecar or takes its shard mutex.
+    auto& six_binding() { return detail::EntrySixBindingStore::binding(this); }
     allocator::six_group::Record* six_record() const {
-        return six_binding_.load(std::memory_order_acquire);
+        return detail::EntrySixBindingStore::load(this);
     }
     void set_six_pending_evict(bool dirty) {
         six_pending_evict_.store(dirty ? 2 : 1, std::memory_order_release);
@@ -186,8 +207,17 @@ public:
     }
     // Entry relocation changes no physical object or Region occupancy.
     void take_six_metadata_from(FarObjectEntry& other) {
-        six_binding_.store(other.six_binding_.exchange(nullptr),
-                           std::memory_order_release);
+        // The sidecar is keyed by Entry address; move the non-owning Record
+        // pointer before the source address is recycled.
+        auto *binding = detail::EntrySixBindingStore::exchange(&other, nullptr);
+        detail::EntrySixBindingStore::erase(this);
+        if (binding != nullptr)
+            detail::EntrySixBindingStore::store(this, binding);
+        // Accessor relocation uses this routine as the common metadata move;
+        // heat must follow the logical object even though it no longer shares
+        // the Recovery placement byte.
+        routing_flags_.store(other.routing_flags_.exchange(0),
+                             std::memory_order_release);
         six_pending_evict_.store(other.six_pending_evict_.exchange(0),
                                  std::memory_order_release);
         six_remote_committed_ = other.six_remote_committed_;
@@ -255,6 +285,122 @@ public:
         update_placement_flag(RemoteBackupReserved, reserved);
     }
 
+    bool is_recomputable() const {
+        return (placement_flags.load(std::memory_order_acquire) &
+                Recomputable) != 0;
+    }
+
+    bool has_recompute_recipe() const {
+        return recompute_binding_.inputs != nullptr;
+    }
+
+    recompute::Binding recompute_binding() const {
+        return recompute_binding_;
+    }
+
+    // Bind one immutable input set and callback before the entry has acquired
+    // its first remote address. The entry invalid bit is the existing per-entry
+    // move lock used to serialize this publication with eviction/moves.
+    bool try_bind_recompute_recipe(const recompute::Inputs &inputs,
+                                   recompute::EntryFn callback,
+                                   uint64_t arg) {
+        if (!inputs.valid() || callback == nullptr) return false;
+        recompute::InputState *input_state = inputs.input_state();
+        auto current = load_state();
+        for (;;) {
+            if (current.invalid) return false;
+            if (current.state != LOCAL && current.state != MARKED &&
+                current.state != PINNED) {
+                return false;
+            }
+
+            auto locked = current;
+            locked.invalid = 1;
+            if (!cas_state_weak(current, locked)) continue;
+
+            bool accepted = false;
+            if (remote_invalid() && !has_recompute_recipe() &&
+                input_state->register_callback(callback)) {
+                input_state->retain();
+                recompute_binding_ = {input_state, arg};
+                set_recomputable();
+                accepted = true;
+            }
+
+            auto unlocked = locked;
+            unlocked.invalid = 0;
+            if (accepted && unlocked.state == MARKED) {
+                unlocked.state = LOCAL;
+                unlocked.inc_hotness();
+            }
+            const bool restored = cas_state_strong(locked, unlocked);
+            assert(restored);
+            (void)restored;
+            return accepted;
+        }
+    }
+
+    // Drop the entry's intrusive InputState reference. The placement flag is
+    // intentionally left alone: reset/free clear flags as a separate step.
+    void release_recompute_recipe() noexcept {
+        recompute::InputState *input_state = recompute_binding_.inputs;
+        recompute_binding_ = {};
+        if (input_state != nullptr) input_state->release();
+    }
+
+    void clear_recompute_metadata() noexcept {
+        release_recompute_recipe();
+        update_placement_flag(Recomputable, false);
+    }
+
+    // Move both the recipe reference and Recovery's placement bit. The
+    // reference is transferred, rather than retained/released, before the
+    // source entry is cleared by an accessor move/free path.
+    void take_recompute_recipe_from(FarObjectEntry &source) noexcept {
+        if (this == &source) return;
+        release_recompute_recipe();
+        recompute_binding_ = source.recompute_binding_;
+        source.recompute_binding_ = {};
+        const bool source_recomputable = source.is_recomputable();
+        update_placement_flag(Recomputable, source_recomputable);
+        source.update_placement_flag(Recomputable, false);
+    }
+
+    // Publication is serialized by ConcurrentArrayCache's recovery entry
+    // operation. Recovery reserves placement_flags bit 2 for this identity.
+    void set_recomputable() {
+        update_placement_flag(Recomputable, true);
+    }
+
+    bool try_mark_recomputable_before_eviction(bool *newly_marked = nullptr) {
+        if (newly_marked != nullptr) *newly_marked = false;
+        auto current = load_state();
+        for (;;) {
+            if (current.state == FREE || current.state == BUSY) return false;
+            if (is_recomputable()) return true;
+            if (current.invalid || (current.state != LOCAL &&
+                current.state != MARKED && current.state != PINNED)) {
+                return false;
+            }
+            auto locked = current;
+            locked.invalid = 1;
+            if (!cas_state_weak(current, locked)) continue;
+            const bool accepted = remote_invalid();
+            if (accepted) set_recomputable();
+            auto unlocked = locked;
+            unlocked.invalid = 0;
+            if (accepted && unlocked.state == MARKED) {
+                unlocked.state = LOCAL;
+                unlocked.inc_hotness();
+            }
+            const bool restored = cas_state_strong(locked, unlocked);
+            assert(restored);
+            (void)restored;
+            if (newly_marked != nullptr) *newly_marked = accepted;
+            return accepted;
+        }
+    }
+
     uint8_t load_placement_flags() const {
         return placement_flags.load(std::memory_order_acquire);
     }
@@ -285,6 +431,17 @@ private:
             std::memory_order_relaxed));
     }
 
+    void update_routing_flag(uint8_t flag, bool enabled) {
+        uint8_t current = routing_flags_.load(std::memory_order_relaxed);
+        uint8_t desired;
+        do {
+            desired = enabled ? static_cast<uint8_t>(current | flag)
+                              : static_cast<uint8_t>(current & ~flag);
+        } while (!routing_flags_.compare_exchange_weak(
+            current, desired, std::memory_order_acq_rel,
+            std::memory_order_relaxed));
+    }
+
 public:
 
     void set_pinned(bool pinned = false) {
@@ -304,97 +461,56 @@ public:
 
     uint32_t load_window_frequency(
         std::memory_order order = std::memory_order::relaxed) const {
-        return window_frequency.load(order);
+        (void)order;
+        return detail::EntryFrequencyStore::load_window(this);
     }
 
     uint32_t load_ema_frequency(
         std::memory_order order = std::memory_order::relaxed) const {
-        return ema_frequency.load(order);
+        (void)order;
+        return detail::EntryFrequencyStore::load_ema(this);
     }
 
     uint32_t load_published_window_frequency(
         std::memory_order order = std::memory_order::relaxed) const {
-        return published_window_frequency.load(order);
+        (void)order;
+        return detail::EntryFrequencyStore::load_published_window(this);
     }
 
     uint32_t load_published_ema_frequency(
         std::memory_order order = std::memory_order::relaxed) const {
-        return published_ema_frequency.load(order);
+        (void)order;
+        return detail::EntryFrequencyStore::load_published_ema(this);
     }
 
     void add_window_frequency(uint32_t delta) const {
-        if (delta == 0) {
-            return;
-        }
-        auto current = window_frequency.load(std::memory_order_relaxed);
-        while (true) {
-            uint32_t next = current > FrequencyCounterMax - delta
-                                ? FrequencyCounterMax
-                                : current + delta;
-            if (window_frequency.compare_exchange_weak(
-                    current, next, std::memory_order_relaxed,
-                    std::memory_order_relaxed)) {
-                return;
-            }
-        }
+        detail::EntryFrequencyStore::add_window(this, delta);
     }
 
     bool try_add_window_frequency(uint32_t delta) const {
-        if (delta == 0) {
-            return true;
-        }
-        auto current = window_frequency.load(std::memory_order_relaxed);
-        uint32_t next = current > FrequencyCounterMax - delta
-                            ? FrequencyCounterMax
-                            : current + delta;
-        return window_frequency.compare_exchange_weak(
-            current, next, std::memory_order_relaxed,
-            std::memory_order_relaxed);
+        return detail::EntryFrequencyStore::try_add_window(this, delta);
     }
 
     uint32_t consume_window_frequency() const {
-        return window_frequency.exchange(0, std::memory_order_relaxed);
+        return detail::EntryFrequencyStore::consume_window(this);
     }
 
     void update_ema_frequency(uint32_t observed_frequency,
                               size_t ema_decay_shift) const {
-        auto current = ema_frequency.load(std::memory_order_relaxed);
-        while (true) {
-            uint32_t decay =
-                ema_decay_shift == 0 ? 0u : (current >> ema_decay_shift);
-            uint32_t next = current - decay;
-            next = next > FrequencyCounterMax - observed_frequency
-                       ? FrequencyCounterMax
-                       : next + observed_frequency;
-            if (ema_frequency.compare_exchange_weak(
-                    current, next, std::memory_order_relaxed,
-                    std::memory_order_relaxed)) {
-                return;
-            }
-        }
+        detail::EntryFrequencyStore::update_ema(
+            this, observed_frequency, static_cast<uint32_t>(ema_decay_shift));
     }
 
     void publish_frequency_profile(uint32_t window, uint32_t ema) const {
-        published_window_frequency.store(window, std::memory_order_relaxed);
-        published_ema_frequency.store(ema, std::memory_order_relaxed);
+        detail::EntryFrequencyStore::publish(this, window, ema);
     }
 
     void copy_frequency_profile_from(const FarObjectEntry &other) {
-        window_frequency.store(other.load_window_frequency(),
-                               std::memory_order_relaxed);
-        ema_frequency.store(other.load_ema_frequency(),
-                            std::memory_order_relaxed);
-        published_window_frequency.store(other.load_published_window_frequency(),
-                                         std::memory_order_relaxed);
-        published_ema_frequency.store(other.load_published_ema_frequency(),
-                                      std::memory_order_relaxed);
+        detail::EntryFrequencyStore::copy(&other, this);
     }
 
     void reset_frequency_profile() {
-        window_frequency.store(0, std::memory_order_relaxed);
-        ema_frequency.store(0, std::memory_order_relaxed);
-        published_window_frequency.store(0, std::memory_order_relaxed);
-        published_ema_frequency.store(0, std::memory_order_relaxed);
+        detail::EntryFrequencyStore::erase(this);
     }
 
 public:
@@ -420,6 +536,7 @@ public:
                bool dirty = false, bool resident_local = false,
                uint32_t logical_owner_id = 0,
                uint32_t resident_group_id = 0) {
+        release_recompute_recipe();
         EntryStateBits reset_state = {
             .invalid = 0,
             .dirty = dirty ? 1u : 0u,
@@ -430,9 +547,10 @@ public:
         };
         placement_flags.store(resident_local ? ResidentLocal : 0,
                               std::memory_order_release);
+        routing_flags_.store(0, std::memory_order_release);
         logical_owner_id_ = logical_owner_id;
         resident_group_id_ = resident_group_id;
-        six_binding_.store(nullptr, std::memory_order_relaxed);
+        detail::EntrySixBindingStore::erase(this);
         six_pending_evict_.store(0, std::memory_order_relaxed);
         six_remote_committed_ = false;
         state.store(reset_state, std::memory_order::relaxed);
@@ -440,9 +558,11 @@ public:
         set_local_addr(local_ptr);
         set_remote_addr(remote_ptr);
         reset_frequency_profile();
+        detail::EntryFrequencyStore::register_entry(this);
     }
 
     void set_free() {
+        release_recompute_recipe();
         EntryStateBits free_state = {
             .invalid = 0,
             .dirty = 0,
@@ -453,9 +573,11 @@ public:
         };
         state.store(free_state);
         placement_flags.store(0, std::memory_order_release);
+        routing_flags_.store(0, std::memory_order_release);
         logical_owner_id_ = 0;
         resident_group_id_ = 0;
-        assert(six_binding_.load(std::memory_order_relaxed) == nullptr);
+        assert(detail::EntrySixBindingStore::load(this) == nullptr);
+        detail::EntrySixBindingStore::erase(this);
         six_pending_evict_.store(0, std::memory_order_relaxed);
         set_local_addr(nullptr);
         object_trace_slot_.store(0, std::memory_order_relaxed);
@@ -504,7 +626,10 @@ public:
     friend class ConcurrentArrayCache;
 };
 
-// static_assert(sizeof(FarObjectEntry) == 16);
+// Recovery's ABI-critical Entry remains 48B: the legacy six binding is lazy
+// sidecar state, while D2's routing/pending/trace metadata occupies the
+// otherwise unused bytes before the 16B recompute Binding.
+static_assert(sizeof(FarObjectEntry) == 48);
 
 class DereferenceScope;
 

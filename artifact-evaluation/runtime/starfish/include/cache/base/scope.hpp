@@ -1,5 +1,7 @@
 #pragma once
+#include "cache/base/object.hpp"
 #include "cache/entry.hpp"
+#include <cstdint>
 #include <iostream>
 
 namespace FarLib {
@@ -35,6 +37,11 @@ protected:
 public:
     explicit DereferenceScope(const DereferenceScope *parent)
         : parent(parent) {}
+
+    // The definition is supplied by accessor.hpp and forwards to the default
+    // cache instance.
+    bool mark_recomputable(far_obj_t obj, const recompute::Inputs &inputs,
+                           recompute::EntryFn callback, uint64_t arg);
 
     DereferenceScope(const DereferenceScope &) = delete;
 

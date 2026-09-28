@@ -5,12 +5,16 @@
 
 #include <infiniband/verbs.h>
 
+#include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "utils/debug.hpp"
@@ -21,6 +25,38 @@ namespace FarLib {
 constexpr size_t PAGE_SIZE = 4096;
 
 namespace rdma {
+
+namespace detail {
+
+template <typename T>
+bool read_config_value(std::istream &input, T &value) {
+    return static_cast<bool>(input >> value);
+}
+
+// Byte-sized configuration fields are numbers, not input characters.
+inline bool read_config_value(std::istream &input, uint8_t &value) {
+    std::string token;
+    if (!(input >> token)) return false;
+    for (const char character : token) {
+        if (character < '0' || character > '9') {
+            input.setstate(std::ios::failbit);
+            return false;
+        }
+    }
+    unsigned int parsed = 0;
+    const char *first = token.data();
+    const char *last = first + token.size();
+    const auto result = std::from_chars(first, last, parsed, 10);
+    if (result.ec != std::errc{} || result.ptr != last ||
+        parsed > static_cast<unsigned int>(std::numeric_limits<uint8_t>::max())) {
+        input.setstate(std::ios::failbit);
+        return false;
+    }
+    value = static_cast<uint8_t>(parsed);
+    return true;
+}
+
+}  // namespace detail
 
 struct Configure {
 #define CONFIG(TYPE, VAR, DEFAULT) TYPE VAR = DEFAULT;
@@ -83,7 +119,7 @@ struct Configure {
             }
 #define CONFIG(TYPE, VAR, DEFAULT)                                      \
     if (name == #VAR) {                                                 \
-        if (!(ifs >> this->VAR)) {                                      \
+        if (!detail::read_config_value(ifs, this->VAR)) {                 \
             std::cerr << "Error when reading configuration of " << name \
                       << ". Expected type is " << #TYPE << std::endl;   \
             std::abort();                                               \

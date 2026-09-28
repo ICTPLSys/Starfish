@@ -718,7 +718,7 @@ private:
     // become candidates immediately after the first endpoint failure.
     RemoteRegionList standby_waiting_region_list[RegionBinCount];
     std::unique_ptr<RemoteRegionHead[]> regions;
-    size_t regions_size;
+    size_t regions_size = 0;
     // One process-wide endpoint eligibility policy is shared by the ordinary
     // flat allocator and the EC stripe manager.  Regions retain their own
     // endpoint metadata, so a dead region can leave the allocation lists while
@@ -735,7 +735,7 @@ private:
     std::atomic<uint64_t> standby_flat_allocation_count_{0};
     std::atomic<uint64_t> standby_ec_allocation_count_{0};
     std::atomic<bool> standby_first_allocation_logged_{false};
-    std::atomic_size_t used_heap_idx;
+    std::atomic_size_t used_heap_idx{0};
     std::atomic<uint64_t> used_bytes{0};
     size_t total_capacity_bytes{0};
     // Rotating starts keep pending donor bins/classes from starving behind a
@@ -744,6 +744,12 @@ private:
     size_t budget_scan_class_cursor{0};
     std::unique_ptr<std::atomic<uint64_t>[]> server_used_bytes;
     std::unique_ptr<ShardedRemoteUsage> sharded_usage;
+    // Cold-path EC supplement; no global accounting RMW/lock on group updates.
+    const void *ec_usage_context_ = nullptr;
+    std::vector<uint64_t> (*ec_usage_reader_)(const void *) = nullptr;
+    // Preserve the last EC snapshot after its owner is destroyed so the
+    // global heap's later exit log cannot silently omit leaked live groups.
+    std::vector<uint64_t> detached_ec_usage_;
 
 #ifdef FARLIB_ALLOC_DEBUG
     std::atomic<uint64_t> dbg_double_free_detected{0};
@@ -804,7 +810,7 @@ public:
     }
 
     ~RemoteGlobalHeap() {
-        std::cout << "used memory: " << used_heap_idx * RegionSize << std::endl;
+        std::cout << "used memory: " << get_committed_bytes() << std::endl;
         std::cout << "exact used bytes: " << get_used_bytes() << std::endl;
     }
 
@@ -934,13 +940,16 @@ public:
     }
 
     void print_used_memory() {
+        const auto endpoint_bytes = get_endpoint_used_bytes();
+        uint64_t total = 0;
+        for (const auto bytes : endpoint_bytes) total += bytes;
         std::cout << "remote.committed_bytes: " << get_committed_bytes() << std::endl;
-        std::cout << "remote.exact_allocated_bytes: " << get_used_bytes() << std::endl;
+        std::cout << "remote.exact_allocated_bytes: " << total << std::endl;
         if (server_used_bytes) {
             size_t server_count = FarLib::get_config().server_count;
             for (size_t i = 0; i < server_count; i++) {
                 std::cout << "remote.server[" << i << "].used_bytes: "
-                          << get_server_used_bytes(i) << std::endl;
+                          << endpoint_bytes[i] << std::endl;
             }
         }
         std::cout << "remote.capacity_bytes: " << get_capacity_bytes() << std::endl;
@@ -955,11 +964,58 @@ public:
     }
 
     uint64_t get_used_bytes() const {
-        return sharded_usage ? sharded_usage->total() : used_bytes.load();
+        uint64_t total = sharded_usage ? sharded_usage->total() : used_bytes.load();
+        if (ec_usage_reader_) {
+            for (const auto bytes : ec_usage_reader_(ec_usage_context_))
+                total += bytes;
+        } else {
+            for (const auto bytes : detached_ec_usage_) total += bytes;
+        }
+        return total;
     }
     size_t get_capacity_bytes() const { return total_capacity_bytes; }
     uint64_t get_committed_bytes() const {
-        return used_heap_idx.load(std::memory_order::relaxed) * RegionSize;
+        const size_t flat_extent = std::min(
+            used_heap_idx.load(std::memory_order_relaxed), regions_size);
+        if (!ec_region_claimed) return flat_extent * RegionSize;
+        // The flat cursor skips EC-owned regions. Count the union, not the
+        // cursor plus EC reservation (which double-counts skipped regions).
+        size_t overlap = 0;
+        for (size_t i = 0; i < flat_extent; ++i)
+            overlap += ec_region_claimed[i].load(std::memory_order_relaxed) != 0;
+        return (flat_extent - overlap + get_ec_shard_region_count()) * RegionSize;
+    }
+
+    // Install/remove only during quiescent cache lifecycle boundaries.
+    void set_ec_group_usage_reader(
+        const void *context,
+        std::vector<uint64_t> (*reader)(const void *)) {
+        if (!reader && ec_usage_reader_)
+            detached_ec_usage_ = ec_usage_reader_(ec_usage_context_);
+        if (reader) detached_ec_usage_.clear();
+        ec_usage_context_ = context;
+        ec_usage_reader_ = reader;
+    }
+
+    std::vector<uint64_t> get_endpoint_used_bytes() const {
+        const size_t count = static_cast<size_t>(FarLib::get_config().server_count);
+        std::vector<uint64_t> result(count, 0);
+        if (sharded_usage) {
+            result = sharded_usage->snapshot();
+        } else if (server_used_bytes) {
+            for (size_t i = 0; i < count; ++i)
+                result[i] = server_used_bytes[i].load(std::memory_order_relaxed);
+        }
+        if (ec_usage_reader_) {
+            const auto ec = ec_usage_reader_(ec_usage_context_);
+            assert(ec.size() == result.size());
+            for (size_t i = 0; i < result.size(); ++i) result[i] += ec[i];
+        } else if (!detached_ec_usage_.empty()) {
+            assert(detached_ec_usage_.size() == result.size());
+            for (size_t i = 0; i < result.size(); ++i)
+                result[i] += detached_ec_usage_[i];
+        }
+        return result;
     }
 
     void inc_used_bytes(size_t bytes, uint64_t addr) {
@@ -988,14 +1044,16 @@ public:
     }
 
     uint64_t get_server_used_bytes(size_t endpoint_idx) const {
-        if (sharded_usage) return sharded_usage->server(endpoint_idx);
-        if (!server_used_bytes) return 0;
-        return server_used_bytes[endpoint_idx].load(std::memory_order::relaxed);
+        return get_endpoint_used_bytes().at(endpoint_idx);
     }
 
     // init function
     // call only once per remote allocator
     void register_remote(size_t size) {
+        // Existing register_remote contract: no live owner or concurrent readers.
+        ec_usage_reader_ = nullptr;
+        ec_usage_context_ = nullptr;
+        detached_ec_usage_.clear();
         if (simple_region_budget::enabled()) {
             // Configure before any descriptor can be claimed.  This resets
             // the per-bin ownership ledger while leaving the allocator's

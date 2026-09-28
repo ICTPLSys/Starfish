@@ -713,7 +713,6 @@ inline void ConcurrentArrayCache::flush_hydra_write_batch(size_t owner) {
                 profile::count_rdma_write_post(queue.requests[i].bytes);
             if (accepted != 0) {
                 hydra_write_batch_accepted_wrs_.fetch_add(accepted, std::memory_order_relaxed);
-                read_supply_timeline::record_write_posts(client_idx, qp_idx, accepted);
             }
             first += accepted;
             if (!posted) {
@@ -855,14 +854,14 @@ inline void ConcurrentArrayCache::handle_ec_batch_write_complete(uint64_t wr_id,
                     line << "INFO: ec_batch standby write_completed endpoint="
                          << standby << " token=" << token_id
                          << " bytes=" << record.group.segments[s].slot_size;
-                    std::cout << line.str() << std::endl;
+                    std::cerr << line.str() << std::endl;
                 }
                 break;
             }
         }
     }
-    if (failed != 0) {
-        std::cout << "INFO: ec_batch degraded_write token=" << token_id
+    if (failed != 0 && !ec_recovery_diag_quiet()) {
+        std::cerr << "INFO: ec_batch degraded_write token=" << token_id
                   << " completed_ok=" << completed_ok
                   << " failed_mask=" << static_cast<unsigned>(failed)
                   << std::endl;

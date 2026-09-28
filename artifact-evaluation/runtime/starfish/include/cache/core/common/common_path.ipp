@@ -24,34 +24,12 @@ inline size_t ConcurrentArrayCache::check_cq() {
          ++endpoint) {
         const size_t cnt = client->check_cq_with_idx_endpoint(
             wc, rdma::CHECK_CQ_BATCH_SIZE, 0, endpoint);
-        read_supply_timeline::record_cq_result(client->get_thread_id(), 0,
-                                               wc, cnt);
-        request_interval_diag::Token request_tokens[rdma::CHECK_CQ_BATCH_SIZE];
-        for (size_t i = 0; i < cnt; ++i) {
-            request_tokens[i] = {};
-            if (wc[i].status == IBV_WC_SUCCESS &&
-                wc[i].opcode == IBV_WC_RDMA_READ &&
-                request_interval_diag::tracked(wc[i].wr_id)) {
-                const auto name = fid->getName();
-                request_tokens[i] = request_interval_diag::cq_reaped(
-                    wc[i].wr_id, reinterpret_cast<uint64_t>(fid),
-                    fid->getPriority(), name.c_str());
-            }
-        }
         if (read_batch) client->note_cq_progress(endpoint, 0, cnt);
         for (size_t i = 0; i < cnt; i++) {
-            const auto request_token = request_tokens[i];
-            request_interval_diag::set_completion_context(request_token);
             {
                 scope_diag::Guard wc_guard(fibre_self(),
                                            scope_diag::WC_HANDLE);
                 handle_work_complete(wc[i]);
-            }
-            request_interval_diag::clear_completion_context();
-            request_interval_diag::callback_done(request_token);
-            if (wc[i].status == IBV_WC_SUCCESS &&
-                wc[i].opcode == IBV_WC_RDMA_READ) {
-                read_supply_timeline::record_lifecycle_done(wc[i].wr_id);
             }
         }
         if (read_batch) {
@@ -85,34 +63,12 @@ inline size_t ConcurrentArrayCache::check_cq_idx(size_t qp_idx) {
          ++endpoint) {
         const size_t cnt = client->check_cq_with_idx_endpoint(
             wc, rdma::CHECK_CQ_BATCH_SIZE, qp_idx, endpoint);
-        read_supply_timeline::record_cq_result(client->get_thread_id(), qp_idx,
-                                               wc, cnt);
-        request_interval_diag::Token request_tokens[rdma::CHECK_CQ_BATCH_SIZE];
-        for (size_t i = 0; i < cnt; ++i) {
-            request_tokens[i] = {};
-            if (wc[i].status == IBV_WC_SUCCESS &&
-                wc[i].opcode == IBV_WC_RDMA_READ &&
-                request_interval_diag::tracked(wc[i].wr_id)) {
-                const auto name = fid->getName();
-                request_tokens[i] = request_interval_diag::cq_reaped(
-                    wc[i].wr_id, reinterpret_cast<uint64_t>(fid),
-                    fid->getPriority(), name.c_str());
-            }
-        }
         if (read_batch) client->note_cq_progress(endpoint, qp_idx, cnt);
         for (size_t i = 0; i < cnt; i++) {
-            const auto request_token = request_tokens[i];
-            request_interval_diag::set_completion_context(request_token);
             {
                 scope_diag::Guard wc_guard(fibre_self(),
                                            scope_diag::WC_HANDLE);
                 handle_work_complete(wc[i]);
-            }
-            request_interval_diag::clear_completion_context();
-            request_interval_diag::callback_done(request_token);
-            if (wc[i].status == IBV_WC_SUCCESS &&
-                wc[i].opcode == IBV_WC_RDMA_READ) {
-                read_supply_timeline::record_lifecycle_done(wc[i].wr_id);
             }
         }
         if (read_batch) {
@@ -145,33 +101,12 @@ inline size_t ConcurrentArrayCache::check_cq_idx_with_client_idx(
          ++endpoint) {
         const size_t cnt = client->check_cq_with_idx_endpoint(
             wc, rdma::CHECK_CQ_BATCH_SIZE, qp_idx, endpoint);
-        read_supply_timeline::record_cq_result(thread_id, qp_idx, wc, cnt);
-        request_interval_diag::Token request_tokens[rdma::CHECK_CQ_BATCH_SIZE];
-        for (size_t i = 0; i < cnt; ++i) {
-            request_tokens[i] = {};
-            if (wc[i].status == IBV_WC_SUCCESS &&
-                wc[i].opcode == IBV_WC_RDMA_READ &&
-                request_interval_diag::tracked(wc[i].wr_id)) {
-                const auto name = fid->getName();
-                request_tokens[i] = request_interval_diag::cq_reaped(
-                    wc[i].wr_id, reinterpret_cast<uint64_t>(fid),
-                    fid->getPriority(), name.c_str());
-            }
-        }
         if (read_batch) client->note_cq_progress(endpoint, qp_idx, cnt);
         for (size_t i = 0; i < cnt; i++) {
-            const auto request_token = request_tokens[i];
-            request_interval_diag::set_completion_context(request_token);
             {
                 scope_diag::Guard wc_guard(fibre_self(),
                                            scope_diag::WC_HANDLE);
                 handle_work_complete(wc[i]);
-            }
-            request_interval_diag::clear_completion_context();
-            request_interval_diag::callback_done(request_token);
-            if (wc[i].status == IBV_WC_SUCCESS &&
-                wc[i].opcode == IBV_WC_RDMA_READ) {
-                read_supply_timeline::record_lifecycle_done(wc[i].wr_id);
             }
         }
         if (read_batch) {
@@ -206,33 +141,12 @@ ConcurrentArrayCache::poll_cq_idx_with_client_idx_endpoint_no_flush(
     profile::start_check_cq();
     size_t cnt = client->check_cq_with_idx_endpoint(
         wc, rdma::CHECK_CQ_BATCH_SIZE, qp_idx, endpoint_idx);
-    read_supply_timeline::record_cq_result(thread_id, qp_idx, wc, cnt);
-    request_interval_diag::Token request_tokens[rdma::CHECK_CQ_BATCH_SIZE];
-    for (size_t i = 0; i < cnt; ++i) {
-        request_tokens[i] = {};
-        if (wc[i].status == IBV_WC_SUCCESS &&
-            wc[i].opcode == IBV_WC_RDMA_READ &&
-            request_interval_diag::tracked(wc[i].wr_id)) {
-            const auto name = fid->getName();
-            request_tokens[i] = request_interval_diag::cq_reaped(
-                wc[i].wr_id, reinterpret_cast<uint64_t>(fid),
-                fid->getPriority(), name.c_str());
-        }
-    }
     scope_diag::cq_result(fid, cnt);
     if (read_batch) client->note_cq_progress(endpoint_idx, qp_idx, cnt);
     for (size_t i = 0; i < cnt; i++) {
-        const auto request_token = request_tokens[i];
-        request_interval_diag::set_completion_context(request_token);
         {
             scope_diag::Guard wc_guard(fibre_self(), scope_diag::WC_HANDLE);
             handle_work_complete(wc[i]);
-        }
-        request_interval_diag::clear_completion_context();
-        request_interval_diag::callback_done(request_token);
-        if (wc[i].status == IBV_WC_SUCCESS &&
-            wc[i].opcode == IBV_WC_RDMA_READ) {
-            read_supply_timeline::record_lifecycle_done(wc[i].wr_id);
         }
     }
     profile::end_check_cq();
@@ -256,36 +170,12 @@ inline void ConcurrentArrayCache::full_checker() {
              endpoint < client->get_endpoint_count(); ++endpoint) {
             const size_t cnt = client->check_cq_with_idx_endpoint(
                 wc, rdma::CHECK_CQ_BATCH_SIZE, 0, endpoint);
-            read_supply_timeline::record_cq_result(i, 0, wc, cnt);
-            request_interval_diag::Token
-                request_tokens[rdma::CHECK_CQ_BATCH_SIZE];
-            const auto handler_fid = fibre_self();
-            for (size_t j = 0; j < cnt; ++j) {
-                request_tokens[j] = {};
-                if (wc[j].status == IBV_WC_SUCCESS &&
-                    wc[j].opcode == IBV_WC_RDMA_READ &&
-                    request_interval_diag::tracked(wc[j].wr_id)) {
-                    const auto name = handler_fid->getName();
-                    request_tokens[j] = request_interval_diag::cq_reaped(
-                        wc[j].wr_id,
-                        reinterpret_cast<uint64_t>(handler_fid),
-                        handler_fid->getPriority(), name.c_str());
-                }
-            }
             if (read_batch) client->note_cq_progress(endpoint, 0, cnt);
             for (size_t j = 0; j < cnt; j++) {
-                const auto request_token = request_tokens[j];
-                request_interval_diag::set_completion_context(request_token);
                 {
                     scope_diag::Guard wc_guard(fibre_self(),
                                                scope_diag::WC_HANDLE);
                     handle_work_complete(wc[j]);
-                }
-                request_interval_diag::clear_completion_context();
-                request_interval_diag::callback_done(request_token);
-                if (wc[j].status == IBV_WC_SUCCESS &&
-                    wc[j].opcode == IBV_WC_RDMA_READ) {
-                    read_supply_timeline::record_lifecycle_done(wc[j].wr_id);
                 }
             }
             if (read_batch) {
@@ -342,14 +232,18 @@ retry:
 
 inline void ConcurrentArrayCache::mark_dirty(far_obj_t obj) {
     FarObjectEntry &entry = get_entry_of(obj);
+    wait_ec_write_source(entry);
     record_non_fast_path_reference(entry, profile::ReferenceKind::Write);
     if (invalidate_retained_backup_for_write(entry, obj.size)) {
         return;
     }
     EntryStateBits old_state = entry.load_state();
     if (old_state.dirty) return;
-    EntryStateBits new_state;
-    do {
+    for (;;) {
+        old_state = entry.load_state();
+        // Keep this state snapshot from BEFORE the borrow check: a later
+        // eviction/rescue adds a write ref and therefore makes this CAS fail.
+        wait_ec_write_source(entry);
         if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
             auto spin_start = get_cycles();
             profile::count_excl_move_lock_spin();
@@ -357,19 +251,21 @@ inline void ConcurrentArrayCache::mark_dirty(far_obj_t obj) {
             profile::count_excl_move_lock_spin_cycles(get_cycles() - spin_start);
             continue;
         }
-        new_state = old_state;
+        auto new_state = old_state;
         new_state.dirty = 1;
-    } while (!entry.cas_state_weak(old_state, new_state));
+        if (entry.cas_state_weak(old_state, new_state)) return;
+    }
 }
 
 inline void ConcurrentArrayCache::release_cache(FarObjectEntry *entry, bool dirty) {
     if (dirty) {
+        wait_ec_write_source(*entry);
         invalidate_retained_backup_for_write(
             *entry, entry->load_state(std::memory_order_relaxed).size);
     }
-    EntryStateBits old_state = entry->load_state();
-    EntryStateBits new_state;
-    do {
+    for (;;) {
+        auto old_state = entry->load_state();
+        if (dirty) wait_ec_write_source(*entry);
         if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
             auto spin_start = get_cycles();
             profile::count_excl_move_lock_spin();
@@ -377,7 +273,7 @@ inline void ConcurrentArrayCache::release_cache(FarObjectEntry *entry, bool dirt
             profile::count_excl_move_lock_spin_cycles(get_cycles() - spin_start);
             continue;
         }
-        new_state = old_state;
+        auto new_state = old_state;
         if (new_state.state == FREE) [[unlikely]] {
             ERROR("release cache: try to release a free entry");
         }
@@ -390,7 +286,8 @@ inline void ConcurrentArrayCache::release_cache(FarObjectEntry *entry, bool dirt
         }
         new_state.dec_ref_cnt();
         if (dirty) new_state.dirty = 1;
-    } while (!entry->cas_state_weak(old_state, new_state));
+        if (entry->cas_state_weak(old_state, new_state)) return;
+    }
 }
 
 inline void ConcurrentArrayCache::release_cache(far_obj_t obj, bool dirty) {

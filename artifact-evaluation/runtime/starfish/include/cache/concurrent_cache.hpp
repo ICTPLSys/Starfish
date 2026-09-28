@@ -40,9 +40,16 @@
 #include "region_based_allocator.hpp"
 #include "cache/alloc/remote_allocator.hpp"
 #include "cache/alloc/ec_batch_write.hpp"
+#include "cache/alloc/ec_update_worker.hpp"
+#include "cache/alloc/ec_rmw_worker.hpp"
+#include "cache/alloc/ec_direct_group_builder.hpp"
 #include "recovery/ec_read_recovery.hpp"
 #include "recovery/ec_read_context.hpp"
 #include "recovery/ec_recovery_scratch.hpp"
+#include "cache/alloc/ec_split_buffers.hpp"
+#include "cache/alloc/ec_size_class_builder.hpp"
+#include "recovery/ec_backup_policy.hpp"
+#include "cache/alloc/ec_split_layout.hpp"
 #include "utils/control.hpp"
 #include "utils/debug.hpp"
 #include "utils/fork_join.hpp"
@@ -53,8 +60,8 @@
 #include "utils/wait_trace.hpp"
 #include "utils/inclusive_reclaim_diag.hpp"
 #include "utils/scope_diag.hpp"
-#include "utils/read_supply_timeline.hpp"
 #include "utils/request_interval_diag.hpp"
+#include "utils/sharded_diagnostic_counter.hpp"
 
 // Compile the complete client and its static libraries with the same value.
 // This experiment changes cache-object layout only, not backup admission.
@@ -196,8 +203,6 @@ public:
         uint32_t requested_group_id = 0,
         uint32_t requested_behavior_group_id = 0) {
         scope_diag::Guard sd_alloc_guard(fibre_self(), scope_diag::ALLOC);
-        auto *wc_sample = wc_object_diag::find_object(obj.obj_id);
-        const uint64_t wc_alloc_begin = wc_sample ? wc_object_diag::stamp() : 0;
         if (alloc_scope_checkpoint_enabled()) {
             update_scope(scope);
         }
@@ -278,7 +283,6 @@ public:
             }
         }
         assert(obj == block->obj_meta_data);
-        wc_object_diag::allocation_done(wc_sample, wc_alloc_begin);
         alloc_reclaim_rate_diag::record_allocation(
             ::FarLib::allocator::get_bin_size(alloc_bin));
         return {block, ::FarLib::allocator::six_group::enabled() ||
@@ -534,8 +538,6 @@ private:
     size_t evacuate_thread_cnt;
     std::atomic_flag flag;
     std::atomic_bool stw_active{false};
-    std::atomic_bool read_supply_timeline_stop{false};
-    std::thread read_supply_timeline_thread;
     std::atomic<size_t> reclaim_diag_last_alloc_bin{
         inclusive_reclaim_diag::kNoAllocBin};
     FullPopulationFrequencyTracker full_population_frequency_tracker;
@@ -585,9 +587,6 @@ private:
                             uint64_t a = 0, uint64_t b = 0) {
         wait_trace::emit(name, bin, a, b, (uint64_t)uthread::get_tls());
     }
-
-    void start_read_supply_timeline();
-    void stop_read_supply_timeline();
 
     static bool full_population_frequency_stats_enabled();
     static size_t full_population_frequency_scan_period_ms();
@@ -3431,6 +3430,7 @@ private:
         }
     retry:
         auto old_state = entry.load_state();
+        wait_ec_write_source(entry);
         if (old_state.invalid) [[unlikely]] {
             profile::count_excl_move_lock_spin();
             uthread::yield();
@@ -3475,12 +3475,139 @@ public:
         return remote_allocator.allocate(size, behavior_group);
     }
 
+    // Simple annotation contract: call within the allocation scope, before
+    // publishing the handle and before its first remote allocation. No
+    // concurrent application access/move/reset is allowed. Evacuation may race
+    // this call; the existing per-entry move lock gives an all-or-nothing
+    // result. Marking is monotonic until reset/reallocation; no unmark API.
+    bool mark_recomputable(far_obj_t obj) {
+        const auto &config = ::FarLib::get_config();
+        if (obj.is_null() || !config.exclusive_cache ||
+            (config.ft_enabled() && !config.is_ec_batch_mode())) return false;
+        auto &entry = get_entry_of(obj);
+        bool newly_marked = false;
+        const bool accepted = entry.try_mark_recomputable_before_eviction(&newly_marked);
+        if (recomputable_diag_enabled_ && newly_marked)
+            recomputable_marked_.fetch_add(1, std::memory_order_relaxed);
+        return accepted;
+    }
+
+    // Register the immutable-input recipe used when an EC-batch flat object
+    // loses its only remote copy.  The entry owns one intrusive InputState
+    // reference after a successful bind; the callback itself is never invoked
+    // from a CQ completion handler (see recompute_recipe_path.ipp).
+    bool register_recompute_recipe(far_obj_t obj,
+                                   const recompute::Inputs &inputs,
+                                   recompute::EntryFn callback,
+                                   uint64_t arg) {
+        const auto &config = ::FarLib::get_config();
+        if (obj.is_null() || !config.exclusive_cache ||
+            !config.is_ec_batch_mode()) {
+            return false;
+        }
+        auto &entry = get_entry_of(obj);
+        const bool accepted =
+            entry.try_bind_recompute_recipe(inputs, callback, arg);
+        if (accepted) {
+            recomputable_registered_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return accepted;
+    }
+
+    // A recipe promises immutable output.  Keep the old flag-only annotation
+    // mode writable; only a bound recipe rejects a mutable dereference.
+    void guard_recompute_mutation(const FarObjectEntry &entry) const {
+        if (entry.has_recompute_recipe()) {
+            ERROR("mutable access to a recompute recipe object");
+        }
+    }
+
+    bool is_recomputable(far_obj_t obj) const {
+        return !obj.is_null() && obj.get_entry_ptr()->is_recomputable();
+    }
+
+    struct RecomputableStats {
+        uint64_t marked;
+        uint64_t flat_writebacks;
+        uint64_t flat_write_bytes;
+        uint64_t flat_read_posts;
+        uint64_t registered;
+        uint64_t restored;
+        uint64_t failures;
+        uint64_t virtual_evictions;
+        uint64_t failed_writes;
+    };
+    RecomputableStats recomputable_stats() const {
+        return {recomputable_marked_.load(std::memory_order_relaxed),
+                recomputable_flat_writebacks_.load(std::memory_order_relaxed),
+                recomputable_flat_write_bytes_.load(std::memory_order_relaxed),
+                recomputable_flat_read_posts_.load(std::memory_order_relaxed),
+                recomputable_registered_.load(std::memory_order_relaxed),
+                recomputable_restored_.load(std::memory_order_relaxed),
+                recomputable_failures_.load(std::memory_order_relaxed),
+                recomputable_virtual_evictions_.load(
+                    std::memory_order_relaxed),
+                recomputable_failed_writes_.load(std::memory_order_relaxed)};
+    }
+    // Stable machine-readable line for the validator.  `restored` is bumped
+    // only after the runtime callback has published FETCHING -> LOCAL through
+    // the ordinary READ completion state machine; it is independent of any
+    // application callback counter.
+    void print_recompute_recipe_stats(const char *phase = "snapshot") const {
+        const auto stats = recomputable_stats();
+        std::cout << "recompute_recipe_stats phase="
+                  << (phase != nullptr ? phase : "snapshot")
+                  << " marked=" << stats.marked
+                  << " registered=" << stats.registered
+                  << " flat_writebacks=" << stats.flat_writebacks
+                  << " flat_write_bytes=" << stats.flat_write_bytes
+                  << " flat_read_posts=" << stats.flat_read_posts
+                  << " restored=" << stats.restored
+                  << " failures=" << stats.failures
+                  << " virtual_evictions=" << stats.virtual_evictions
+                  << " failed_writes=" << stats.failed_writes << std::endl;
+    }
+    bool recomputable_diagnostics_enabled() const {
+        return recomputable_diag_enabled_;
+    }
+
     static bool six_dirty_routing_enabled();
 
     static uint32_t initial_simple_behavior_group(bool hot = false);
 
     static uint32_t current_behavior_group(const FarObjectEntry& entry);
 
+    // In Resident-mapped mode the local heat band is a placement identity,
+    // not the entry's measured-heat hint. The allocator reconciles this
+    // requested class again if its native placement fallback changes R/S.
+    static uint32_t local_behavior_group(
+        const FarObjectEntry &entry,
+        ::FarLib::allocator::RegionPlacement requested_placement) {
+        if (::FarLib::simple_region_heat::local_resident_enabled())
+            return ::FarLib::simple_region_heat::class_for_placement(
+                requested_placement ==
+                    ::FarLib::allocator::RegionPlacement::Resident,
+                entry.simple_dirty_class());
+        return current_behavior_group(entry);
+    }
+
+    // Remote groups retain the measured-heat meaning. Never derive this
+    // hint from a local supply class: its Hot bit now means Resident.
+    static uint32_t remote_behavior_group(
+        const FarObjectEntry &entry, uintptr_t source_local_address) {
+        if (::FarLib::simple_region_budget::six_enabled())
+            return (::FarLib::simple_region_heat::is_hot(
+                        ::FarLib::simple_region_heat::class_for(
+                            source_local_address))
+                        ? 3u : 0u) + entry.simple_dirty_class();
+        if (::FarLib::simple_region_heat::grouping_enabled())
+            return ::FarLib::simple_region_heat::class_for(
+                source_local_address);
+        return current_behavior_group(entry);
+    }
+
+    // Caller holds the sampled object's trace lock across binding lookup and
+    // append.  Region locks alone cannot order a move between two Regions.
     static void trace_object_event_locked(const FarObjectEntry& entry,
                                          ::FarLib::object_group_trace::Kind kind);
 
@@ -3579,16 +3706,58 @@ public:
     
     // Per-endpoint EvictBuffer array
     struct EvictBufferSet {
+        struct EcEndpointWrites {
+            ibv_sge sges[EvictBatchSize];
+            ibv_sge direct_sges[EvictBatchSize][2];
+            ibv_send_wr wrs[EvictBatchSize];
+            size_t count = 0;
+        };
         std::unique_ptr<EvictBuffer[]> buffers;
         std::unique_ptr<SpongeEvictBuffer[]> sponge_buffers;
+        // Invocation/worker owned, never OS-thread-local: fibres may migrate.
+        // Only this worker can construct, seal or consume these EC groups.
+        std::unique_ptr<ec_batch::EcGroupBuilder> ec_builder;
+        std::unique_ptr<ec_batch::EcSizeClassBuilder> size_class_builder;
+        std::unique_ptr<ec_batch::EcDirectGroupBuilder> direct_builder;
+        std::unique_ptr<EcEndpointWrites[]> ec_writes;
+        ConcurrentArrayCache *ec_cache = nullptr;
+        profile::evict_breakdown::Worker *breakdown = nullptr;
+        size_t ec_objects_since_post = 0;
+        uint64_t ec_reported_sealed = 0;
+        uint64_t ec_reported_alloc_ok = 0;
+        uint64_t ec_reported_alloc_failed = 0;
+        std::array<uint64_t, ec_batch::kEcBatchBehaviorGroupCount> ec_reported_by_group{};
+        uint64_t direct_reported_sealed = 0, direct_reported_alloc_ok = 0;
+        uint64_t direct_reported_alloc_failed = 0, direct_reported_objects = 0;
+        uint64_t direct_reported_bytes = 0;
+        std::array<uint64_t, ec_batch::kEcBatchBehaviorGroupCount> direct_reported_by_group{};
         size_t server_count;
+        size_t direct_owner = static_cast<size_t>(-1);
+        // True when the most recent one-sided incremental stage retained the
+        // old remote allocation itself (either in a filled batch or in a
+        // deferred SlotReuse candidate).  The eviction path resets this at
+        // stage entry and uses it to avoid releasing an allocation that is
+        // still owned by a pending RMW transaction.
+        bool last_stage_owns_old_remote = false;
+        uint64_t staging_original_remote_addr = FarObjectEntry::RemoteAddrInvalid48;
         
         EvictBufferSet() : buffers(nullptr), server_count(0) {}
+
+        ~EvictBufferSet() {
+            if (ec_builder) {
+                // Posted records are copied into tokens and outlive this batch.
+                // Unposted records must never outlive their sole producer.
+                ASSERT(!ec_builder->group_open() && ec_builder->pending_count() == 0);
+            }
+            ASSERT(!direct_builder || (!direct_builder->group_open() && direct_builder->pending_count() == 0));
+            ASSERT(!size_class_builder || (!size_class_builder->group_open() && size_class_builder->pending_count() == 0));
+        }
         
         void init(size_t count) {
             server_count = count;
             buffers.reset(new EvictBuffer[server_count]);
-            if (::FarLib::get_config().ft_enabled()) {
+            if (::FarLib::get_config().ft_enabled() &&
+                !::FarLib::get_config().is_ec_batch_mode()) {
                 sponge_buffers.reset(new SpongeEvictBuffer[server_count]);
             }
         }
@@ -3617,7 +3786,7 @@ public:
                 // flush point of the group path - seal the partly filled group
                 // and post every sealed group, so no object of this batch is
                 // left behind in EVICTING.
-                cache->flush_ec_batch_groups(client_idx);
+                cache->flush_ec_batch_groups(client_idx, this);
             }
         }
 
@@ -3629,12 +3798,69 @@ public:
                     total += sponge_buffers[i].batch.header.record_count;
                 }
             }
+            if (ec_builder) {
+                total += ec_builder->pending_count();
+                total += ec_builder->group_open() ? 1 : 0;
+            }
+            if (direct_builder) {
+                total += direct_builder->pending_count();
+                total += direct_builder->group_open() ? 1 : 0;
+                if (ec_cache && ec_cache->ec_update_workers_)
+                    total += ec_cache->ec_update_workers_[direct_owner].count;
+                if (ec_cache && ec_cache->ec_rmw_workers_ &&
+                    direct_owner < ec_cache->ec_persistent_owner_count_)
+                    total += ec_cache->ec_rmw_workers_[direct_owner].pending_count();
+            }
+            if (size_class_builder) {
+                total += size_class_builder->pending_count();
+                total += size_class_builder->group_open() ? 1 : 0;
+            }
             return total;
         }
     };
 
-    // Ordinary READ wr_id carries a per-block generation token; writes keep
-    // the historical local-address contract.
+    struct EcWorkerActivityGuard {
+        ConcurrentArrayCache *cache;
+        explicit EcWorkerActivityGuard(ConcurrentArrayCache *c) : cache(c) {
+            cache->ec_worker_active_buffers_.fetch_add(1, std::memory_order_relaxed);
+        }
+        ~EcWorkerActivityGuard() { cache->ec_worker_active_buffers_.fetch_sub(1, std::memory_order_relaxed); }
+    };
+    void init_ec_direct_writes();
+    EvictBufferSet *persistent_evict_buffers(size_t owner);
+    bool stage_ec_direct_object(EvictBufferSet &, void *, size_t, FarObjectEntry *, uint32_t);
+    size_t post_ec_direct_pending(EvictBufferSet &, size_t, size_t);
+    void flush_ec_direct_groups(EvictBufferSet &, size_t);
+    void complete_ec_direct_write(uint64_t, uint8_t, bool);
+    void wait_ec_write_source(FarObjectEntry &);
+
+    // Ordinary RDMA WRITE completions used to carry a raw local pointer.  A
+    // failed/flushed WC is allowed to report opcode=0, so the completion
+    // path needs a namespace bit that cannot be confused with the ordinary
+    // READ (bit 62) or EC (bit 63) tokens.  Keep only the canonical low 48
+    // pointer bits in the token; write lifetime is held by the entry's
+    // EVICTING reference, so no generation field is needed here.
+    static constexpr uint64_t kNormalWriteWrIdTagBit = 1ull << 61;
+    static constexpr uint64_t kNormalWriteWrIdPointerMask = (1ull << 48) - 1;
+
+    static uint64_t encode_normal_write_wr_id(void *local_addr) {
+        const uint64_t pointer = reinterpret_cast<uintptr_t>(local_addr);
+        ASSERT((pointer & ~kNormalWriteWrIdPointerMask) == 0);
+        return kNormalWriteWrIdTagBit |
+               (pointer & kNormalWriteWrIdPointerMask);
+    }
+
+    static bool is_normal_write_wr_id(uint64_t wr_id) {
+        return (wr_id & kNormalWriteWrIdTagBit) != 0 &&
+               (wr_id & ((1ull << 62) | (1ull << 63))) == 0;
+    }
+
+    static void *normal_write_wr_id_local_addr(uint64_t wr_id) {
+        return reinterpret_cast<void *>(wr_id & kNormalWriteWrIdPointerMask);
+    }
+
+    // Ordinary READ wr_id carries a per-block generation token; ordinary
+    // WRITE wr_id uses the dedicated bit-61 namespace above.
     template <bool IsReadRequest>
     void post_rdma_request(far_obj_t obj, size_t client_idx,
                            bool sync_batch_eligible = false) {
@@ -3648,6 +3874,17 @@ public:
         auto *client = rdma::get_client(client_idx);
         size_t qp_idx = client->get_qp_idx();
         const auto& config = ::FarLib::get_config();
+        if constexpr (IsReadRequest) {
+            if (config.is_ec_batch_mode() && !entry.is_recomputable() &&
+                ec_batch_uses_split(obj.size)) {
+                // A large object's remote address anchors data fragment 0;
+                // it is never a contiguous full-object RDMA source, even
+                // while all endpoints are healthy. The fetch wait retries
+                // transient resource pressure through the same split path.
+                (void)post_ec_degraded_read(obj, client_idx, local_addr);
+                return;
+            }
+        }
         size_t endpoint_idx = 0;
         size_t offset = remote_addr;
         if (config.server_count > 1) {
@@ -3665,6 +3902,14 @@ public:
         if constexpr (IsReadRequest) {
             if (config.server_count > 1 &&
                 ec_recovery_endpoint_is_dead(endpoint_idx)) {
+                if (entry.is_recomputable()) {
+                    // A recipe object has no EC survivor round.  Close the
+                    // ordinary-READ gate and leave the FETCHING epoch for
+                    // the wait-side recipe assist; never issue another READ
+                    // to a known-dead RC QP.
+                    ::FarLib::allocator::begin_normal_read_recovery(block);
+                    return;
+                }
                 const auto recovery =
                     post_ec_degraded_read(obj, client_idx, local_addr);
                 if (recovery !=
@@ -3698,23 +3943,12 @@ public:
             }
             wr_id = ::FarLib::allocator::encode_normal_read_wr_id(
                 local_addr, generation);
-            wc_object_diag::prepost(obj.obj_id, wr_id);
         }
         const bool use_read_batch = IsReadRequest && sync_batch_eligible &&
                                     client->sync_read_batching_enabled();
-        request_interval_diag::Token request_interval_token{};
         if constexpr (IsReadRequest) {
             if (!use_read_batch) {
                 client->record_immediate_read_generated(obj.size);
-                auto *diag_slot = scope_diag::current(fibre_self());
-                if (diag_slot != nullptr) {
-                    request_interval_token =
-                        request_interval_diag::request_prepost(
-                            scope_diag::index(diag_slot),
-                            reinterpret_cast<uint64_t>(fibre_self()),
-                            reinterpret_cast<uint64_t>(&entry), wr_id,
-                            mutator_waiters.load(std::memory_order_relaxed));
-                }
             }
         }
         
@@ -3751,15 +3985,16 @@ public:
                     goto retry;
                 }
                 if (!queued.enqueued) std::abort();
+                if (recomputable_diag_enabled_ && entry.is_recomputable())
+                    recomputable_flat_read_posts_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            request_interval_diag::set_post_context(request_interval_token);
             posted = client->post_read(
                 offset, local_addr, obj.size, wr_id, obj.obj_id, 0,
                 endpoint_idx);
-            request_interval_diag::clear_post_context();
         } else {
             // Use original post_write for now
+            wr_id = encode_normal_write_wr_id(local_addr);
             posted = rdma::get_client(client_idx)->post_write(
                 offset, local_addr, obj.size, wr_id, obj.obj_id, 0, endpoint_idx);
         }
@@ -3769,9 +4004,8 @@ public:
         }
 
         if constexpr (IsReadRequest) {
-            // B1 observer: count only after ibv_post_send accepted the READ.
-            read_supply_timeline::record_read_accepted(client_idx, qp_idx,
-                                                        wr_id);
+            if (recomputable_diag_enabled_ && entry.is_recomputable())
+                recomputable_flat_read_posts_.fetch_add(1, std::memory_order_relaxed);
         } else {
             profile::count_rdma_write_post(obj.size);
         }
@@ -3809,7 +4043,7 @@ public:
             }
             client->build_send_wr(write_wr[i], write_sge[i], offset,
                                   req.local_addr, req.size,
-                                  reinterpret_cast<uint64_t>(req.local_addr),
+                                  encode_normal_write_wr_id(req.local_addr),
                                   true, IBV_WR_RDMA_WRITE, endpoint_idx);
             if (i > 0) {
                 write_wr[i - 1].next = &(write_wr[i]);
@@ -3835,11 +4069,6 @@ public:
                 (int64_t)(get_cycles() - post_start));
             profile::count_evac_post_write_retry_count(retry_count);
         }
-
-        // All WRs in this buffer have now been accepted, including any suffix
-        // retried after a partial post.
-        read_supply_timeline::record_write_posts(client_idx, qp_idx,
-                                                 posted_count);
 
         profile::count_evacuation_bytes(total_bytes);
         profile::count_evac_flush(posted_count, posted_count == EvictBatchSize);
@@ -4018,12 +4247,15 @@ public:
                                  StreamingEvictMasterArgs::ResumeScanRound
                                      *resume_scan = nullptr,
                                  std::atomic_bool *evict_stop_after_mark =
-                                     nullptr);
+                                     nullptr,
+                                 profile::evict_breakdown::Worker *breakdown = nullptr);
     void evict_ready_worker_logic(
         const std::vector<::FarLib::allocator::EvictTask> &ready_tasks,
         std::atomic_size_t &next_task_idx, uint32_t current_safe_epoch,
         std::vector<::FarLib::allocator::EvictTask> &deferred_tasks,
-        std::atomic_int64_t &posted_wrs_total);
+        std::atomic_int64_t &posted_wrs_total,
+        profile::evict_breakdown::Worker *breakdown = nullptr,
+        EvictBufferSet *reusable_buffers = nullptr);
     void evict_drain_phase();
     void drain_eviction_completions_for_shutdown();
     void evacuate_phase(uint32_t timestamp);
@@ -4223,6 +4455,12 @@ public:
             }
             assert(new_state.ref_cnt == 0);
             six_free(entry, size);
+            // The FREE transition is published directly here (rather than
+            // through FarObjectEntry::set_free()), so drop the intrusive
+            // recipe ownership before the local/remote storage is released
+            // or the entry is recycled.
+            entry.clear_recompute_metadata();
+            entry.reset_frequency_profile();
             unregister_live_entry(&entry);
             deallocate_local(entry.local_addr(), entry);
             {
@@ -4262,6 +4500,10 @@ public:
                 goto retry;
             }
             six_free(entry, size);
+            // REMOTE teardown also publishes FREE directly; make recipe
+            // lifetime independent of the eventual entry destructor.
+            entry.clear_recompute_metadata();
+            entry.reset_frequency_profile();
             unregister_live_entry(&entry);
             {
                 uint64_t remote_addr = entry.remote_addr();
@@ -4296,6 +4538,26 @@ public:
         // EC recovery scratch is registered lazily in separate grow-on-demand
         // chunks. It does not impose a fixed depth or carve out application MR.
         local_buf_size = init_ec_read_recovery(local_buf, local_buf_size);
+        if (::FarLib::get_config().behavior_group &&
+            (!ec_staging_pool_.valid() || !ec_split_buffers_.valid() ||
+             !ec_read_scratch_pool_.valid() ||
+             ec_read_scratch_pool_.slot_size() < ec_batch::kEcBatchStagingMaxSlotSize))
+            ERROR("behavior_group: complete write/recovery buffers are required");
+        init_ec_direct_writes();
+        if (::FarLib::get_config().ft_incremental_update) {
+            if (!ec_direct_bank_ || !ec_persistent_buffers_)
+                ERROR("ec_update: requires permanent worker-private direct banks");
+            if (::FarLib::get_config().ft_incremental_one_sided) {
+                auto *control = rdma::ClientControl::get_default();
+                if (control == nullptr || control->ec_rmw_transport() == nullptr)
+                    ERROR("ec_rmw: missing one-sided transport");
+                ec_rmw_workers_.reset(
+                    new ec_rmw_runtime::Worker[ec_persistent_owner_count_]);
+            } else {
+                ec_update_workers_.reset(
+                    new ec_update_runtime::Worker[ec_persistent_owner_count_]);
+            }
+        }
         const auto member_offset = [this](const void *member) {
             return reinterpret_cast<uintptr_t>(member) -
                    reinterpret_cast<uintptr_t>(this);
@@ -4323,10 +4585,24 @@ public:
                   << " budget_offset=" << budget_offset
                   << " resident_offset=" << resident_offset << '\n';
         const auto &config = ::FarLib::get_config();
+        // The legacy registry indexes ordinary remote Regions, not EC stripes.
+        // The supported EC grouping path is Design2 semantic-six builders.
+        if (config.is_ec_batch_mode() &&
+            (::FarLib::allocator::six_group::enabled() ||
+             ::FarLib::simple_dirty_observer::enabled())) {
+            ERROR("EC supports semantic-six grouping, not legacy registry/dirty-observer geometry");
+        }
         if (::FarLib::allocator::six_group::enabled() && !config.exclusive_cache)
             ERROR("fixed-six aligned runtime currently requires exclusive_cache");
         backup_profile_window_events = std::max<size_t>(
             1, config.remote_backup_profile_window_events);
+        // The optional legacy per-entry frequency profile is external so the
+        // combined Design2/recompute entry retains Recovery's 48-byte layout. Native
+        // Resident and behavior-group hotness keep their existing counters.
+        detail::EntryFrequencyStore::set_enabled(config.profiling_enabled);
+        std::cout << "entry_metadata bytes=" << sizeof(FarObjectEntry)
+                  << " frequency_inline_bytes=0 frequency_external_enabled="
+                  << (config.profiling_enabled ? 1 : 0) << std::endl;
         backup_profile_min_score_pct = std::min<size_t>(
             100, config.remote_backup_profile_min_score_pct);
         logical_object_profile_enabled_flag =
@@ -4339,7 +4615,7 @@ public:
         // eviction call path, so it must be disabled for the entire EC cache
         // lifetime rather than relying on a transient config predicate at
         // each call site.
-        const bool ec_batch_config = config.ft_method == "ec_batch";
+        const bool ec_batch_config = config.behavior_group || config.ft_method == "ec_batch";
         ec_batch_mode_ = ec_batch_config;
         resident_profile_planner_enabled_flag =
             config.enable_resident_profile_planner;
@@ -4592,15 +4868,65 @@ public:
             resident_profile_thread =
                 std::thread([this] { run_resident_profile_planner(); });
         }
-        start_read_supply_timeline();
     }
 
     ~ConcurrentArrayCache() {
         ::FarLib::simple_region_heat::end_work();
         ec_batch_diag_report("cache_dtor_begin");
         ec_read_recovery_diag_report("cache_dtor_begin");
-        stop_read_supply_timeline();
         quiesce_background_evacuation();
+        // Report native logical-worker intervals only after every producer
+        // has joined; Work clipping excludes shutdown drain and logging.
+        profile::evict_breakdown::report();
+        if (ec_update_workers_) {
+            uint64_t commits = 0, aborts = 0, bytes = 0, wire = 0;
+            for (size_t owner = 0; owner < ec_persistent_owner_count_; ++owner) {
+                const auto &worker = ec_update_workers_[owner];
+                ASSERT(worker.count == 0);
+                commits += worker.committed; aborts += worker.aborted;
+                bytes += worker.payload_bytes; wire += worker.request_bytes;
+            }
+            std::cout << "INFO: ec_update committed=" << commits << " aborted=" << aborts
+                      << " payload_bytes=" << bytes << " request_wire_bytes=" << wire << std::endl;
+        }
+        if (ec_rmw_workers_) {
+            uint64_t attempted = 0, committed = 0, aborted = 0;
+            uint64_t fallback = 0, deferred = 0, read_bytes = 0;
+            uint64_t write_bytes = 0, read_posts = 0, write_posts = 0;
+            uint64_t full = 0, tail = 0, polls = 0, highwater = 0;
+            for (size_t owner = 0; owner < ec_persistent_owner_count_; ++owner) {
+                const auto &worker = ec_rmw_workers_[owner];
+                ASSERT(worker.pending_count() == 0);
+                attempted += worker.attempted;
+                committed += worker.committed;
+                aborted += worker.aborted;
+                fallback += worker.fallback;
+                deferred += worker.deferred;
+                read_bytes += worker.read_bytes;
+                write_bytes += worker.write_bytes;
+                read_posts += worker.read_posts;
+                write_posts += worker.write_posts;
+                full += worker.batches_full;
+                tail += worker.batches_tail;
+                polls += worker.polls;
+                highwater = std::max<uint64_t>(highwater,
+                                               worker.inflight_highwater);
+            }
+            std::cout << "INFO: ec_rmw attempted=" << attempted
+                      << " committed=" << committed
+                      << " aborted=" << aborted
+                      << " fallback=" << fallback
+                      << " deferred=" << deferred
+                      << " read_bytes=" << read_bytes
+                      << " write_bytes=" << write_bytes
+                      << " read_posts=" << read_posts
+                      << " write_posts=" << write_posts
+                      << " batches_full=" << full
+                      << " batches_tail=" << tail
+                      << " polls=" << polls
+                      << " inflight_highwater=" << highwater << std::endl;
+        }
+        ec_persistent_buffers_.reset();
         if (::FarLib::allocator::six_group::enabled()) {
             ::FarLib::allocator::six_group::registry().stop();
             ::FarLib::allocator::six_group::registry().dump();
@@ -4614,6 +4940,11 @@ public:
         ::FarLib::allocator::global_heap.print_used_memory();
         print_design1_diagnostics();
         ::FarLib::allocator::global_heap.destroy();
+        std::cout << "entry_frequency records_remaining="
+                  << detail::EntryFrequencyStore::live_records()
+                  << " allocation_failures="
+                  << detail::EntryFrequencyStore::allocation_failures()
+                  << std::endl;
         ec_batch_diag_step("cache_dtor_end");
     }
 
@@ -4640,6 +4971,20 @@ public:
         if (master_evacuation_thread) {
             uthread::join(std::move(master_evacuation_thread));
         }
+        // Persistent RMW banks may outlive a worker invocation, but never the
+        // cache. Only inspect other owners after every producer has joined.
+        if (ec_rmw_workers_) {
+            for (size_t owner = 0; owner < ec_persistent_owner_count_; ++owner) {
+                if (ec_rmw_workers_[owner].pending_count() == 0) continue;
+                auto &buffers = *persistent_evict_buffers(owner);
+                buffers.breakdown = nullptr;
+                drain_ec_rmw_worker(buffers, rdma::thread_info.thread_id);
+                flush_ec_direct_groups(buffers, rdma::thread_info.thread_id);
+            }
+        }
+        // No producer remains after join. Drain groups posted by a worker that
+        // raced the first drain, before settling failed groups and reclaiming.
+        drain_ec_batch_in_flight_groups_for_shutdown();
         // Every normal eviction worker drains its CQ before returning, but a
         // stop can race the boundary between the final post and its CQ poll.
         // Once the master and its fork/join workers have exited, no producer
@@ -4681,6 +5026,41 @@ public:
             return;
         }
         publish_resident_profile_plan();
+    }
+
+    struct SimpleResidentStateSnapshot {
+        bool local_resident_mapping;
+        uint64_t backup_used_bytes, backup_peak_bytes, backup_budget_bytes;
+        uint64_t resident_regions, resident_budget_regions;
+        uint64_t resident_bytes, resident_budget_bytes, streaming_regions;
+        uint64_t local_hot_regions, local_cold_regions;
+    };
+
+    // A diagnostic snapshot, not a globally atomic live invariant. Quiesce
+    // background workers before comparing the two independently locked ledgers.
+    // Resident bytes here are reserved physical capacity, not live payload.
+    SimpleResidentStateSnapshot simple_resident_state_snapshot() const {
+        auto &heap = ::FarLib::allocator::global_heap;
+        SimpleResidentStateSnapshot s{};
+        s.local_resident_mapping =
+            ::FarLib::simple_region_heat::local_resident_enabled();
+        s.backup_used_bytes = retained_backup_bytes.load(std::memory_order_acquire);
+        s.backup_peak_bytes = peak_retained_backup_bytes.load(std::memory_order_acquire);
+        s.backup_budget_bytes = retained_backup_budget_bytes;
+        s.resident_regions = heap.get_resident_reserved_regions();
+        s.resident_budget_regions = heap.get_resident_region_budget();
+        s.resident_bytes = s.resident_regions * ::FarLib::allocator::RegionSize;
+        s.resident_budget_bytes = resident_local_budget_bytes;
+        s.streaming_regions = heap.get_streaming_reserved_regions();
+        if (s.local_resident_mapping) {
+            for (size_t bin = 0; bin < ::FarLib::simple_region_budget::kBins; ++bin) {
+                const auto counts =
+                    ::FarLib::simple_region_budget::local().snapshot(bin).actual;
+                for (size_t c = 0; c < 3; ++c) s.local_cold_regions += counts[c];
+                for (size_t c = 3; c < 6; ++c) s.local_hot_regions += counts[c];
+            }
+        }
+        return s;
     }
 
     static FarObjectEntry &get_entry_of(far_obj_t obj) {
@@ -5007,7 +5387,10 @@ public:
             region_group_binding_enabled() ? resident_group_id : 0;
         uint32_t behavior_group = 0;
         if (::FarLib::simple_region_budget::six_enabled()) {
-            behavior_group = initial_simple_behavior_group();
+            behavior_group = initial_simple_behavior_group(
+                ::FarLib::simple_region_heat::local_resident_enabled() &&
+                requested_placement ==
+                    ::FarLib::allocator::RegionPlacement::Resident);
         } else if (::FarLib::allocator::six_group::enabled()) {
             const auto bin = ::FarLib::allocator::bin_from_wsize(
                 ::FarLib::allocator::wsize_from_size(size + sizeof(::FarLib::allocator::BlockHead)));
@@ -5017,7 +5400,8 @@ public:
                                          requested_placement,
                                          allocation_group_id, behavior_group);
         void* local_ptr = allocation.get();
-        if (::FarLib::simple_region_heat::remote_grouping_enabled()) {
+        if (::FarLib::simple_region_heat::remote_grouping_enabled() ||
+            ::FarLib::simple_region_heat::local_resident_enabled()) {
             // The first remote copy is created before the object has an
             // entry-level heat hint.  Inherit only the physical local
             // Region's hot/cold dimension: allocator fallback must not
@@ -5138,9 +5522,11 @@ public:
 
     void *fetch_with_miss_handler(far_obj_t obj, const DataMissHandler &handler,
                                   DereferenceScope &scope);
-    void fetch_wait_until_local(FarObjectEntry *entry, far_obj_t obj,
-                                size_t qp_idx, size_t client_idx,
-                                size_t endpoint_idx);
+    // An accessor move can replace the Entry during recovery. Callers must
+    // use the returned owner instead of dereferencing their original pointer.
+    [[nodiscard]] FarObjectEntry *fetch_wait_until_local(
+        FarObjectEntry *entry, void *wait_local_addr, size_t qp_idx, size_t client_idx,
+        size_t endpoint_idx);
 public:
     static constexpr const char *kProfilingMethodDisabled = "disabled";
     static constexpr const char *kProfilingMethodFineGrained = "fine_grained";
@@ -5212,11 +5598,13 @@ public:
     bool handle_sponge_ack_complete(const ibv_wc &wc);
     void check_sponge_ack_cq_ft();
     void handle_rdma_write_complete(const ibv_wc &wc);
+    void handle_rdma_write_error(const ibv_wc &wc);
     // `release_read_pin` is false only for the synthetic completion emitted
     // after an EC degraded read rebuilds the object.  The original ordinary
     // READ (and its error WC) owns the allocator pin in that case.
     void handle_rdma_read_complete(const ibv_wc &wc,
-                                   bool release_read_pin = true);
+                                   bool release_read_pin = true,
+                                   bool source_is_recompute = false);
     void handle_work_complete(const ibv_wc &wc);
 
     // --- EC (ft_method=ec_batch) group write path -------------------------
@@ -5224,27 +5612,47 @@ public:
     // only carved out by the constructor in that mode, post_ec_batch_group()
     // refuses to post anything otherwise, and no ec_batch wr_id can exist.
     size_t init_ec_batch_staging(void *local_buf, size_t local_buf_size);
+    bool stage_ec_incremental_object(EvictBufferSet &, void *, size_t, FarObjectEntry *, uint32_t);
+    void flush_ec_incremental_objects(EvictBufferSet &, size_t client_idx);
+    bool handle_ec_incremental_complete(const ibv_wc &);
+    bool stage_ec_rmw_object(EvictBufferSet &, void *, size_t, FarObjectEntry *, uint32_t);
+    void flush_ec_rmw_objects(EvictBufferSet &, size_t client_idx);
+    void drain_ec_rmw_worker(EvictBufferSet &, size_t client_idx);
+    bool handle_ec_rmw_complete(const ibv_wc &);
+    bool try_publish_ec_rmw_address(void *source, uint64_t address, size_t client_idx,
+                                    const uint64_t *expected_old = nullptr);
     bool post_ec_batch_group(const ec_batch::EcGroupSendRecord &record,
-                             size_t client_idx, size_t qp_idx);
-    size_t post_ec_batch_pending(ec_batch::EcGroupBuilder &builder,
+                             size_t client_idx, size_t qp_idx,
+                             bool *token_backpressure = nullptr);
+    size_t post_ec_batch_pending(EvictBufferSet &buffers,
                                  size_t client_idx, size_t qp_idx);
+    template <class Builder, class Pool>
+    size_t post_ec_pending_impl(EvictBufferSet &, Builder &, Pool &, size_t, size_t);
+    void account_ec_worker_builder(EvictBufferSet &buffers);
     // Segment completion of one group write; called from
     // handle_rdma_write_complete() when the wr_id carries the ec_batch tag.
     void handle_ec_batch_write_complete(uint64_t wr_id, bool success = true);
-    // Group staging used by try_evict(): ec_batch_staging_ready() reports
-    // whether a small object may be grouped (ft_method=ec_batch plus a usable
-    // staging pool) and lazily creates the builder; stage_ec_batch_object()
-    // copies the object into a data slot of the open group and publishes that
-    // segment's address as the object's remote address; the call returns false
-    // when the object has to take the flat path instead.  Both are serialized
-    // by ec_batch_stage_mutex_ against flush_ec_batch_groups().
+    // Each eviction invocation privately stages, publishes object addresses,
+    // encodes and submits its groups. Only that owner may flush its builder;
+    // completion tokens retain posted leases after the invocation returns.
     bool ec_batch_staging_ready();
-    bool stage_ec_batch_object(void *local_addr, size_t size,
-                               FarObjectEntry *entry);
+    bool stage_ec_batch_object(EvictBufferSet &buffers, void *local_addr, size_t size,
+                              FarObjectEntry *entry, uint32_t behavior_group = 0);
+    static bool ec_batch_uses_split(size_t size) {
+        // A permissive cutoff (e.g. legacy 8192) must not send >4 KiB objects
+        // into the fixed-size small-object staging buffers.
+        static_assert(rdma::Configure::behavior_group_max_whole_object_bytes ==
+                      ec_batch::kEcBatchStagingMaxSlotSize);
+        return ::FarLib::get_config().ec_object_uses_split(size);
+    }
+    bool stage_ec_split_object(void *local_addr, size_t size,
+                               FarObjectEntry *entry, uint32_t behavior_group = 0);
+    bool stage_ec_size_class_object(EvictBufferSet &, void *, size_t,
+                                    FarObjectEntry *, uint32_t);
     // Flush point of the group path: seals the partly filled group (holes zero
     // filled) and posts every sealed group.  Called from
     // EvictBufferSet::flush_all().
-    void flush_ec_batch_groups(size_t client_idx);
+    void flush_ec_batch_groups(size_t client_idx, EvictBufferSet *buffers = nullptr);
 
     // --- EC (ft_method=ec_batch) degraded READ path (read-side recovery) ----
     // All of these are inert while ft_method != ec_batch: the scratch range is
@@ -5260,7 +5668,7 @@ public:
     //                             checked before handle_rdma_read_complete();
     //   ec_recovery_endpoint_is_dead() / ec_recovery_endpoint_count();
     //   post_ec_degraded_read()/post_ec_degraded_read_entry()  post the reads of
-    //                             the five surviving segments of a group;
+    //                             exactly four selected segments of a group;
     //   handle_ec_read_segment_complete()  completion of one tagged read;
     //   ec_recovery_assist_wait()  the in-flight re-post hook of the fetch
     //                             wait/check loops.
@@ -5268,19 +5676,25 @@ public:
     void note_ec_recovery_error_wc(const ibv_wc &wc);
     bool ec_recovery_is_read_wr_id(uint64_t wr_id) const;
     bool ec_recovery_endpoint_is_dead(size_t endpoint_idx) const;
-    // Reuse paths may only keep a clean remote copy when the entry's own
-    // current endpoint is still alive.  The check is deliberately gated on
-    // ec_batch and maps this address (rather than inspecting other segments
-    // in its EC group), so a dead parity/data peer does not invalidate a
-    // healthy object backup.
-    bool reuse_ec_recovery_endpoint_is_dead(uint64_t remote_addr) const {
+    // Small objects can reuse their own healthy data segment. A split object
+    // owns the entire group: a lost data/parity segment invalidates its clean
+    // backup so the next eviction writes a fully protected replacement group.
+    bool reuse_ec_recovery_endpoint_is_dead(uint64_t remote_addr,
+                                            size_t object_size) {
         const auto &config = ::FarLib::get_config();
         if (!config.is_ec_batch_mode() || config.server_count <= 1 ||
             remote_addr == FarObjectEntry::RemoteAddrInvalid48) {
             return false;
         }
-        return ec_recovery_endpoint_is_dead(
-            config.map_remote_addr(remote_addr).first);
+        // Flat recomputable objects may also be large. Their remote address
+        // describes a whole ordinary object, not a split group's data-0 shard.
+        return ec_backup_policy::backup_endpoint_is_dead(
+            remote_allocator.small_object_stripe_manager(), remote_addr,
+            object_size != 0 && ec_batch_uses_split(object_size),
+            [&](uint64_t address) {
+                return ec_recovery_endpoint_is_dead(
+                    config.map_remote_addr(address).first);
+            });
     }
     size_t ec_recovery_endpoint_count() const;
     int ec_recovery_endpoint_for_qp_num(uint32_t qp_num) const;
@@ -5297,6 +5711,8 @@ public:
     void handle_ec_read_segment_complete(uint64_t wr_id);
     bool ec_recovery_assist_wait(FarObjectEntry *entry, size_t qp_idx,
                                  size_t client_idx);
+    bool recompute_recipe_assist_wait(FarObjectEntry *entry, size_t qp_idx,
+                                      size_t client_idx);
     void ec_read_recovery_diag_report(const char *where);
 
     // Observability of the degraded read path / of the write-side group
@@ -5363,6 +5779,23 @@ public:
     const ec_read_recovery::EcRecoveryScratchPool &ec_read_scratch_pool() const {
         return ec_read_scratch_pool_;
     }
+    size_t ec_split_buffer_in_use() const { return ec_split_buffers_.in_use(); }
+    bool ec_split_group_layout(uint64_t anchor,
+        SmallObjectStripeManager::SlotGroupHandle *group_out) {
+        auto &manager = remote_allocator.small_object_stripe_manager();
+        SmallObjectStripeManager::SlotLayout layout;
+        return group_out != nullptr && manager.slot_group_is_split(anchor) &&
+            manager.get_slot_layout(anchor, &layout) &&
+            layout.data_shard_idx == 0 && layout.data_addr == anchor &&
+            manager.get_slot_group_layout(
+                {layout.stripe_id, layout.slot_id}, group_out);
+    }
+    uint64_t ec_split_read_completions() const {
+        return ec_split_read_completions_.load(std::memory_order_relaxed);
+    }
+    uint64_t ec_split_degraded_read_completions() const {
+        return ec_split_degraded_read_completions_.load(std::memory_order_relaxed);
+    }
     size_t ec_batch_staging_reserved_bytes() const {
         return ec_staging_reserved_bytes_;
     }
@@ -5379,14 +5812,9 @@ public:
         return ::FarLib::allocator::global_heap.memory_low();
     }
 
-    // Diagnostics-only lifetime fence: the benchmark calls this before its
-    // object metadata vectors are cleared so the observer cannot dereference
-    // a stale pending-entry pointer during teardown.
-    static void stop_default_read_supply_timeline_for_diagnostics() {
-        if (default_instance) {
-            default_instance->stop_read_supply_timeline();
-        }
-    }
+    // Compatibility for shared benchmark sources. The temporary READ
+    // timeline observer has been retired; there is no observer to join.
+    static void stop_default_read_supply_timeline_for_diagnostics() {}
 
 public:
     size_t check_cq();
@@ -5422,17 +5850,32 @@ private:
     // while ft_method != ec_batch.
     ec_batch::EcStagingPool ec_staging_pool_;
     ec_batch::EcBatchTokenTable ec_batch_tokens_;
-    // The group builder (lazily created on the first grouped eviction; inert
-    // and null while ft_method != ec_batch) and the mutex that serializes
-    // staging against sealing/posting.
-    std::unique_ptr<ec_batch::EcGroupBuilder> ec_group_builder_;
-    // Staging can poll completions and yield. A kernel-thread mutex here
-    // would block a fibre worker while the lock-owning fibre is suspended.
-    uthread::Mutex ec_batch_stage_mutex_;
+    std::unique_ptr<ec_batch::EcDirectWriteBank> ec_direct_bank_;
+    std::unique_ptr<EvictBufferSet[]> ec_persistent_buffers_;
+    size_t ec_persistent_owner_count_ = 0;
+    std::unique_ptr<ec_update_runtime::Worker[]> ec_update_workers_;
+    std::unique_ptr<ec_rmw_runtime::Worker[]> ec_rmw_workers_;
+    profile::ShardedDiagnosticCounter ec_direct_data_bytes_{};
+    profile::ShardedDiagnosticCounter ec_copy_data_bytes_{};
+    profile::ShardedDiagnosticCounter ec_direct_groups_{};
+    profile::ShardedDiagnosticCounter ec_direct_write_waits_{};
+    // Work-gated, never reset while producers run; one update per endpoint
+    // batch. Retain an independent accepted-payload ledger for audit closure.
+    profile::ShardedDiagnosticCounter ec_direct_work_write_posts_{};
+    profile::ShardedDiagnosticCounter ec_direct_work_write_bytes_{};
+    // Builder state belongs to each EvictBufferSet, not the cache. Aggregate
+    // diagnostics are updated per submission batch, never used as a stage lock.
+    std::atomic<uint64_t> ec_worker_active_buffers_{0};
+    profile::ShardedDiagnosticCounter ec_worker_sealed_groups_{};
+    profile::ShardedDiagnosticCounter ec_worker_alloc_ok_{};
+    profile::ShardedDiagnosticCounter ec_worker_alloc_failed_{};
+    std::array<profile::ShardedDiagnosticCounter,
+               ec_batch::kEcBatchBehaviorGroupCount>
+        ec_worker_sealed_by_group_{};
     size_t ec_staging_reserved_bytes_ = 0;
     size_t ec_staging_slot_size_ = 0;
-    std::atomic<uint64_t> ec_batch_groups_posted_{0};
-    std::atomic<uint64_t> ec_batch_groups_completed_{0};
+    profile::ShardedDiagnosticCounter ec_batch_groups_posted_{};
+    profile::ShardedDiagnosticCounter ec_batch_groups_completed_{};
     std::atomic<uint64_t> ec_batch_post_rejects_{0};
     std::atomic<uint64_t> ec_batch_staging_release_failures_{0};
     // Last value returned by ec_batch_poll_all_cqs_once() from the ref_cnt
@@ -5445,17 +5888,29 @@ private:
     // and no teardown ordering reads any of them; every print of these values
     // (ec_batch_diag_report / ec_batch_diag_step) is gated on
     // ft_method=ec_batch, so ft_method=none keeps its output byte for byte.
-    std::atomic<uint64_t> ec_candidate_checked_{0};
-    std::atomic<uint64_t> ec_candidate_true_{0};
-    std::atomic<uint64_t> ec_diag_stage_called_{0};
-    std::atomic<uint64_t> ec_diag_stage_ok_{0};
+    // Off in normal/performance runs: no shared marker diagnostic RMWs.
+    const bool recomputable_diag_enabled_ =
+        env_flag_or_default("FARLIB_RECOMPUTABLE_DIAG", false);
+    std::atomic<uint64_t> recomputable_marked_{0};
+    std::atomic<uint64_t> recomputable_registered_{0};
+    std::atomic<uint64_t> recomputable_restored_{0};
+    std::atomic<uint64_t> recomputable_failures_{0};
+    std::atomic<uint64_t> recomputable_virtual_evictions_{0};
+    std::atomic<uint64_t> recomputable_failed_writes_{0};
+    std::atomic<uint64_t> recomputable_flat_writebacks_{0};
+    std::atomic<uint64_t> recomputable_flat_write_bytes_{0};
+    std::atomic<uint64_t> recomputable_flat_read_posts_{0};
+    profile::ShardedDiagnosticCounter ec_candidate_checked_{};
+    profile::ShardedDiagnosticCounter ec_candidate_true_{};
+    profile::ShardedDiagnosticCounter ec_diag_stage_called_{};
+    profile::ShardedDiagnosticCounter ec_diag_stage_ok_{};
     std::atomic<uint64_t> ec_diag_stage_failed_{0};
     std::atomic<uint64_t> ec_diag_stage_fail_not_ready_{0};
     std::atomic<uint64_t> ec_diag_stage_fail_no_client_{0};
     std::atomic<uint64_t> ec_diag_stage_fail_bad_segment_addr_{0};
     std::atomic<uint64_t> ec_diag_stage_fail_rounds_exhausted_{0};
-    std::atomic<uint64_t> ec_diag_add_obj_calls_{0};
-    std::atomic<uint64_t> ec_diag_add_obj_ok_{0};
+    profile::ShardedDiagnosticCounter ec_diag_add_obj_calls_{};
+    profile::ShardedDiagnosticCounter ec_diag_add_obj_ok_{};
     std::atomic<uint64_t> ec_diag_status_group_full_{0};
     std::atomic<uint64_t> ec_diag_status_staging_exhausted_{0};
     std::atomic<uint64_t> ec_diag_status_pending_queue_full_{0};
@@ -5471,10 +5926,11 @@ private:
     std::atomic<uint64_t> ec_diag_post_fail_no_client_{0};
     std::atomic<uint64_t> ec_diag_post_fail_no_token_{0};
     std::atomic<uint64_t> ec_diag_post_pending_failed_{0};
+    std::atomic<uint64_t> ec_diag_pending_token_backpressure_{0};
     std::atomic<uint64_t> ec_diag_post_write_retries_{0};
-    std::atomic<uint64_t> ec_diag_complete_cqes_{0};
-    std::atomic<uint64_t> ec_diag_complete_not_last_{0};
-    std::atomic<uint64_t> ec_diag_complete_last_{0};
+    profile::ShardedDiagnosticCounter ec_diag_complete_cqes_{};
+    profile::ShardedDiagnosticCounter ec_diag_complete_not_last_{};
+    profile::ShardedDiagnosticCounter ec_diag_complete_last_{};
 
     // --- EC (ft_method=ec_batch) read-side recovery ------------------------
     // Endpoint liveness bitmap sized by config.server_count (not by the 6
@@ -5489,6 +5945,7 @@ private:
     size_t ec_endpoint_dead_count_ = 0;
     // Grow-on-demand recovery buffers (separately registered MRs) and tokens.
     ec_read_recovery::EcRecoveryScratchPool ec_read_scratch_pool_;
+    ec_split::BufferPools ec_split_buffers_;
     ec_read_recovery::EcReadContextPool ec_read_tokens_{
         static_cast<size_t>(::FarLib::get_config().max_thread_cnt) +
         static_cast<size_t>(::FarLib::get_config().evacuate_thread_cnt) + 2};
@@ -5522,6 +5979,10 @@ private:
     std::atomic<uint64_t> ec_recovery_verify_events_{0};
     std::atomic<uint64_t> ec_recovery_group_alloc_blocked_{0};
     std::atomic<uint64_t> ec_recovery_last_summary_ms_{0};
+    std::atomic<uint64_t> ec_split_groups_staged_{0};
+    std::atomic<uint64_t> ec_split_read_posts_{0};
+    std::atomic<uint64_t> ec_split_read_completions_{0};
+    std::atomic<uint64_t> ec_split_degraded_read_completions_{0};
 };
 
 }  // namespace cache
@@ -5538,6 +5999,7 @@ private:
 #include "cache/core/fetch/fetch_path.ipp"
 #include "cache/core/rdma/rdma_completion.ipp"
 #include "cache/core/rdma/ec_batch_path.ipp"
+#include "cache/core/rdma/ec_direct_path.ipp"
 #include "recovery/ec_read_recovery.ipp"
+#include "recovery/recompute_recipe_path.ipp"
 #include "cache/core/common/common_path.ipp"
-#include "cache/core/diagnostics/read_supply_timeline.ipp"

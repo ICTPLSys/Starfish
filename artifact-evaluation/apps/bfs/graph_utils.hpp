@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -13,6 +14,8 @@
 #include <thread>
 #include <unordered_map>
 #include <fstream>
+
+#include "graph_load_affinity.hpp"
 
 struct AdjacencyList_inner {
     // A AdjacencyList contains a list of uint64_t value, each value is another vertex id.
@@ -114,19 +117,53 @@ inline void print_graph_progress(
     std::cout << std::endl;
 }
 
-bool readGraph_parallel(const std::string& baseFilename, std::vector<std::vector<uint64_t>>& adjList, uint64_t& numVertices) {
+bool readGraph_parallel(const std::string& baseFilename, std::vector<std::vector<uint64_t>>& adjList, uint64_t& numVertices,
+                        const GraphLoadAffinity& loader_affinity) {
     const int numFiles = 32;
     auto progress_start = std::chrono::steady_clock::now();
     std::vector<std::set<uint64_t>> vertexSets(numFiles);
     std::vector<std::vector<std::pair<uint64_t, uint64_t>>> edgeLists(numFiles);
     std::atomic<int> read_files_done{0};
     std::atomic<int> fill_files_done{0};
+    std::atomic<int> affinity_error{0};
+    std::atomic<int> read_affinity_applied{0};
+    std::atomic<int> fill_affinity_applied{0};
     std::mutex progress_mutex;
 
+    auto prepare_loader = [&](const char* name, std::atomic<int>& applied) {
+        // Names make /proc affinity/CPU samples distinguish these native
+        // threads from the runtime workers; naming is only diagnostic.
+        (void)pthread_setname_np(pthread_self(), name);
+        const int rc = loader_affinity.apply_to_current_thread();
+        if (rc != 0) {
+            int expected = 0;
+            affinity_error.compare_exchange_strong(expected, rc);
+            return false;
+        }
+        applied.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
+
+    auto affinity_ok = [&](const char* phase, int applied) {
+        const int error = affinity_error.load();
+        std::cout << "graph_load_affinity phase=" << phase
+                  << " threads=" << numFiles << " applied=" << applied
+                  << " cpu_count=" << loader_affinity.cpu_count()
+                  << " cpus=" << loader_affinity.cpu_list()
+                  << " error=" << error << std::endl;
+        if (error != 0) {
+            std::cerr << "Graph loader affinity failed: "
+                      << std::system_category().message(error) << std::endl;
+        }
+        return error == 0 && applied == numFiles;
+    };
+
     print_graph_progress("start", progress_start,
-                         "files=32 base=" + baseFilename);
+                         "files=32 base=" + baseFilename +
+                             " loader_cpus=" + loader_affinity.cpu_list());
 
     auto readFile = [&](int idx) {
+        if (!prepare_loader("graph-read", read_affinity_applied)) return;
         std::ifstream fin(baseFilename + "." + std::to_string(idx));
         std::string line;
         while (getline(fin, line)) {
@@ -153,6 +190,7 @@ bool readGraph_parallel(const std::string& baseFilename, std::vector<std::vector
     std::vector<std::thread> threads;
     for (int i = 0; i < numFiles; i++) threads.emplace_back(readFile, i);
     for (auto& t : threads) t.join();
+    if (!affinity_ok("read", read_affinity_applied.load())) return false;
 
     uint64_t total_input_edges = 0;
     for (int i = 0; i < numFiles; i++) {
@@ -203,6 +241,7 @@ bool readGraph_parallel(const std::string& baseFilename, std::vector<std::vector
                          "locks=" + std::to_string(locks.size()));
 
     auto worker = [&](int i) {
+        if (!prepare_loader("graph-fill", fill_affinity_applied)) return;
         for (auto& e : edgeLists[i]) {
             uint64_t u = vertexMap.at(e.first);
             uint64_t v = vertexMap.at(e.second);
@@ -228,6 +267,7 @@ bool readGraph_parallel(const std::string& baseFilename, std::vector<std::vector
         threads_new.emplace_back(worker, i);
     for (auto& t : threads_new)
         t.join();
+    if (!affinity_ok("fill", fill_affinity_applied.load())) return false;
 
     print_graph_progress("fill_adjacency_done", progress_start,
                          "undirected_edges=" +

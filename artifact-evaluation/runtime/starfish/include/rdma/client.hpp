@@ -27,6 +27,8 @@
 #include "read_batch_queue.hpp"
 #include "rdma.hpp"
 #include "rdma/sponge_rpc.hpp"
+#include "rdma/ec_update_client.hpp"
+#include "rdma/ec_rmw_client.hpp"
 #include "utils/debug.hpp"
 #include "utils/request_interval_diag.hpp"
 #include "utils/wc_object_diag.hpp"
@@ -257,6 +259,8 @@ private:
               control_qp(nullptr) {}
     };
     std::vector<EndpointQPs> endpoint_qps;
+    std::unique_ptr<ec_update::ClientTransport> ec_update_transport_;
+    std::unique_ptr<ec_rmw::ClientTransport> ec_rmw_transport_;
 
     // --- EC (ft_method=sponge) commit RPC state ---------------------------
     // Everything below stays null/zero while ft_method == none: nothing
@@ -404,6 +408,13 @@ public:
     ~ClientControl() {
         INFO("destroying rdma client");
         post_stop();
+        // Destroy every endpoint's data QP before either incremental-EC
+        // transport deregisters memory that may still be referenced by a
+        // posted WQE.  This ordering is required for both the legacy RPC
+        // receive bank and the one-sided RMW bank.
+        for (auto &endpoint : endpoint_qps) endpoint.data_qps.reset();
+        ec_update_transport_.reset();
+        ec_rmw_transport_.reset();
         release_sponge_rpc_resources();
         deallocate_buffer(buffer, config.client_buffer_size);
     }
@@ -435,6 +446,21 @@ public:
 
     void *get_buffer() const { return buffer; }
     ibv_pd *get_protection_domain() const { return pd.protection_domain; }
+    ec_update::ClientTransport *ec_update_transport() const {
+        return ec_update_transport_.get();
+    }
+    ec_rmw::ClientTransport *ec_rmw_transport() const {
+        return ec_rmw_transport_.get();
+    }
+    void fence_ec_update_endpoint(size_t ep) {
+        ASSERT(ep < endpoint_qps.size());
+        for (size_t i = 0; i < endpoint_qps[ep].data_qp_count; ++i) {
+            ibv_qp_attr attr{};
+            attr.qp_state = IBV_QPS_ERR;
+            CHECK_ERR(ibv_modify_qp(endpoint_qps[ep].data_qps[i].queue_pair,
+                                    &attr, IBV_QP_STATE));
+        }
+    }
     
     // Multi-endpoint accessors
     size_t get_server_count() const { return server_count; }
@@ -1135,20 +1161,8 @@ public:
         auto &diag = get_client(thread_info.thread_id)->immediate_read_diag;
         ++diag.physical_submit_calls;
         ++diag.attempted_chain_1;
-        ::FarLib::request_interval_diag::post_attempt_begin();
-        auto *wc_sample = ::FarLib::wc_object_diag::find_object(obj_id);
-        const uint64_t wc_submit_begin = wc_sample ? ::FarLib::wc_object_diag::stamp() : 0;
         int send_ret = ibv_post_send(endpoint_qp->queue_pair, &read_wr, &bad_wr);
-        const uint64_t wc_submit_return = wc_sample ? ::FarLib::wc_object_diag::stamp() : 0;
         bool ret = check_ibv_post_send_ret(send_ret);
-        if (wc_sample) {
-            wc_sample->post_attempts.fetch_add(1);
-            if (ret) {
-                wc_sample->submit_begin.store(wc_submit_begin);
-                wc_sample->submit_return.store(wc_submit_return);
-            }
-        }
-        ::FarLib::request_interval_diag::post_attempt_result(ret);
         if (ret) {
             ++diag.accepted_prefix_1;
             ++diag.accepted_reads;
@@ -1158,6 +1172,12 @@ public:
             diag.enqueue_to_accept_cycles_max = std::max(
                 diag.enqueue_to_accept_cycles_max, latency);
             profile::count_rdma_read_post(length);
+            // Namespace bits 63+62 identify EC degraded READs; healthy reads
+            // of EC objects are ordinary one-endpoint READs.
+            const bool ec_read = (wr_id & (3ull << 62)) == (3ull << 62);
+            profile::count_evac_phase_rdma_read(
+                ec_read ? profile::EvacRdmaTraffic::EcBatch
+                        : profile::EvacRdmaTraffic::Ordinary, length);
         } else {
             ++diag.accepted_prefix_0;
         }
@@ -1200,6 +1220,12 @@ public:
         }
         int send_ret = ibv_post_send(endpoint_qp->queue_pair, &write_wr, &bad_wr);
         bool ret = check_ibv_post_send_ret(send_ret);
+        if (ret) {
+            const bool ec_write = (wr_id & (3ull << 62)) == (1ull << 63);
+            profile::count_evac_phase_rdma_write(
+                ec_write ? profile::EvacRdmaTraffic::EcBatch
+                         : profile::EvacRdmaTraffic::Ordinary, length);
+        }
         return ret;
     }
 
@@ -1229,6 +1255,19 @@ public:
         }
         int send_ret = ibv_post_send(endpoint_qp->queue_pair, write_wr, bad_wr);
         bool return_value = check_ibv_post_send_ret(send_ret);
+        if (profile::evac_phase_metrics_enabled()) {
+            // A failed linked submission can still accept a prefix. Attribute
+            // each accepted WR exactly once, before retrying only its suffix.
+            const auto *stop = return_value ? nullptr : *bad_wr;
+            for (auto *wr = write_wr; wr != stop; wr = wr->next) {
+                size_t bytes = 0;
+                for (int i = 0; i < wr->num_sge; ++i) bytes += wr->sg_list[i].length;
+                const bool ec_write = (wr->wr_id & (3ull << 62)) == (1ull << 63);
+                profile::count_evac_phase_rdma_write(
+                    ec_write ? profile::EvacRdmaTraffic::EcBatch
+                             : profile::EvacRdmaTraffic::Ordinary, bytes);
+            }
+        }
         return return_value;
     }
 

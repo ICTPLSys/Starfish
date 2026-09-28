@@ -1,6 +1,5 @@
 #pragma once
 #include "cache/concurrent_cache.hpp"
-#include "utils/scope_diag.hpp"
 
 namespace FarLib::cache {
 
@@ -93,15 +92,8 @@ retry:
                 ERROR("hydra: lost BUSY ownership before fetch publication");
             }
         }
-        auto *diag_fibre = fibre_self();
-        scope_diag::set_pending(
-            diag_fibre, reinterpret_cast<uintptr_t>(&entry));
-        {
-            scope_diag::Guard diag_guard(diag_fibre, scope_diag::RDMA_POST);
-            this->post_read_request_with_idx(obj, client_idx,
-                                             sync_batch_eligible);
-            scope_diag::posted(diag_fibre);
-        }
+        this->post_read_request_with_idx(obj, client_idx,
+                                         sync_batch_eligible);
         signal::enable_signal();
         record_non_fast_path_access(entry, profile::ReferenceKind::Read);
         return false;
@@ -125,6 +117,7 @@ template <bool Mut, bool Profile>
 inline bool ConcurrentArrayCache::post_fetch_lite(far_obj_t obj,
                                                   DereferenceScope &scope,
                                                   bool sync_batch_eligible) {
+    if (hydra::runtime_packing_enabled()) hydra_record_demand(*obj.get_entry_ptr());
     auto &entry = get_entry_of(obj);
     auto old_state = entry.load_state(std::memory_order::relaxed);
     if (fetch_lite_fast_path<Mut>(old_state)) [[likely]] {
@@ -265,15 +258,8 @@ retry:
                 ERROR("hydra: lost BUSY ownership before fetch publication");
             }
         }
-        auto *diag_fibre = fibre_self();
-        scope_diag::set_pending(
-            diag_fibre, reinterpret_cast<uintptr_t>(&entry));
-        {
-            scope_diag::Guard diag_guard(diag_fibre, scope_diag::RDMA_POST);
-            this->post_read_request_with_idx(obj, client_idx,
-                                             sync_batch_eligible);
-            scope_diag::posted(diag_fibre);
-        }
+        this->post_read_request_with_idx(obj, client_idx,
+                                         sync_batch_eligible);
         signal::enable_signal();
         if constexpr (Profile) {
             record_non_fast_path_access(entry,
@@ -346,12 +332,7 @@ inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
             std::memory_order_acquire);
         return current_obj.is_null() ? entry : &get_entry_of(current_obj);
     };
-    auto *diag_fibre = fibre_self();
-    scope_diag::set_pending(
-        diag_fibre, reinterpret_cast<uintptr_t>(entry));
-    {
-        scope_diag::Guard diag_guard(diag_fibre, scope_diag::RDMA_WAIT);
-        const bool ec_wait = ::FarLib::get_config().is_ec_batch_mode();
+    const bool ec_wait = ::FarLib::get_config().is_ec_batch_mode();
         // A recipe callback may scan a large immutable input (Wordcount's
         // local map is the first user).  Keep the network recovery watchdog
         // bounded, but do not apply its 30-second budget to a legitimate
@@ -366,7 +347,7 @@ inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
         uint64_t ec_wait_rounds = 0;
-        while (true) {
+    while (true) {
             entry = resolve_wait_entry();
             if (entry->is_local()) break;
             client_idx = entry->get_client_idx();
@@ -404,15 +385,7 @@ inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
             }
             check_cq_idx_with_client_idx_endpoint(qp_idx, client_idx,
                                                   endpoint_idx);
-        }
     }
-    if (auto *diag_slot = scope_diag::current(diag_fibre)) {
-        request_interval_diag::requester_resumed(
-            scope_diag::index(diag_slot),
-            reinterpret_cast<uint64_t>(diag_fibre),
-            reinterpret_cast<uint64_t>(entry));
-    }
-    scope_diag::clear_pending(diag_fibre);
     return entry;
 }
 
@@ -444,6 +417,7 @@ template <bool Mut>
 inline void *ConcurrentArrayCache::fetch_lite(far_obj_t obj,
                                               const DataMissHandler &handler,
                                               DereferenceScope &scope) {
+    if (hydra::runtime_packing_enabled()) hydra_record_demand(*obj.get_entry_ptr());
     auto entry = &get_entry_of(obj);
     auto state = entry->load_state(std::memory_order::relaxed);
     if (fetch_lite_fast_path<Mut>(state)) [[likely]] {
@@ -460,6 +434,7 @@ inline void *ConcurrentArrayCache::fetch_lite(far_obj_t obj,
 template <bool Mut>
 inline void *ConcurrentArrayCache::fetch_lite_no_profile(
     far_obj_t obj, const DataMissHandler &handler, DereferenceScope &scope) {
+    if (hydra::runtime_packing_enabled()) hydra_record_demand(*obj.get_entry_ptr());
     auto entry = &get_entry_of(obj);
     auto state = entry->load_state(std::memory_order::relaxed);
     if (fetch_lite_fast_path<Mut>(state)) [[likely]] {

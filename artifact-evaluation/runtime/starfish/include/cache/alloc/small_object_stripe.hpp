@@ -36,6 +36,7 @@
 // retain their original addresses for recovery.
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -48,6 +49,9 @@
 
 #include "cache/alloc/region_remote_allocator.hpp"
 #include "cache/alloc/small_object_stripe_codec.hpp"
+
+#include "utils/ec_benchmark_phase.hpp"
+#include "utils/ec_rmw_prepare_trace.hpp"
 
 #include "rdma/config.hpp"
 #include "utils/debug.hpp"
@@ -168,6 +172,32 @@ private:
 };
 
 class SmallObjectStripeManager {
+public:
+    // Aggregate counters only: do not collect example objects on the hot path.
+    struct SpaceUsage {
+        // Active means sealed or in-progress.  A dead group is retained as a
+        // reusable reservation and is reported separately below.
+        uint64_t occupied_group_bytes = 0;
+        uint64_t sealed_group_bytes = 0;
+        uint64_t live_payload_bytes = 0;
+        uint64_t live_data_slot_bytes = 0;
+        // Short name used by the reporting layer; equal to
+        // live_data_slot_bytes in every snapshot.
+        uint64_t live_slot_bytes = 0;
+        uint64_t parity_bytes = 0;
+        uint64_t trapped_hole_bytes = 0;
+        uint64_t padding_bytes = 0;
+        std::array<uint64_t, 5> group_counts_by_live{};
+        uint64_t split_groups = 0;
+        uint64_t in_progress_groups = 0;
+        uint64_t reusable_groups = 0;
+        uint64_t reusable_group_bytes = 0;
+        uint64_t reserved_stripe_bytes = 0;
+        uint64_t unknown_payload_objects = 0;
+        uint64_t sealed_small_groups = 0;
+        std::vector<uint64_t> endpoint_occupied_bytes;
+    };
+
 private:
     static constexpr uint8_t kDataShards = kSmallObjectStripeDataShards;
     static constexpr uint8_t kParityShards = kSmallObjectStripeParityShards;
@@ -250,6 +280,118 @@ private:
             }
             return false;
         }
+
+        // Find a set bit without changing bitmap.  Candidate bitmaps are
+        // protected by their stripe mutex, so this gives indexed reuse a
+        // bounded cursor walk without an object/slot table scan.
+        bool find_set(size_t start, size_t *bit_out) const {
+            if (words.empty() || bit_out == nullptr) return false;
+            const size_t word_count = words.size();
+            const size_t first_word = (start / kBitsPerWord) % word_count;
+            const size_t first_bit = start % kBitsPerWord;
+            for (size_t i = 0; i < word_count; i++) {
+                const size_t word_idx = (first_word + i) % word_count;
+                uint64_t word = words[word_idx];
+                if (i == 0 && first_bit != 0) {
+                    word &= ~((1ULL << first_bit) - 1ULL);
+                }
+                if (word == 0) continue;
+                const int bit = __builtin_ctzll(word);
+                *bit_out = word_idx * kBitsPerWord +
+                           static_cast<size_t>(bit);
+                return true;
+            }
+            // With one word, the loop above masks bits before `start` and
+            // never visits that same word again. Complete the wraparound
+            // explicitly; otherwise a lone candidate below the cursor could
+            // remain unreachable forever.
+            if (first_bit != 0) {
+                const uint64_t word =
+                    words[first_word] & ((1ULL << first_bit) - 1ULL);
+                if (word != 0) {
+                    const int bit = __builtin_ctzll(word);
+                    *bit_out = first_word * kBitsPerWord +
+                               static_cast<size_t>(bit);
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
+
+    // Reuse keys are the six semantic behavior groups used by ec_batch.  The
+    // key is intentionally fixed-size: index construction happens before the
+    // first Work phase and never allocates on the RMW hot path.
+    static constexpr uint8_t kReuseBehaviorGroupCount = 6;
+
+    // Manager-wide stripe summary.  Bits are published with release ordering
+    // after a per-stripe candidate bit is set, and cleared only while holding
+    // that stripe's mutex.  A stale set bit is harmless; begin_slot_reuse_*()
+    // revalidates under the same mutex before reserving.
+    struct AtomicBitmap {
+        std::unique_ptr<std::atomic<uint64_t>[]> words;
+        size_t word_count = 0;
+        size_t bit_count = 0;
+
+        void init(size_t bits) {
+            bit_count = bits;
+            word_count = (bits + kBitsPerWord - 1) / kBitsPerWord;
+            words.reset(word_count == 0
+                            ? nullptr
+                            : new std::atomic<uint64_t>[word_count]);
+            for (size_t i = 0; i < word_count; i++) {
+                words[i].store(0, std::memory_order_relaxed);
+            }
+        }
+
+        void set(size_t bit) {
+            if (bit >= bit_count || word_count == 0) return;
+            words[bit / kBitsPerWord].fetch_or(
+                1ULL << (bit % kBitsPerWord), std::memory_order_release);
+        }
+
+        void reset(size_t bit) {
+            if (bit >= bit_count || word_count == 0) return;
+            words[bit / kBitsPerWord].fetch_and(
+                ~(1ULL << (bit % kBitsPerWord)), std::memory_order_release);
+        }
+
+        bool find_set(size_t start, size_t *bit_out) const {
+            if (word_count == 0 || bit_out == nullptr) return false;
+            const size_t first_word = (start / kBitsPerWord) % word_count;
+            const size_t first_bit = start % kBitsPerWord;
+            for (size_t i = 0; i < word_count; i++) {
+                const size_t word_idx = (first_word + i) % word_count;
+                uint64_t word = words[word_idx].load(std::memory_order_acquire);
+                if (i == 0 && first_bit != 0) {
+                    word &= ~((1ULL << first_bit) - 1ULL);
+                }
+                if (word == 0) continue;
+                const int bit = __builtin_ctzll(word);
+                const size_t candidate =
+                    word_idx * kBitsPerWord + static_cast<size_t>(bit);
+                if (candidate < bit_count) {
+                    *bit_out = candidate;
+                    return true;
+                }
+            }
+            // Complete one-word wraparound; see Bitmap::find_set().
+            if (first_bit != 0) {
+                const uint64_t word =
+                    words[first_word].load(std::memory_order_acquire) &
+                    ((1ULL << first_bit) - 1ULL);
+                if (word != 0) {
+                    const int bit = __builtin_ctzll(word);
+                    const size_t candidate =
+                        first_word * kBitsPerWord + static_cast<size_t>(bit);
+                    if (candidate < bit_count) {
+                        *bit_out = candidate;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
     };
 
     struct Stripe {
@@ -268,19 +410,63 @@ private:
         // 4-bit live mask per slot_id (bit i = data shard i).
         bool in_group_pool = false;
         uint32_t next_group_slot = 0;   // group allocation cursor
+        uint32_t reuse_scan_slot = 0;   // bounded retired-slot scan cursor
         uint32_t group_dead_count = 0;  // dead groups, reusable as a whole
         std::array<uint32_t, kShardCount> shard_endpoint{};
         std::vector<uint64_t> group_state_words;
         std::vector<uint8_t> group_live_mask;
+        // A slot-reuse transaction reserves one retired data bit without
+        // changing the committed live mask.  The coordinator publishes the
+        // bit only after its three absolute writes have reached terminal
+        // completion.  Keeping this separate is what prevents a pending
+        // target from being mistaken for a readable object or a dead group.
+        std::vector<uint8_t> group_pending_mask;
+        std::vector<uint8_t> group_durable;
+        std::vector<uint32_t> group_behavior_group;
+        std::vector<uint64_t> group_generation;
         // Live *object* counter per slot_id: how many of the group's four data
         // segments still hold an object.  Maintained together with
         // group_live_mask (count == popcount(mask)) by seal_slot_group /
         // release_group_object / mark_dead_group.
         std::vector<uint8_t> group_live_objects;
+        // A split object owns all four data fragments as one public object.
+        // The live mask remains 0xf; this metadata distinguishes split
+        // ownership from an ordinary batch with holes.
+        std::vector<uint8_t> group_is_split;
+        // Payload accounting is group-local so release can subtract the
+        // exact object size without an address-keyed table or a global lock.
+        std::vector<std::array<uint32_t, kDataShards>> group_payload_sizes;
+        std::vector<uint8_t> group_payload_unknown;
+        // Per-stripe accounting.  All fields below are plain values and are
+        // read/written only while this stripe's existing mutex is held.
+        uint64_t occupied_group_bytes = 0;
+        uint64_t sealed_group_bytes = 0;
+        uint64_t live_payload_bytes = 0;
+        uint64_t live_data_slot_bytes = 0;
+        uint64_t parity_bytes = 0;
+        uint64_t trapped_hole_bytes = 0;
+        uint64_t padding_bytes = 0;
+        std::array<uint64_t, 5> group_counts_by_live{};
+        uint64_t split_groups = 0;
+        uint64_t in_progress_groups = 0;
+        uint64_t reusable_groups = 0;
+        uint64_t unknown_payload_objects = 0;
+        uint64_t sealed_small_groups = 0;
         // Set (never cleared) when group metadata is materialised for this
         // stripe, so the group-aware release can tell "this stripe never served
         // a group" without taking the stripe mutex.
         std::atomic<bool> has_groups{false};
+        // Conservative fast-path hint for begin_slot_reuse().  It may stay
+        // true after a candidate is consumed, but it is cleared only by a
+        // complete under-lock slot sweep; false is never published while an
+        // eligible partial durable group can still exist.
+        std::atomic<bool> reuse_candidate{false};
+        // Exact candidate slots, partitioned by behavior key.  Each bit is
+        // set only for a durable sealed non-split group with no pending
+        // update and at least one retired data segment.  Access is serialized
+        // by this stripe's mutex; manager-level summary bits point directly
+        // to stripes whose bitmap for a requested key is non-empty.
+        std::array<Bitmap, kReuseBehaviorGroupCount> reuse_bits;
         std::array<uint64_t, kShardCount> shard_base{};
         std::array<Bitmap, kDataShards> free_bits;
         std::array<Bitmap, kDataShards> dead_bits;
@@ -369,6 +555,18 @@ public:
         uint64_t slot_offset = 0;
         std::array<SlotGroupSegment, kShardCount> segments{};
     };
+
+    // Client-coordinated reuse of one retired data slot in an already sealed
+    // group.  `generation` is an ABA guard for delayed commit/abort callbacks;
+    // `data_shard` identifies the retired data segment that remains outside
+    // the committed live mask until commit_slot_reuse().
+    struct SlotReuse {
+        SlotGroupHandle group;
+        uint64_t generation = 0;
+        uint8_t data_shard = 0xff;
+        uint32_t size = 0;
+        uint32_t behavior_group = 0;
+    };
 private:
     struct SizeClassPool {
         std::mutex mutex;
@@ -398,6 +596,13 @@ private:
     // of the single-object pool so the two paths cannot hand out the same
     // slot offset.
     std::array<SizeClassPool, ::FarLib::allocator::RegionBinCount> group_pools_;
+    // Direct reuse index: one atomic stripe-summary bitmap per (size class,
+    // behavior) key. Stripe-local candidate bitmaps carry exact slot IDs;
+    // summaries avoid scanning unrelated stripes while remaining lock-free
+    // for readers.
+    std::array<std::array<AtomicBitmap, kReuseBehaviorGroupCount>,
+               ::FarLib::allocator::RegionBinCount>
+        reuse_stripe_summaries_;
     std::mutex stripes_mutex_;
     std::atomic<uint64_t> next_endpoint_{0};
     // Endpoint liveness lives in RemoteGlobalHeap and is shared with ordinary
@@ -405,6 +610,17 @@ private:
     // published by a stripe; it only filters future placement and reusable
     // group-pool candidates here.
     inline static thread_local LocalLeases local_leases_;
+
+    struct LocalReuseCursor {
+        const SmallObjectStripeManager *owner;
+        // One traversal cursor is sufficient across keys. Keep TLS compact:
+        // libfibre idle pthreads have a small stack shared with static TLS.
+        size_t next_stripe = 0;
+        size_t legacy_next_stripe = 0;
+
+        LocalReuseCursor() : owner(nullptr) {}
+    };
+    inline static thread_local LocalReuseCursor local_reuse_cursor_;
 
     static size_t bin_from_size(size_t size) {
         size_t wsize = ::FarLib::allocator::wsize_from_size(size);
@@ -584,6 +800,66 @@ private:
         return group_state_locked(stripe, slot) != kSlotGroupFree;
     }
 
+    static uint8_t group_pending_mask_locked(const Stripe &stripe,
+                                             uint32_t slot) {
+        if (slot >= stripe.group_pending_mask.size()) return 0;
+        return static_cast<uint8_t>(stripe.group_pending_mask[slot] & 0x0fu);
+    }
+
+    static bool group_update_pending_locked(const Stripe &stripe,
+                                            uint32_t slot) {
+        return group_pending_mask_locked(stripe, slot) != 0;
+    }
+
+    // Behavior-independent aggregate hint. Exact candidate slots live in the
+    // per-behavior bitmaps, so this helper never walks group records.
+    static bool stripe_has_reuse_candidate_locked(const Stripe &stripe) {
+        if (!::FarLib::ec_benchmark_phase::enabled()) {
+            if (stripe.group_state_words.empty()) return false;
+            for (uint32_t slot = 0; slot < stripe.slots_per_shard; slot++) {
+                if (group_state_locked(stripe, slot) != kSlotGroupSealed ||
+                    slot >= stripe.group_durable.size() ||
+                    stripe.group_durable[slot] == 0 ||
+                    slot >= stripe.group_is_split.size() ||
+                    stripe.group_is_split[slot] != 0 ||
+                    slot >= stripe.group_live_mask.size()) {
+                    continue;
+                }
+                const uint8_t live = static_cast<uint8_t>(
+                    stripe.group_live_mask[slot] & 0x0fu);
+                if (live != 0x0fu) return true;
+            }
+            return false;
+        }
+        for (uint8_t behavior = 0; behavior < kReuseBehaviorGroupCount;
+             behavior++) {
+            if (stripe.reuse_bits[behavior].any_set()) return true;
+        }
+        return false;
+    }
+
+    static uint64_t next_group_generation_locked(Stripe &stripe,
+                                                 uint32_t slot) {
+        if (slot >= stripe.group_generation.size()) return 0;
+        uint64_t next = stripe.group_generation[slot] + 1;
+        if (next == 0) next = 1;
+        stripe.group_generation[slot] = next;
+        return next;
+    }
+
+    static bool group_endpoints_alive_for_reuse(const Stripe &stripe) {
+        auto &heap = ::FarLib::allocator::remote::remote_global_heap;
+        if (!heap.endpoint_liveness_enabled()) return true;
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            const uint32_t endpoint = stripe.shard_endpoint[shard];
+            if (endpoint == kInvalidEndpointIdx ||
+                !heap.endpoint_is_alive(endpoint)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Invariant 3: the six shards of a group must sit on six distinct
     // endpoints; unset endpoints (kInvalidEndpointIdx) also fail here.
     static bool endpoints_distinct(const Stripe &stripe) {
@@ -608,14 +884,220 @@ private:
         stripe.group_state_words.assign(
             (bits + kBitsPerWord - 1) / kBitsPerWord, 0);
         stripe.group_live_mask.assign(stripe.slots_per_shard, 0);
+        stripe.group_pending_mask.assign(stripe.slots_per_shard, 0);
+        stripe.group_durable.assign(stripe.slots_per_shard, 0);
+        stripe.group_behavior_group.assign(stripe.slots_per_shard, 0);
+        stripe.group_generation.assign(stripe.slots_per_shard, 0);
         stripe.next_group_slot = 0;
         stripe.group_dead_count = 0;
         stripe.group_live_objects.assign(stripe.slots_per_shard, 0);
+        stripe.group_is_split.assign(stripe.slots_per_shard, 0);
+        stripe.group_payload_sizes.assign(
+            stripe.slots_per_shard,
+            std::array<uint32_t, kDataShards>{});
+        stripe.group_payload_unknown.assign(stripe.slots_per_shard, 0);
+        if (::FarLib::ec_benchmark_phase::enabled()) {
+            for (uint8_t behavior = 0; behavior < kReuseBehaviorGroupCount;
+                 behavior++) {
+                stripe.reuse_bits[behavior].init_empty(
+                    stripe.slots_per_shard);
+            }
+        }
         // Published before the first group slot address can exist: the release
         // path uses it to skip the group lookup for stripes that never served a
         // group, and it is never cleared again.
         stripe.has_groups.store(true, std::memory_order_release);
         return true;
+    }
+
+    static uint64_t group_reserved_bytes(const Stripe &stripe) {
+        return static_cast<uint64_t>(kShardCount) * stripe.slot_size;
+    }
+
+    static uint64_t group_parity_bytes(const Stripe &stripe) {
+        return static_cast<uint64_t>(kParityShards) * stripe.slot_size;
+    }
+
+    static uint8_t group_live_slots_locked(const Stripe &stripe,
+                                           uint32_t slot) {
+        if (slot >= stripe.group_live_mask.size()) return 0;
+        return static_cast<uint8_t>(
+            __builtin_popcount(static_cast<unsigned>(
+                stripe.group_live_mask[slot] & 0x0fu)));
+    }
+
+    static uint32_t group_unknown_count_locked(const Stripe &stripe,
+                                               uint32_t slot) {
+        if (slot >= stripe.group_payload_unknown.size() ||
+            slot >= stripe.group_live_mask.size()) {
+            return 0;
+        }
+        return static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>(
+            stripe.group_payload_unknown[slot] &
+            stripe.group_live_mask[slot] & 0x0fu)));
+    }
+
+    static uint64_t group_payload_bytes_locked(const Stripe &stripe,
+                                               uint32_t slot) {
+        if (slot >= stripe.group_payload_sizes.size() ||
+            slot >= stripe.group_live_mask.size()) {
+            return 0;
+        }
+        const uint8_t mask = stripe.group_live_mask[slot] & 0x0fu;
+        uint64_t bytes = 0;
+        for (uint8_t i = 0; i < kDataShards; i++) {
+            if ((mask & static_cast<uint8_t>(1u << i)) != 0) {
+                bytes += stripe.group_payload_sizes[slot][i];
+            }
+        }
+        return bytes;
+    }
+
+    // Account a fresh or dead-group-backed allocation.  The caller owns the
+    // stripe mutex; no global atomic or lock is involved.
+    static void account_group_allocate_locked(Stripe &stripe,
+                                               bool from_dead) {
+        if (from_dead) {
+            assert(stripe.reusable_groups > 0);
+            stripe.reusable_groups--;
+        }
+        stripe.occupied_group_bytes += group_reserved_bytes(stripe);
+        stripe.in_progress_groups++;
+    }
+
+    static void account_group_seal_locked(Stripe &stripe, uint32_t slot,
+                                          bool split) {
+        const uint64_t reserved = group_reserved_bytes(stripe);
+        const uint64_t parity = group_parity_bytes(stripe);
+        const uint8_t live = split ? kDataShards
+                                   : group_live_slots_locked(stripe, slot);
+        const uint64_t payload = group_payload_bytes_locked(stripe, slot);
+        const uint32_t unknown = group_unknown_count_locked(stripe, slot);
+        assert(stripe.in_progress_groups > 0);
+        stripe.in_progress_groups--;
+        stripe.sealed_group_bytes += reserved;
+        stripe.parity_bytes += parity;
+        stripe.live_data_slot_bytes +=
+            static_cast<uint64_t>(live) * stripe.slot_size;
+        if (!split) {
+            stripe.trapped_hole_bytes +=
+                static_cast<uint64_t>(kDataShards - live) * stripe.slot_size;
+            assert(live <= kDataShards);
+            stripe.group_counts_by_live[live]++;
+            stripe.sealed_small_groups++;
+        }
+        stripe.live_payload_bytes += payload;
+        const uint64_t live_capacity =
+            static_cast<uint64_t>(live) * stripe.slot_size;
+        assert(live_capacity >= payload);
+        stripe.padding_bytes += live_capacity - payload;
+        stripe.unknown_payload_objects += unknown;
+        if (split) {
+            stripe.split_groups++;
+        }
+    }
+
+    static void account_group_dead_locked(Stripe &stripe, uint32_t slot,
+                                          bool split) {
+        const uint64_t reserved = group_reserved_bytes(stripe);
+        const uint64_t parity = group_parity_bytes(stripe);
+        const uint8_t live = split ? kDataShards
+                                   : group_live_slots_locked(stripe, slot);
+        const uint64_t payload = group_payload_bytes_locked(stripe, slot);
+        const uint32_t unknown = group_unknown_count_locked(stripe, slot);
+        assert(stripe.occupied_group_bytes >= reserved);
+        stripe.occupied_group_bytes -= reserved;
+        const uint8_t state = group_state_locked(stripe, slot);
+        if (state == kSlotGroupInProgress) {
+            assert(stripe.in_progress_groups > 0);
+            stripe.in_progress_groups--;
+        } else if (state == kSlotGroupSealed) {
+            assert(stripe.sealed_group_bytes >= reserved);
+            assert(stripe.parity_bytes >= parity);
+            assert(stripe.live_data_slot_bytes >=
+                   static_cast<uint64_t>(live) * stripe.slot_size);
+            stripe.sealed_group_bytes -= reserved;
+            stripe.parity_bytes -= parity;
+            stripe.live_data_slot_bytes -=
+                static_cast<uint64_t>(live) * stripe.slot_size;
+            const uint64_t holes = split
+                                       ? 0
+                                       : static_cast<uint64_t>(kDataShards - live) *
+                                             stripe.slot_size;
+            assert(stripe.trapped_hole_bytes >= holes);
+            stripe.trapped_hole_bytes -= holes;
+            assert(stripe.live_payload_bytes >= payload);
+            stripe.live_payload_bytes -= payload;
+            const uint64_t live_capacity =
+                static_cast<uint64_t>(live) * stripe.slot_size;
+            assert(live_capacity >= payload);
+            assert(stripe.padding_bytes >= live_capacity - payload);
+            stripe.padding_bytes -= live_capacity - payload;
+            assert(stripe.unknown_payload_objects >= unknown);
+            stripe.unknown_payload_objects -= unknown;
+            if (split) {
+                assert(stripe.split_groups > 0);
+                stripe.split_groups--;
+            } else {
+                assert(live <= kDataShards);
+                assert(stripe.group_counts_by_live[live] > 0);
+                stripe.group_counts_by_live[live]--;
+                assert(stripe.sealed_small_groups > 0);
+                stripe.sealed_small_groups--;
+            }
+        } else {
+            // The helper is only called for a live group transition.  Keep an
+            // assertion here so a future state-machine change cannot silently
+            // corrupt the counters.
+            assert(false && "account_group_dead_locked on non-live group");
+        }
+        stripe.reusable_groups++;
+    }
+
+    static void account_group_object_release_locked(Stripe &stripe,
+                                                     uint32_t slot,
+                                                     uint8_t shard) {
+        assert(slot < stripe.group_payload_sizes.size());
+        assert(shard < kDataShards);
+        const uint32_t payload = stripe.group_payload_sizes[slot][shard];
+        assert(stripe.live_data_slot_bytes >= stripe.slot_size);
+        assert(stripe.live_payload_bytes >= payload);
+        stripe.live_data_slot_bytes -= stripe.slot_size;
+        stripe.live_payload_bytes -= payload;
+        assert(stripe.padding_bytes >= stripe.slot_size - payload);
+        stripe.padding_bytes -= stripe.slot_size - payload;
+        stripe.trapped_hole_bytes += stripe.slot_size;
+        const uint8_t bit = static_cast<uint8_t>(1u << shard);
+        if ((stripe.group_payload_unknown[slot] & bit) != 0) {
+            assert(stripe.unknown_payload_objects > 0);
+            stripe.unknown_payload_objects--;
+            stripe.group_payload_unknown[slot] = static_cast<uint8_t>(
+                stripe.group_payload_unknown[slot] & ~bit);
+        }
+    }
+
+    // Fill one previously retired data slot while keeping the six-segment
+    // reservation and sealed-group parity accounting intact.  The caller has
+    // already validated the pending generation and holds stripe.mutex.
+    static void account_group_slot_reuse_commit_locked(
+        Stripe &stripe, uint32_t slot, uint8_t shard, uint32_t payload) {
+        assert(shard < kDataShards);
+        assert(slot < stripe.group_live_mask.size());
+        const uint8_t old_live = group_live_slots_locked(stripe, slot);
+        assert(old_live < kDataShards);
+        assert((stripe.group_live_mask[slot] &
+                static_cast<uint8_t>(1u << shard)) == 0);
+        assert(payload > 0 && payload <= stripe.slot_size);
+        assert(stripe.trapped_hole_bytes >= stripe.slot_size);
+        stripe.trapped_hole_bytes -= stripe.slot_size;
+        stripe.live_data_slot_bytes += stripe.slot_size;
+        stripe.live_payload_bytes += payload;
+        stripe.padding_bytes += stripe.slot_size - payload;
+        if (old_live <= kDataShards) {
+            assert(stripe.group_counts_by_live[old_live] > 0);
+            stripe.group_counts_by_live[old_live]--;
+            stripe.group_counts_by_live[old_live + 1]++;
+        }
     }
 
     // Invariants 1 and 2: a candidate offset is only taken when all four data
@@ -667,7 +1149,15 @@ private:
             }
             set_group_state_locked(stripe, slot, kSlotGroupInProgress);
             stripe.group_live_mask[slot] = 0;
+            stripe.group_pending_mask[slot] = 0;
+            stripe.group_durable[slot] = 0;
+            stripe.group_behavior_group[slot] = 0;
+            (void)next_group_generation_locked(stripe, slot);
             stripe.group_live_objects[slot] = 0;
+            stripe.group_is_split[slot] = 0;
+            stripe.group_payload_sizes[slot].fill(0);
+            stripe.group_payload_unknown[slot] = 0;
+            account_group_allocate_locked(stripe, from_dead);
             stripe.live_count += kDataShards;
             *slot_id_out = slot;
             if (from_dead_out != nullptr) *from_dead_out = from_dead;
@@ -726,6 +1216,32 @@ private:
         *group_out = handle;
         return true;
     }
+
+    // Validate the immutable physical handle carried by a slot-reuse
+    // callback.  The generation check protects allocator metadata from ABA;
+    // this check additionally prevents a caller that retained or modified a
+    // stale handle from committing metadata for a different physical layout.
+    static bool same_group_handle(const SlotGroupHandle &a,
+                                  const SlotGroupHandle &b) {
+        if (a.id.stripe_id != b.id.stripe_id ||
+            a.id.slot_id != b.id.slot_id || a.bin != b.bin ||
+            a.slot_size != b.slot_size ||
+            a.slots_per_shard != b.slots_per_shard ||
+            a.slot_offset != b.slot_offset) {
+            return false;
+        }
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            const SlotGroupSegment &as = a.segments[shard];
+            const SlotGroupSegment &bs = b.segments[shard];
+            if (as.shard_idx != bs.shard_idx ||
+                as.endpoint_idx != bs.endpoint_idx || as.offset != bs.offset ||
+                as.addr != bs.addr || as.slot_size != bs.slot_size) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void clear_local_lease(uint16_t bin) {
         auto &lease = local_leases_.bins[bin];
         if (lease.owner == this) {
@@ -817,6 +1333,126 @@ private:
         // preserves its old physical addresses while ensuring all newly
         // allocated groups include the spare.
         return !standby_active || has_standby;
+    }
+
+    static bool reuse_behavior_indexable(uint32_t behavior_group) {
+        return behavior_group < kReuseBehaviorGroupCount;
+    }
+
+    AtomicBitmap &reuse_summary(uint16_t bin, uint32_t behavior_group) {
+        assert(bin < ::FarLib::allocator::RegionBinCount);
+        assert(reuse_behavior_indexable(behavior_group));
+        return reuse_stripe_summaries_[bin][behavior_group];
+    }
+
+    const AtomicBitmap &reuse_summary(uint16_t bin,
+                                      uint32_t behavior_group) const {
+        assert(bin < ::FarLib::allocator::RegionBinCount);
+        assert(reuse_behavior_indexable(behavior_group));
+        return reuse_stripe_summaries_[bin][behavior_group];
+    }
+
+    static void refresh_reuse_hint_locked(Stripe &stripe) {
+        bool any = false;
+        for (uint8_t behavior = 0; behavior < kReuseBehaviorGroupCount;
+             behavior++) {
+            if (stripe.reuse_bits[behavior].any_set()) {
+                any = true;
+                break;
+            }
+        }
+        stripe.reuse_candidate.store(any, std::memory_order_release);
+    }
+
+    void clear_reuse_summary_if_empty_locked(Stripe &stripe,
+                                             uint32_t behavior_group) {
+        if (!reuse_behavior_indexable(behavior_group)) return;
+        if (!stripe.reuse_bits[behavior_group].any_set()) {
+            reuse_summary(stripe.bin, behavior_group).reset(
+                static_cast<size_t>(stripe.stripe_id));
+        }
+    }
+
+    // Publish or clear one exact candidate bit. Caller holds stripe.mutex.
+    // The summary is deliberately conservative: an occasional stale set bit
+    // is revalidated and cleared by begin_slot_reuse_indexed().
+    void update_reuse_index_locked(Stripe &stripe, uint32_t slot) {
+        if (!::FarLib::ec_benchmark_phase::enabled()) return;
+        if (slot >= stripe.slots_per_shard ||
+            stripe.reuse_bits[0].words.empty()) {
+            return;
+        }
+        uint32_t behavior = 0;
+        bool eligible = false;
+        if (group_state_locked(stripe, slot) == kSlotGroupSealed &&
+            slot < stripe.group_durable.size() &&
+            stripe.group_durable[slot] != 0 &&
+            slot < stripe.group_is_split.size() &&
+            stripe.group_is_split[slot] == 0 &&
+            slot < stripe.group_live_mask.size() &&
+            (stripe.group_live_mask[slot] & 0x0fu) != 0x0fu &&
+            !group_update_pending_locked(stripe, slot) &&
+            slot < stripe.group_behavior_group.size()) {
+            behavior = stripe.group_behavior_group[slot];
+            eligible = reuse_behavior_indexable(behavior) &&
+                       endpoints_distinct(stripe) &&
+                       group_endpoints_alive_for_reuse(stripe) &&
+                       stripe_eligible_for_new_group(stripe);
+        }
+
+        if (eligible) {
+            stripe.reuse_bits[behavior].set(slot);
+            reuse_summary(stripe.bin, behavior).set(
+                static_cast<size_t>(stripe.stripe_id));
+        } else {
+            // Behavior is immutable for a sealed group. For stale metadata,
+            // clear every key defensively; this path is transition-only.
+            for (uint8_t key = 0; key < kReuseBehaviorGroupCount; key++) {
+                stripe.reuse_bits[key].reset(slot);
+                clear_reuse_summary_if_empty_locked(stripe, key);
+            }
+        }
+        refresh_reuse_hint_locked(stripe);
+    }
+
+    void clear_reuse_index_locked(Stripe &stripe, uint32_t slot) {
+        if (!::FarLib::ec_benchmark_phase::enabled()) return;
+        if (slot >= stripe.slots_per_shard ||
+            stripe.reuse_bits[0].words.empty()) {
+            return;
+        }
+        for (uint8_t key = 0; key < kReuseBehaviorGroupCount; key++) {
+            stripe.reuse_bits[key].reset(slot);
+            clear_reuse_summary_if_empty_locked(stripe, key);
+        }
+        refresh_reuse_hint_locked(stripe);
+    }
+
+    // Normal indexed lookup knows the immutable behavior key of the sealed
+    // group.  Remove only that exact candidate bit; the aggregate hint is
+    // deliberately conservative and is refreshed by batch operations (or by
+    // full cleanup) rather than scanning all six keys per object.
+    void clear_reuse_key_locked(Stripe &stripe, uint32_t slot,
+                                uint32_t behavior_group) {
+        if (!::FarLib::ec_benchmark_phase::enabled() ||
+            !reuse_behavior_indexable(behavior_group) ||
+            slot >= stripe.slots_per_shard ||
+            stripe.reuse_bits[behavior_group].words.empty()) {
+            return;
+        }
+        stripe.reuse_bits[behavior_group].reset(slot);
+        clear_reuse_summary_if_empty_locked(stripe, behavior_group);
+    }
+
+    void clear_all_reuse_index_locked(Stripe &stripe) {
+        if (!::FarLib::ec_benchmark_phase::enabled()) return;
+        if (stripe.reuse_bits[0].words.empty()) return;
+        for (uint8_t key = 0; key < kReuseBehaviorGroupCount; key++) {
+            for (uint64_t &word : stripe.reuse_bits[key].words) word = 0;
+            reuse_summary(stripe.bin, key).reset(
+                static_cast<size_t>(stripe.stripe_id));
+        }
+        refresh_reuse_hint_locked(stripe);
     }
 
     bool allocate_from_local_lease(uint16_t bin, uint64_t *addr_out,
@@ -975,6 +1611,16 @@ public:
         stripe_index_.reset(new std::atomic<Stripe *>[stripe_capacity_]);
         for (size_t i = 0; i < stripe_capacity_; i++) {
             stripe_index_[i].store(nullptr, std::memory_order_relaxed);
+        }
+        if (::FarLib::ec_benchmark_phase::enabled()) {
+            for (size_t bin = 0; bin < ::FarLib::allocator::RegionBinCount;
+                 bin++) {
+                for (uint8_t behavior = 0;
+                     behavior < kReuseBehaviorGroupCount; behavior++) {
+                    reuse_stripe_summaries_[bin][behavior].init(
+                        stripe_capacity_);
+                }
+            }
         }
         stripe_storage_.clear();
         stripe_storage_.reserve(stripe_capacity_);
@@ -1240,12 +1886,827 @@ public:
                                  group_out);
     }
 
+    // Reserve one retired data slot from a sealed, durable, non-split group.
+    // Candidate lookup is two-level indexed: (bin, behavior) selects an
+    // atomic stripe-summary bitmap, then the stripe-local candidate bitmap
+    // selects a slot. The reservation leaves group_live_mask unchanged until
+    // commit, so a concurrent reader/recovery path still describes old codeword.
+    bool begin_slot_reuse_indexed(size_t size, uint32_t behavior_group,
+                                  SlotReuse *reuse_out,
+                                  bool *busy_out = nullptr,
+                                  ::FarLib::profile::ec_rmw_prepare::Trace *trace =
+                                      nullptr) {
+        if (busy_out != nullptr) *busy_out = false;
+        if (!::FarLib::ec_benchmark_phase::enabled()) return false;
+        if (reuse_out == nullptr || size == 0) return false;
+        *reuse_out = SlotReuse{};
+        const size_t bin = bin_from_size(size);
+        const uint32_t slot_size = static_cast<uint32_t>(
+            ::FarLib::allocator::get_bin_size(bin));
+        if (slot_size > shard_table_.shard_size() || size > slot_size ||
+            size > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        if (!reuse_behavior_indexable(behavior_group) ||
+            stripe_capacity_ == 0) {
+            return false;
+        }
+
+        auto &cursor = local_reuse_cursor_;
+        const size_t count = static_cast<size_t>(
+            stripe_count_.load(std::memory_order_acquire));
+        if (count == 0) return false;
+        if (cursor.owner != this) {
+            cursor.owner = this;
+            cursor.next_stripe = 0;
+            cursor.legacy_next_stripe = 0;
+        }
+        constexpr size_t kStripeCandidateBudget = 64;
+        auto &summary = reuse_summary(static_cast<uint16_t>(bin),
+                                       behavior_group);
+        for (size_t visited = 0; visited < kStripeCandidateBudget; visited++) {
+            size_t index = 0;
+            bool summary_found = false;
+            {
+                ::FarLib::profile::ec_rmw_prepare::Scope summary_scope(
+                    trace != nullptr ? &trace->summary : nullptr);
+                summary_found =
+                    summary.find_set(cursor.next_stripe, &index);
+            }
+            if (trace != nullptr) {
+                trace->summary_calls++;
+                if (!summary_found || index >= count) {
+                    trace->summary_misses++;
+                }
+            }
+            if (!summary_found ||
+                index >= count) {
+                return false;
+            }
+            cursor.next_stripe = (index + 1) % count;
+            Stripe *stripe = stripe_by_id(index);
+            if (stripe == nullptr) {
+                summary.reset(index);
+                continue;
+            }
+
+            ::FarLib::profile::ec_rmw_prepare::Scope lock_wait(
+                trace != nullptr ? &trace->lock_wait : nullptr);
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            lock_wait.stop();
+            ::FarLib::profile::ec_rmw_prepare::Scope stripe_held(
+                trace != nullptr ? &trace->stripe_held : nullptr);
+            if (stripe->bin != bin || stripe->slot_size != slot_size ||
+                stripe->group_state_words.empty() ||
+                !endpoints_distinct(*stripe) ||
+                !group_endpoints_alive_for_reuse(*stripe) ||
+                !stripe_eligible_for_new_group(*stripe)) {
+                // The candidate may have become invalid after publication
+                // (endpoint death/standby activation); clear exact bits while
+                // holding the stripe lock so no later publication is lost.
+                if (stripe->bin == bin && stripe->slot_size == slot_size) {
+                    {
+                        ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                            trace != nullptr ? &trace->index : nullptr);
+                        clear_all_reuse_index_locked(*stripe);
+                        summary.reset(index);
+                    }
+                } else {
+                    summary.reset(index);
+                }
+                continue;
+            }
+            auto &candidates = stripe->reuse_bits[behavior_group];
+            size_t slot = 0;
+            if (!candidates.find_set(stripe->reuse_scan_slot, &slot) ||
+                slot >= stripe->slots_per_shard) {
+                {
+                    ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                        trace != nullptr ? &trace->index : nullptr);
+                    clear_reuse_summary_if_empty_locked(*stripe,
+                                                         behavior_group);
+                    refresh_reuse_hint_locked(*stripe);
+                }
+                continue;
+            }
+            stripe->reuse_scan_slot =
+                (static_cast<uint32_t>(slot) + 1) % stripe->slots_per_shard;
+            const uint32_t slot_id = static_cast<uint32_t>(slot);
+            if (group_state_locked(*stripe, slot_id) != kSlotGroupSealed ||
+                slot_id >= stripe->group_durable.size() ||
+                stripe->group_durable[slot_id] == 0 ||
+                slot_id >= stripe->group_is_split.size() ||
+                stripe->group_is_split[slot_id] != 0 ||
+                slot_id >= stripe->group_behavior_group.size() ||
+                stripe->group_behavior_group[slot_id] != behavior_group) {
+                {
+                    ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                        trace != nullptr ? &trace->index : nullptr);
+                    clear_reuse_key_locked(*stripe, slot_id, behavior_group);
+                }
+                continue;
+            }
+            const uint8_t live = static_cast<uint8_t>(
+                stripe->group_live_mask[slot_id] & 0x0fu);
+            const uint8_t holes = static_cast<uint8_t>(~live & 0x0fu);
+            if (holes == 0) {
+                {
+                    ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                        trace != nullptr ? &trace->index : nullptr);
+                    clear_reuse_key_locked(*stripe, slot_id, behavior_group);
+                }
+                continue;
+            }
+            if (group_update_pending_locked(*stripe, slot_id)) {
+                if (busy_out != nullptr) *busy_out = true;
+                {
+                    ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                        trace != nullptr ? &trace->index : nullptr);
+                    clear_reuse_key_locked(*stripe, slot_id, behavior_group);
+                }
+                continue;
+            }
+            const uint8_t data_shard = static_cast<uint8_t>(
+                __builtin_ctz(static_cast<unsigned>(holes)));
+            SlotGroupHandle handle;
+            if (!fill_group_handle(*stripe, stripe->bin, slot_id, &handle)) {
+                {
+                    ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                        trace != nullptr ? &trace->index : nullptr);
+                    clear_reuse_key_locked(*stripe, slot_id, behavior_group);
+                }
+                continue;
+            }
+            if (slot_id >= stripe->group_generation.size()) {
+                {
+                    ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                        trace != nullptr ? &trace->index : nullptr);
+                    clear_reuse_key_locked(*stripe, slot_id, behavior_group);
+                }
+                continue;
+            }
+            const uint64_t generation =
+                next_group_generation_locked(*stripe, slot_id);
+            if (generation == 0) {
+                {
+                    ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                        trace != nullptr ? &trace->index : nullptr);
+                    clear_reuse_key_locked(*stripe, slot_id, behavior_group);
+                }
+                continue;
+            }
+            stripe->group_pending_mask[slot_id] =
+                static_cast<uint8_t>(1u << data_shard);
+            // Pending target is no longer readable/reusable. Clear exact
+            // candidate bit and summary before exposing reservation.
+            {
+                ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                    trace != nullptr ? &trace->index : nullptr);
+                clear_reuse_key_locked(*stripe, slot_id, behavior_group);
+            }
+            reuse_out->group = handle;
+            reuse_out->generation = generation;
+            reuse_out->data_shard = data_shard;
+            reuse_out->size = static_cast<uint32_t>(size);
+            reuse_out->behavior_group = behavior_group;
+            return true;
+        }
+        return false;
+    }
+
+    // Reserve independent holes by metadata Stripe, holding each selected
+    // Stripe's mutex only once.  Each output still owns its own handle, data
+    // shard, generation and pending bit; this is an allocator metadata
+    // optimization, not a wider EC transaction.
+    //
+    // The indexed bitmap is exact for the requested behavior key.  A stale
+    // candidate is cleared only from that key in the normal path; the full
+    // six-key cleanup remains reserved for an invalid Stripe/endpoint state.
+    // The return value is a successful prefix; later output pointers are not
+    // touched when candidate supply is exhausted.
+    size_t begin_slot_reuse_indexed_batch(
+        size_t size, uint32_t behavior_group, SlotReuse **outputs,
+        size_t capacity, bool *busy_out = nullptr,
+        ::FarLib::profile::ec_rmw_prepare::Trace *trace = nullptr) {
+        if (busy_out != nullptr) *busy_out = false;
+        if (outputs == nullptr || capacity == 0 || size == 0) return 0;
+        for (size_t i = 0; i < capacity; ++i) {
+            if (outputs[i] == nullptr) return 0;
+        }
+        if (!::FarLib::ec_benchmark_phase::enabled()) return 0;
+        if (!reuse_behavior_indexable(behavior_group) ||
+            stripe_capacity_ == 0) {
+            return 0;
+        }
+
+        const size_t bin = bin_from_size(size);
+        const uint32_t slot_size = static_cast<uint32_t>(
+            ::FarLib::allocator::get_bin_size(bin));
+        if (slot_size > shard_table_.shard_size() || size > slot_size ||
+            size > std::numeric_limits<uint32_t>::max()) {
+            return 0;
+        }
+
+        auto &cursor = local_reuse_cursor_;
+        const size_t count = static_cast<size_t>(
+            stripe_count_.load(std::memory_order_acquire));
+        if (count == 0) return 0;
+        if (cursor.owner != this) {
+            cursor.owner = this;
+            cursor.next_stripe = 0;
+            cursor.legacy_next_stripe = 0;
+        }
+
+        constexpr size_t kStripeCandidateBudget = 64;
+        auto &summary = reuse_summary(static_cast<uint16_t>(bin),
+                                       behavior_group);
+        size_t total_acquired = 0;
+        for (size_t visited = 0; visited < kStripeCandidateBudget;
+             ++visited) {
+            size_t index = 0;
+            bool summary_found = false;
+            {
+                ::FarLib::profile::ec_rmw_prepare::Scope summary_scope(
+                    trace != nullptr ? &trace->summary : nullptr);
+                summary_found = summary.find_set(cursor.next_stripe, &index);
+            }
+            if (trace != nullptr) {
+                ++trace->summary_calls;
+                if (!summary_found || index >= count) ++trace->summary_misses;
+            }
+            if (!summary_found || index >= count) return total_acquired;
+            cursor.next_stripe = (index + 1) % count;
+            Stripe *stripe = stripe_by_id(index);
+            if (stripe == nullptr) {
+                summary.reset(index);
+                continue;
+            }
+
+            ::FarLib::profile::ec_rmw_prepare::Scope lock_wait(
+                trace != nullptr ? &trace->lock_wait : nullptr);
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            lock_wait.stop();
+            ::FarLib::profile::ec_rmw_prepare::Scope stripe_held(
+                trace != nullptr ? &trace->stripe_held : nullptr);
+
+            if (stripe->bin != bin || stripe->slot_size != slot_size ||
+                stripe->group_state_words.empty() ||
+                !endpoints_distinct(*stripe) ||
+                !group_endpoints_alive_for_reuse(*stripe) ||
+                !stripe_eligible_for_new_group(*stripe)) {
+                // Endpoint/Stripe invalidation is the exceptional path where
+                // all keys must be cleared while this lock is held.
+                if (stripe->bin == bin && stripe->slot_size == slot_size) {
+                    ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                        trace != nullptr ? &trace->index : nullptr);
+                    clear_all_reuse_index_locked(*stripe);
+                    summary.reset(index);
+                } else {
+                    summary.reset(index);
+                }
+                continue;
+            }
+
+            auto &candidates = stripe->reuse_bits[behavior_group];
+            while (total_acquired < capacity) {
+                    size_t slot = 0;
+                    if (!candidates.find_set(stripe->reuse_scan_slot,
+                                              &slot) ||
+                        slot >= stripe->slots_per_shard) {
+                        break;
+                    }
+                    stripe->reuse_scan_slot =
+                        (static_cast<uint32_t>(slot) + 1) %
+                        stripe->slots_per_shard;
+                    const uint32_t slot_id = static_cast<uint32_t>(slot);
+
+                    const bool structurally_valid =
+                        group_state_locked(*stripe, slot_id) ==
+                            kSlotGroupSealed &&
+                        slot_id < stripe->group_durable.size() &&
+                        stripe->group_durable[slot_id] != 0 &&
+                        slot_id < stripe->group_is_split.size() &&
+                        stripe->group_is_split[slot_id] == 0 &&
+                        slot_id < stripe->group_live_mask.size() &&
+                        slot_id < stripe->group_pending_mask.size() &&
+                        slot_id < stripe->group_generation.size() &&
+                        slot_id < stripe->group_behavior_group.size() &&
+                        stripe->group_behavior_group[slot_id] ==
+                            behavior_group;
+                    if (!structurally_valid) {
+                        // Behavior is immutable for a sealed group, so a
+                        // stale indexed bit can be removed from this key only.
+                        ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                            trace != nullptr ? &trace->index : nullptr);
+                        candidates.reset(slot_id);
+                        continue;
+                    }
+
+                    const uint8_t live = static_cast<uint8_t>(
+                        stripe->group_live_mask[slot_id] & 0x0fu);
+                    const uint8_t holes = static_cast<uint8_t>(~live & 0x0fu);
+                    if (holes == 0) {
+                        ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                            trace != nullptr ? &trace->index : nullptr);
+                        candidates.reset(slot_id);
+                        continue;
+                    }
+                    if (group_update_pending_locked(*stripe, slot_id)) {
+                        if (busy_out != nullptr) *busy_out = true;
+                        ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                            trace != nullptr ? &trace->index : nullptr);
+                        candidates.reset(slot_id);
+                        continue;
+                    }
+
+                    const uint8_t data_shard = static_cast<uint8_t>(
+                        __builtin_ctz(static_cast<unsigned>(holes)));
+                    SlotGroupHandle handle;
+                    if (!fill_group_handle(*stripe, stripe->bin, slot_id,
+                                            &handle)) {
+                        ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                            trace != nullptr ? &trace->index : nullptr);
+                        candidates.reset(slot_id);
+                        continue;
+                    }
+                    const uint64_t generation =
+                        next_group_generation_locked(*stripe, slot_id);
+                    if (generation == 0) {
+                        ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                            trace != nullptr ? &trace->index : nullptr);
+                        candidates.reset(slot_id);
+                        continue;
+                    }
+
+                    // The output pointer was checked before touching metadata;
+                    // assigning it cannot leave a pending reservation without
+                    // a caller-visible SlotReuse record.
+                    stripe->group_pending_mask[slot_id] =
+                        static_cast<uint8_t>(1u << data_shard);
+                    {
+                        ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                            trace != nullptr ? &trace->index : nullptr);
+                        candidates.reset(slot_id);
+                    }
+                    SlotReuse &reuse = *outputs[total_acquired];
+                    reuse = SlotReuse{};
+                    reuse.group = handle;
+                    reuse.generation = generation;
+                    reuse.data_shard = data_shard;
+                    reuse.size = static_cast<uint32_t>(size);
+                    reuse.behavior_group = behavior_group;
+                    ++total_acquired;
+            }
+
+            // Publish/clear the manager summary only once for this Stripe;
+            // all exact candidate bits above were changed under stripe->mutex.
+            {
+                ::FarLib::profile::ec_rmw_prepare::Scope index_scope(
+                    trace != nullptr ? &trace->index : nullptr);
+                const bool remaining = candidates.any_set();
+                if (!remaining) {
+                    clear_reuse_summary_if_empty_locked(*stripe,
+                                                         behavior_group);
+                }
+                refresh_reuse_hint_locked(*stripe);
+            }
+            if (total_acquired == capacity) return total_acquired;
+        }
+        return total_acquired;
+    }
+
+    // Compatibility entry point. All callers now share indexed lookup; no
+    // phase flag is set. The legacy path intentionally preserves its bounded
+    // hint-guided scan and all prior behavior when phased mode is disabled.
+    bool begin_slot_reuse(size_t size, uint32_t behavior_group,
+                          SlotReuse *reuse_out, bool *busy_out = nullptr) {
+        if (busy_out != nullptr) *busy_out = false;
+        if (reuse_out == nullptr || size == 0) return false;
+        *reuse_out = SlotReuse{};
+        const size_t bin = bin_from_size(size);
+        const uint32_t slot_size = static_cast<uint32_t>(
+            ::FarLib::allocator::get_bin_size(bin));
+        if (slot_size > shard_table_.shard_size() || size > slot_size ||
+            size > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+
+        auto &cursor = local_reuse_cursor_;
+        const size_t count = static_cast<size_t>(
+            stripe_count_.load(std::memory_order_acquire));
+        if (count == 0) return false;
+        if (cursor.owner != this) {
+            cursor.owner = this;
+            cursor.next_stripe = 0;
+            cursor.legacy_next_stripe = 0;
+        }
+        const size_t start = cursor.legacy_next_stripe % count;
+        constexpr size_t kStripeScanBudget = 64;
+        constexpr size_t kSlotScanBudget = 128;
+        const size_t stripe_budget = std::min(count, kStripeScanBudget);
+        for (size_t visited = 0; visited < stripe_budget; visited++) {
+            const size_t index = (start + visited) % count;
+            cursor.legacy_next_stripe = (index + 1) % count;
+            Stripe *stripe = stripe_by_id(index);
+            if (stripe == nullptr) continue;
+            if (stripe->bin != bin || stripe->slot_size != slot_size ||
+                !stripe->reuse_candidate.load(std::memory_order_acquire)) {
+                continue;
+            }
+
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            if (stripe->group_state_words.empty() ||
+                !endpoints_distinct(*stripe) ||
+                !group_endpoints_alive_for_reuse(*stripe) ||
+                !stripe_eligible_for_new_group(*stripe)) {
+                continue;
+            }
+            const size_t slot_count = stripe->slots_per_shard;
+            if (slot_count == 0) continue;
+            const size_t slot_start = stripe->reuse_scan_slot % slot_count;
+            const size_t slot_budget = std::min(slot_count, kSlotScanBudget);
+            bool found_any_hole = false;
+            for (size_t step = 0; step < slot_budget; step++) {
+                const uint32_t slot = static_cast<uint32_t>(
+                    (slot_start + step) % slot_count);
+                stripe->reuse_scan_slot = (slot + 1) % stripe->slots_per_shard;
+                if (group_state_locked(*stripe, slot) != kSlotGroupSealed ||
+                    slot >= stripe->group_durable.size() ||
+                    stripe->group_durable[slot] == 0 ||
+                    slot >= stripe->group_is_split.size() ||
+                    stripe->group_is_split[slot] != 0) {
+                    continue;
+                }
+                const uint8_t live = static_cast<uint8_t>(
+                    stripe->group_live_mask[slot] & 0x0fu);
+                const uint8_t holes = static_cast<uint8_t>(~live & 0x0fu);
+                if (holes == 0) continue;
+                found_any_hole = true;
+                if (slot >= stripe->group_behavior_group.size() ||
+                    stripe->group_behavior_group[slot] != behavior_group) {
+                    continue;
+                }
+                if (group_update_pending_locked(*stripe, slot)) {
+                    if (busy_out != nullptr) *busy_out = true;
+                    continue;
+                }
+                const uint8_t data_shard = static_cast<uint8_t>(
+                    __builtin_ctz(static_cast<unsigned>(holes)));
+                SlotGroupHandle handle;
+                if (!fill_group_handle(*stripe, stripe->bin, slot, &handle)) {
+                    continue;
+                }
+                if (slot >= stripe->group_generation.size()) continue;
+                const uint64_t generation =
+                    next_group_generation_locked(*stripe, slot);
+                if (generation == 0) continue;
+                stripe->group_pending_mask[slot] =
+                    static_cast<uint8_t>(1u << data_shard);
+                reuse_out->group = handle;
+                reuse_out->generation = generation;
+                reuse_out->data_shard = data_shard;
+                reuse_out->size = static_cast<uint32_t>(size);
+                reuse_out->behavior_group = behavior_group;
+                return true;
+            }
+            if (!found_any_hole && !stripe_has_reuse_candidate_locked(*stripe)) {
+                stripe->reuse_candidate.store(false,
+                                               std::memory_order_release);
+            }
+        }
+        return false;
+    }
+
+    // Commit a slot reuse after the coordinator has drained the three
+    // absolute-write completions.  The generation and target bit are checked
+    // under stripe.mutex so stale callbacks cannot publish an ABA-reused slot.
+    bool commit_slot_reuse(const SlotReuse &reuse) {
+        const SlotGroupId &id = reuse.group.id;
+        Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || !id.valid() ||
+            id.slot_id >= stripe->slots_per_shard ||
+            reuse.data_shard >= kDataShards || reuse.size == 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        if (group_state_locked(*stripe, id.slot_id) != kSlotGroupSealed ||
+            id.slot_id >= stripe->group_pending_mask.size() ||
+            stripe->group_pending_mask[id.slot_id] !=
+                static_cast<uint8_t>(1u << reuse.data_shard) ||
+            id.slot_id >= stripe->group_generation.size() ||
+            stripe->group_generation[id.slot_id] != reuse.generation ||
+            id.slot_id >= stripe->group_behavior_group.size() ||
+            stripe->group_behavior_group[id.slot_id] != reuse.behavior_group ||
+            reuse.group.slot_size != stripe->slot_size ||
+            reuse.group.bin != stripe->bin || reuse.size > stripe->slot_size) {
+            return false;
+        }
+        SlotGroupHandle current;
+        if (!fill_group_handle(*stripe, stripe->bin, id.slot_id, &current) ||
+            !same_group_handle(reuse.group, current)) {
+            return false;
+        }
+        const uint8_t bit = static_cast<uint8_t>(1u << reuse.data_shard);
+        const uint8_t old_live = group_live_slots_locked(*stripe, id.slot_id);
+        if ((stripe->group_live_mask[id.slot_id] & bit) != 0 ||
+            old_live >= kDataShards) {
+            return false;
+        }
+        account_group_slot_reuse_commit_locked(
+            *stripe, id.slot_id, reuse.data_shard, reuse.size);
+        stripe->group_live_mask[id.slot_id] = static_cast<uint8_t>(
+            stripe->group_live_mask[id.slot_id] | bit);
+        stripe->group_live_objects[id.slot_id] =
+            static_cast<uint8_t>(old_live + 1);
+        stripe->group_payload_sizes[id.slot_id][reuse.data_shard] = reuse.size;
+        stripe->group_payload_unknown[id.slot_id] = static_cast<uint8_t>(
+            stripe->group_payload_unknown[id.slot_id] & ~bit);
+        stripe->group_pending_mask[id.slot_id] = 0;
+        stripe->live_count++;
+        if (!::FarLib::ec_benchmark_phase::enabled() &&
+            stripe->group_live_mask[id.slot_id] != 0x0fu) {
+            stripe->reuse_candidate.store(true, std::memory_order_release);
+        } else {
+            update_reuse_index_locked(*stripe, id.slot_id);
+        }
+        return true;
+    }
+
+    // Commit a set of already-completed slot reuses.  Reservations are grouped
+    // by metadata Stripe without allocating or holding more than one Stripe
+    // lock at a time.  Each Stripe is fully preflighted before its live masks
+    // or accounting are modified.
+    bool commit_slot_reuse_batch(const SlotReuse *const *reuses,
+                                 size_t count) {
+        if (count == 0) return true;
+        if (reuses == nullptr) return false;
+
+        // The only production caller is the bounded worker batch (64
+        // transactions).  Keeping the grouping marks on the stack avoids a
+        // hot-path allocation and lets each metadata Stripe take one lock.
+        constexpr size_t kCommitBatchCapacity = 64;
+        if (count > kCommitBatchCapacity) return false;
+        auto same_stripe = [](const SlotReuse &left,
+                              const SlotReuse &right) {
+            return left.group.id.stripe_id == right.group.id.stripe_id;
+        };
+
+        for (size_t i = 0; i < count; ++i) {
+            if (reuses[i] == nullptr || !reuses[i]->group.id.valid() ||
+                reuses[i]->generation == 0 || reuses[i]->size == 0 ||
+                reuses[i]->data_shard >= kDataShards) {
+                return false;
+            }
+            if (::FarLib::ec_benchmark_phase::enabled() &&
+                !reuse_behavior_indexable(reuses[i]->behavior_group)) {
+                return false;
+            }
+        }
+
+        auto validate_locked = [&](Stripe &stripe,
+                                   const SlotReuse &reuse) -> bool {
+            const SlotGroupId &id = reuse.group.id;
+            if (id.stripe_id != stripe.stripe_id ||
+                id.slot_id >= stripe.slots_per_shard ||
+                reuse.data_shard >= kDataShards || reuse.size == 0 ||
+                reuse.group.slot_size != stripe.slot_size ||
+                reuse.group.bin != stripe.bin ||
+                reuse.size > stripe.slot_size ||
+                group_state_locked(stripe, id.slot_id) != kSlotGroupSealed ||
+                id.slot_id >= stripe.group_durable.size() ||
+                stripe.group_durable[id.slot_id] == 0 ||
+                id.slot_id >= stripe.group_is_split.size() ||
+                stripe.group_is_split[id.slot_id] != 0 ||
+                id.slot_id >= stripe.group_live_mask.size() ||
+                id.slot_id >= stripe.group_live_objects.size() ||
+                id.slot_id >= stripe.group_pending_mask.size() ||
+                id.slot_id >= stripe.group_generation.size() ||
+                id.slot_id >= stripe.group_behavior_group.size() ||
+                id.slot_id >= stripe.group_payload_sizes.size() ||
+                id.slot_id >= stripe.group_payload_unknown.size() ||
+                stripe.group_pending_mask[id.slot_id] !=
+                    static_cast<uint8_t>(1u << reuse.data_shard) ||
+                stripe.group_generation[id.slot_id] != reuse.generation ||
+                stripe.group_behavior_group[id.slot_id] !=
+                    reuse.behavior_group) {
+                return false;
+            }
+            SlotGroupHandle current;
+            if (!fill_group_handle(stripe, stripe.bin, id.slot_id, &current) ||
+                !same_group_handle(reuse.group, current)) {
+                return false;
+            }
+            const uint8_t bit = static_cast<uint8_t>(1u << reuse.data_shard);
+            const uint8_t old_live =
+                group_live_slots_locked(stripe, id.slot_id);
+            return (stripe.group_live_mask[id.slot_id] & bit) == 0 &&
+                   old_live < kDataShards;
+        };
+
+        // Validate and apply each distinct Stripe under one short lock.  A
+        // pending bit prevents another allocator path from changing these
+        // reservations while this lock is held.
+        std::array<bool, kCommitBatchCapacity> visited{};
+        for (size_t i = 0; i < count; ++i) {
+            if (visited[i]) continue;
+            Stripe *stripe = stripe_by_id(reuses[i]->group.id.stripe_id);
+            if (stripe == nullptr) return false;
+            for (size_t j = i; j < count; ++j) {
+                if (!visited[j] && same_stripe(*reuses[i], *reuses[j]))
+                    visited[j] = true;
+            }
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            for (size_t j = i; j < count; ++j) {
+                if (same_stripe(*reuses[i], *reuses[j]) &&
+                    !validate_locked(*stripe, *reuses[j])) {
+                    return false;
+                }
+            }
+            std::array<bool, kReuseBehaviorGroupCount> touched{};
+            const bool index_eligible =
+                endpoints_distinct(*stripe) &&
+                group_endpoints_alive_for_reuse(*stripe) &&
+                stripe_eligible_for_new_group(*stripe);
+            for (size_t j = i; j < count; ++j) {
+                if (!same_stripe(*reuses[i], *reuses[j])) continue;
+                const SlotReuse &reuse = *reuses[j];
+                const uint32_t slot = reuse.group.id.slot_id;
+                const uint8_t bit =
+                    static_cast<uint8_t>(1u << reuse.data_shard);
+                const uint8_t old_live = group_live_slots_locked(*stripe, slot);
+                account_group_slot_reuse_commit_locked(
+                    *stripe, slot, reuse.data_shard, reuse.size);
+                stripe->group_live_mask[slot] = static_cast<uint8_t>(
+                    stripe->group_live_mask[slot] | bit);
+                stripe->group_live_objects[slot] =
+                    static_cast<uint8_t>(old_live + 1);
+                stripe->group_payload_sizes[slot][reuse.data_shard] =
+                    reuse.size;
+                stripe->group_payload_unknown[slot] = static_cast<uint8_t>(
+                    stripe->group_payload_unknown[slot] & ~bit);
+                stripe->group_pending_mask[slot] = 0;
+                stripe->live_count++;
+                if (!::FarLib::ec_benchmark_phase::enabled()) {
+                    if (stripe->group_live_mask[slot] != 0x0fu) {
+                        stripe->reuse_candidate.store(
+                            true, std::memory_order_release);
+                    }
+                } else {
+                    touched[reuse.behavior_group] = true;
+                    auto &candidates =
+                        stripe->reuse_bits[reuse.behavior_group];
+                    if (index_eligible &&
+                        stripe->group_live_mask[slot] != 0x0fu) {
+                        candidates.set(slot);
+                    } else {
+                        candidates.reset(slot);
+                    }
+                }
+            }
+            if (::FarLib::ec_benchmark_phase::enabled()) {
+                if (!index_eligible) {
+                    // Recovery/endpoint invalidation is exceptional: clear
+                    // every key so no stale candidate survives the failure.
+                    clear_all_reuse_index_locked(*stripe);
+                } else {
+                    for (uint32_t behavior = 0;
+                         behavior < kReuseBehaviorGroupCount; ++behavior) {
+                        if (!touched[behavior]) continue;
+                        // Reservation may have removed the last candidate
+                        // and cleared this summary bit. A committed group
+                        // with another hole must become discoverable again.
+                        auto &summary = reuse_summary(stripe->bin, behavior);
+                        if (stripe->reuse_bits[behavior].any_set()) {
+                            summary.set(static_cast<size_t>(stripe->stripe_id));
+                        } else {
+                            summary.reset(static_cast<size_t>(stripe->stripe_id));
+                        }
+                    }
+                }
+                refresh_reuse_hint_locked(*stripe);
+            }
+        }
+        return true;
+    }
+
+    // Abort a pending reuse.  If the old group lost its final live object
+    // while the transaction was in flight, retire the now-empty group only
+    // after clearing the pending bit and revalidate the same generation.
+    bool abort_slot_reuse(const SlotReuse &reuse) {
+        const SlotGroupId &id = reuse.group.id;
+        Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || !id.valid() ||
+            id.slot_id >= stripe->slots_per_shard ||
+            reuse.data_shard >= kDataShards) {
+            return false;
+        }
+        bool became_dead = false;
+        {
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            if (group_state_locked(*stripe, id.slot_id) != kSlotGroupSealed ||
+                id.slot_id >= stripe->group_pending_mask.size() ||
+                stripe->group_pending_mask[id.slot_id] !=
+                    static_cast<uint8_t>(1u << reuse.data_shard) ||
+                id.slot_id >= stripe->group_generation.size() ||
+                stripe->group_generation[id.slot_id] != reuse.generation ||
+                id.slot_id >= stripe->group_behavior_group.size() ||
+                stripe->group_behavior_group[id.slot_id] != reuse.behavior_group) {
+                return false;
+            }
+            SlotGroupHandle current;
+            if (!fill_group_handle(*stripe, stripe->bin, id.slot_id, &current) ||
+                !same_group_handle(reuse.group, current)) {
+                return false;
+            }
+            stripe->group_pending_mask[id.slot_id] = 0;
+            if (stripe->group_live_mask[id.slot_id] == 0) {
+                const bool retain_empty =
+                    ::FarLib::ec_benchmark_phase::enabled() &&
+                    id.slot_id < stripe->group_is_split.size() &&
+                    stripe->group_is_split[id.slot_id] == 0;
+                if (retain_empty) {
+                    update_reuse_index_locked(*stripe, id.slot_id);
+                } else {
+                    became_dead = mark_dead_group_locked(*stripe, id);
+                }
+            } else {
+                if (!::FarLib::ec_benchmark_phase::enabled() &&
+                    stripe->group_live_mask[id.slot_id] != 0x0fu) {
+                    stripe->reuse_candidate.store(true,
+                                                   std::memory_order_release);
+                } else {
+                    update_reuse_index_locked(*stripe, id.slot_id);
+                }
+            }
+        }
+        if (became_dead) requeue_group_stripe(*stripe);
+        return true;
+    }
+
+    bool slot_group_update_pending(const SlotGroupId &id) const {
+        const Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || id.slot_id >= stripe->slots_per_shard) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        return group_update_pending_locked(*stripe, id.slot_id);
+    }
+
+    // Mark initial group publication durable after all six terminal write
+    // outcomes are observed.  Slot reuse is intentionally restricted to this
+    // state so its PREPARE reads never race an initial write round.
+    void mark_slot_group_durable(const SlotGroupId &id) {
+        Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || id.slot_id >= stripe->slots_per_shard) return;
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        if (group_state_locked(*stripe, id.slot_id) == kSlotGroupSealed &&
+            !group_update_pending_locked(*stripe, id.slot_id) &&
+            id.slot_id < stripe->group_durable.size()) {
+            stripe->group_durable[id.slot_id] = 1;
+            if (!::FarLib::ec_benchmark_phase::enabled() &&
+                id.slot_id < stripe->group_live_mask.size() &&
+                (stripe->group_live_mask[id.slot_id] & 0x0fu) != 0x0fu &&
+                id.slot_id < stripe->group_is_split.size() &&
+                stripe->group_is_split[id.slot_id] == 0) {
+                stripe->reuse_candidate.store(true,
+                                               std::memory_order_release);
+            } else {
+                update_reuse_index_locked(*stripe, id.slot_id);
+            }
+        }
+    }
+
+    bool addr_update_pending(uint64_t addr) const {
+        DecodedBinding binding;
+        if (!binding_for_addr(addr, &binding) || binding.shard_idx >= kDataShards) {
+            return false;
+        }
+        const Stripe *stripe = stripe_by_id(binding.stripe_id);
+        if (stripe == nullptr || !stripe->has_groups.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        const uint64_t base = stripe->shard_base[binding.shard_idx];
+        if (base == kInvalidRemoteAddr || addr < base || stripe->slot_size == 0) {
+            return false;
+        }
+        const uint64_t offset = addr - base;
+        if ((offset % stripe->slot_size) != 0) return false;
+        const uint64_t slot64 = offset / stripe->slot_size;
+        if (slot64 >= stripe->slots_per_shard) return false;
+        const uint32_t slot = static_cast<uint32_t>(slot64);
+        const uint8_t pending = group_pending_mask_locked(*stripe, slot);
+        return (pending & static_cast<uint8_t>(1u << binding.shard_idx)) != 0;
+    }
+
     // free -> in_progress -> sealed.  live_mask is a 4-bit mask (bit i = data
     // shard i); any value below 16 is accepted, including fewer than four live
     // objects.  Slots that are not live hold no object and their shard content
     // is defined to be zero (the writer guarantees it).  The group keeps owning
     // all four data slots, live or not, so they are never handed out singly.
-    bool seal_slot_group(const SlotGroupId &id, uint8_t live_mask) {
+    bool seal_slot_group(const SlotGroupId &id, uint8_t live_mask,
+                         const uint32_t *sizes = nullptr,
+                         uint32_t behavior_group = 0) {
         if ((live_mask & 0xf0u) != 0) return false;
         Stripe *stripe = stripe_by_id(id.stripe_id);
         if (stripe == nullptr || id.slot_id >= stripe->slots_per_shard) {
@@ -1255,13 +2716,80 @@ public:
         if (group_state_locked(*stripe, id.slot_id) != kSlotGroupInProgress) {
             return false;
         }
+        // Validate before touching either state or accounting.  A supplied
+        // size is an exact payload length, not a slot capacity; holes must be
+        // represented by zero and live objects must be non-zero and fit.
+        if (sizes != nullptr) {
+            for (uint8_t i = 0; i < kDataShards; i++) {
+                const bool live = (live_mask & static_cast<uint8_t>(1u << i)) != 0;
+                const uint32_t payload = sizes[i];
+                if ((live && (payload == 0 || payload > stripe->slot_size)) ||
+                    (!live && payload != 0)) {
+                    return false;
+                }
+            }
+        }
         uint32_t live = static_cast<uint32_t>(
             __builtin_popcount(static_cast<unsigned>(live_mask)));
         assert(stripe->live_count >= kDataShards - live);
         stripe->live_count -= (kDataShards - live);
         stripe->group_live_mask[id.slot_id] = live_mask;
+        stripe->group_pending_mask[id.slot_id] = 0;
+        stripe->group_durable[id.slot_id] = 0;
+        stripe->group_behavior_group[id.slot_id] = behavior_group;
         stripe->group_live_objects[id.slot_id] = static_cast<uint8_t>(live);
+        stripe->group_payload_sizes[id.slot_id].fill(0);
+        stripe->group_payload_unknown[id.slot_id] = 0;
+        for (uint8_t i = 0; i < kDataShards; i++) {
+            if ((live_mask & static_cast<uint8_t>(1u << i)) == 0) continue;
+            if (sizes == nullptr) {
+                stripe->group_payload_sizes[id.slot_id][i] = stripe->slot_size;
+                stripe->group_payload_unknown[id.slot_id] |=
+                    static_cast<uint8_t>(1u << i);
+            } else {
+                stripe->group_payload_sizes[id.slot_id][i] = sizes[i];
+            }
+        }
         set_group_state_locked(*stripe, id.slot_id, kSlotGroupSealed);
+        account_group_seal_locked(*stripe, id.slot_id, false);
+        update_reuse_index_locked(*stripe, id.slot_id);
+        return true;
+    }
+
+    // Seal one large-object split group. All four data fragments are valid
+    // internal shards, while data[0] remains the sole public owner.
+    bool seal_split_slot_group(const SlotGroupId &id,
+                               uint32_t payload_size = 0) {
+        Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || id.slot_id >= stripe->slots_per_shard) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        if (group_state_locked(*stripe, id.slot_id) != kSlotGroupInProgress ||
+            id.slot_id >= stripe->group_is_split.size()) {
+            return false;
+        }
+        const uint64_t max_payload =
+            static_cast<uint64_t>(kDataShards) * stripe->slot_size;
+        if (payload_size != 0 && payload_size > max_payload) return false;
+        stripe->group_live_mask[id.slot_id] = 0xfu;
+        stripe->group_pending_mask[id.slot_id] = 0;
+        stripe->group_durable[id.slot_id] = 0;
+        stripe->group_behavior_group[id.slot_id] = 0;
+        stripe->group_live_objects[id.slot_id] = kDataShards;
+        stripe->group_is_split[id.slot_id] = 1;
+        stripe->group_payload_sizes[id.slot_id].fill(0);
+        // A split group has one public object anchored at data[0].  With no
+        // payload argument retain a conservative full-group estimate, but mark
+        // it unknown so callers never mistake the padding ratio for exact data.
+        stripe->group_payload_sizes[id.slot_id][0] =
+            payload_size != 0 ? payload_size
+                              : static_cast<uint32_t>(max_payload);
+        stripe->group_payload_unknown[id.slot_id] =
+            payload_size == 0 ? static_cast<uint8_t>(1u) : 0;
+        set_group_state_locked(*stripe, id.slot_id, kSlotGroupSealed);
+        account_group_seal_locked(*stripe, id.slot_id, true);
+        update_reuse_index_locked(*stripe, id.slot_id);
         return true;
     }
 
@@ -1293,15 +2821,35 @@ public:
         if (state != kSlotGroupInProgress && state != kSlotGroupSealed) {
             return false;
         }
+        // A sealed group with an outstanding slot-reuse transaction still
+        // owns the old codeword.  Do not retire it underneath the coordinator;
+        // abort_slot_reuse() will clear the reservation and retry this
+        // transition once the three-part update has settled.
+        if (group_update_pending_locked(stripe, id.slot_id)) return false;
+        // Retained empty groups carry an indexed RMW candidate. Remove that
+        // publication before changing state to dead (shutdown path and the
+        // legacy non-phased last-release path both use this helper).
+        clear_reuse_index_locked(stripe, id.slot_id);
         uint32_t live = kDataShards;
         if (state == kSlotGroupSealed) {
             live = static_cast<uint32_t>(__builtin_popcount(
                 static_cast<unsigned>(stripe.group_live_mask[id.slot_id])));
         }
         assert(stripe.live_count >= live);
+        const bool split = id.slot_id < stripe.group_is_split.size() &&
+                           stripe.group_is_split[id.slot_id] != 0;
+        account_group_dead_locked(stripe, id.slot_id, split);
         stripe.live_count -= live;
         stripe.group_live_mask[id.slot_id] = 0;
+        stripe.group_pending_mask[id.slot_id] = 0;
+        stripe.group_durable[id.slot_id] = 0;
+        stripe.group_behavior_group[id.slot_id] = 0;
         stripe.group_live_objects[id.slot_id] = 0;
+        stripe.group_payload_sizes[id.slot_id].fill(0);
+        stripe.group_payload_unknown[id.slot_id] = 0;
+        if (id.slot_id < stripe.group_is_split.size()) {
+            stripe.group_is_split[id.slot_id] = 0;
+        }
         set_group_state_locked(stripe, id.slot_id, kSlotGroupDead);
         stripe.group_dead_count++;
         return true;
@@ -1320,6 +2868,39 @@ public:
             push_group_candidate(stripe.bin, stripe.stripe_id);
         }
     }
+
+    // Cold shutdown hook for phased mode. Producers must be quiesced before
+    // calling: convert retained sealed-empty groups to ordinary dead groups
+    // under their existing stripe mutex, without requeueing or recursively
+    // retaining them. This restores normal group accounting before allocator
+    // teardown releases backing regions.
+    void release_retained_empty_groups_for_shutdown() {
+        if (!::FarLib::ec_benchmark_phase::enabled()) return;
+        const size_t count = static_cast<size_t>(
+            stripe_count_.load(std::memory_order_acquire));
+        for (size_t i = 0; i < count && i < stripe_capacity_; i++) {
+            Stripe *stripe = stripe_by_id(i);
+            if (stripe == nullptr || stripe->group_state_words.empty()) {
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            for (uint32_t slot = 0; slot < stripe->slots_per_shard; slot++) {
+                if (group_state_locked(*stripe, slot) != kSlotGroupSealed ||
+                    slot >= stripe->group_live_mask.size() ||
+                    stripe->group_live_mask[slot] != 0 ||
+                    slot >= stripe->group_is_split.size() ||
+                    stripe->group_is_split[slot] != 0 ||
+                    group_update_pending_locked(*stripe, slot)) {
+                    continue;
+                }
+                SlotGroupId id;
+                id.stripe_id = stripe->stripe_id;
+                id.slot_id = slot;
+                (void)mark_dead_group_locked(*stripe, id);
+            }
+        }
+    }
+
     // ------------------------------------------------- per-object release --
     // Result of an address-based per-object release.
     enum GroupReleaseResult : uint8_t {
@@ -1371,6 +2952,7 @@ public:
 
         SlotGroupId id;
         id.stripe_id = binding.stripe_id;
+        bool split_group_released = false;
         {
             std::lock_guard<std::mutex> lock(stripe->mutex);
             uint64_t base = stripe->shard_base[binding.shard_idx];
@@ -1403,39 +2985,123 @@ public:
                 // release) or the whole group was.
                 return kGroupReleaseRejected;
             } else {
+                // A split group has one public owner at data shard 0. Never
+                // release an internal fragment as an independent object.
+                if (slot < stripe->group_is_split.size() &&
+                    stripe->group_is_split[slot] != 0) {
+                    const uint64_t anchor =
+                        stripe->shard_base[0] +
+                        static_cast<uint64_t>(slot) * stripe->slot_size;
+                    if (binding.shard_idx != 0 || addr != anchor) {
+                        return kGroupReleaseRejected;
+                    }
+                    if (!mark_dead_group_locked(*stripe, id)) {
+                        return kGroupReleaseRejected;
+                    }
+                    split_group_released = true;
+                } else {
                 const uint8_t bit =
                     static_cast<uint8_t>(1u << binding.shard_idx);
                 if ((stripe->group_live_mask[slot] & bit) == 0) {
                     // Zero-filled hole or a second release of the same object.
                     return kGroupReleaseRejected;
                 }
-                stripe->group_live_mask[slot] =
-                    static_cast<uint8_t>(stripe->group_live_mask[slot] & ~bit);
                 assert(slot < stripe->group_live_objects.size());
                 assert(stripe->group_live_objects[slot] > 0);
-                const uint32_t remaining =
-                    static_cast<uint32_t>(--stripe->group_live_objects[slot]);
-                assert(remaining ==
-                       static_cast<uint32_t>(__builtin_popcount(
-                           static_cast<unsigned>(stripe->group_live_mask[slot]))));
-                assert(stripe->live_count > 0);
-                stripe->live_count--;
-                if (remaining != 0) {
+                const uint8_t prior_live = stripe->group_live_objects[slot];
+                const uint32_t remaining = static_cast<uint32_t>(prior_live - 1);
+                const bool update_pending =
+                    group_update_pending_locked(*stripe, slot);
+                if (remaining == 0) {
+                    if (update_pending) {
+                        // Keep the sealed reservation alive while the pending
+                        // target is being prepared.  abort_slot_reuse() or
+                        // commit_slot_reuse() will settle the empty-old-live
+                        // case after this release has removed its metadata.
+                        account_group_object_release_locked(
+                            *stripe, slot, binding.shard_idx);
+                        stripe->group_live_mask[slot] = static_cast<uint8_t>(
+                            stripe->group_live_mask[slot] & ~bit);
+                        stripe->group_live_objects[slot] = 0;
+                        assert(stripe->live_count > 0);
+                        stripe->live_count--;
+                        assert(stripe->group_counts_by_live[prior_live] > 0);
+                        stripe->group_counts_by_live[prior_live]--;
+                        stripe->group_counts_by_live[0]++;
+                        if (!::FarLib::ec_benchmark_phase::enabled()) {
+                            stripe->reuse_candidate.store(
+                                true, std::memory_order_release);
+                        } else {
+                            update_reuse_index_locked(*stripe, slot);
+                        }
+                        if (remaining_out != nullptr) *remaining_out = 0;
+                        return kGroupReleaseObjectReleased;
+                    }
+                    // In phased benchmark mode, preserve an empty sealed
+                    // non-split group as an RMW target.  Its sealed/parity
+                    // accounting, group_counts_by_live[0], holes and live
+                    // count remain coherent; only object payload ownership is
+                    // removed.  Legacy modes still retire the group below.
+                    const bool retain_empty =
+                        ::FarLib::ec_benchmark_phase::enabled() &&
+                        slot < stripe->group_is_split.size() &&
+                        stripe->group_is_split[slot] == 0;
+                    if (retain_empty) {
+                        account_group_object_release_locked(
+                            *stripe, slot, binding.shard_idx);
+                        stripe->group_live_mask[slot] = static_cast<uint8_t>(
+                            stripe->group_live_mask[slot] & ~bit);
+                        stripe->group_live_objects[slot] = 0;
+                        assert(stripe->live_count > 0);
+                        stripe->live_count--;
+                        assert(stripe->group_counts_by_live[prior_live] > 0);
+                        stripe->group_counts_by_live[prior_live]--;
+                        stripe->group_counts_by_live[0]++;
+                        update_reuse_index_locked(*stripe, slot);
+                        if (remaining_out != nullptr) *remaining_out = 0;
+                        return kGroupReleaseObjectReleased;
+                    }
+                    // Retire the sealed group while its mask/payload metadata
+                    // still describe the final live object.  This keeps the
+                    // structural and payload counters balanced in one lock.
+                    if (!mark_dead_group_locked(*stripe, id)) {
+                        return kGroupReleaseRejected;
+                    }
+                    split_group_released = true;
+                }
+                if (!split_group_released) {
+                    account_group_object_release_locked(*stripe, slot,
+                                                         binding.shard_idx);
+                    stripe->group_live_mask[slot] = static_cast<uint8_t>(
+                        stripe->group_live_mask[slot] & ~bit);
+                    stripe->group_live_objects[slot] =
+                        static_cast<uint8_t>(remaining);
+                    assert(remaining ==
+                           static_cast<uint32_t>(__builtin_popcount(
+                               static_cast<unsigned>(
+                                   stripe->group_live_mask[slot]))));
+                    assert(stripe->live_count > 0);
+                    stripe->live_count--;
+                    assert(stripe->group_counts_by_live[prior_live] > 0);
+                    stripe->group_counts_by_live[prior_live]--;
+                    stripe->group_counts_by_live[remaining]++;
+                    if (!::FarLib::ec_benchmark_phase::enabled()) {
+                        stripe->reuse_candidate.store(
+                            true, std::memory_order_release);
+                    } else {
+                        update_reuse_index_locked(*stripe, slot);
+                    }
                     if (remaining_out != nullptr) *remaining_out = remaining;
                     return kGroupReleaseObjectReleased;
                 }
-                // Last live object: the whole group is released below, outside
-                // this critical section, because mark_dead_group() takes the
-                // same mutex.  The group is still sealed here, so no allocator
-                // can pick it up in between and no second thread can observe
-                // the last object.
+                }
             }
         }
 
-        const bool group_dead = mark_dead_group(id);
+        const bool group_dead = split_group_released || mark_dead_group(id);
         // False only if the same group was already released as a whole by a
         // concurrent path; the re-queue below is harmless then.
-        (void)group_dead;
+        if (!group_dead) return kGroupReleaseRejected;
         // A dead group means the stripe can serve a group again, so re-queue it
         // exactly like allocate_slot_group() does after an allocation: without
         // this the released slots would be unreachable and the group pool would
@@ -1471,6 +3137,7 @@ public:
         const uint8_t state = group_state_locked(*stripe, slot);
         if (state == kSlotGroupDead) return true;
         if (state == kSlotGroupSealed) {
+            if (group_update_pending_locked(*stripe, slot)) return false;
             return stripe->group_live_objects[slot] == 0;
         }
         return false;
@@ -1514,10 +3181,38 @@ public:
         }
         return true;
     }
-    // Live *object* counter of one group: how many of its four data segments
-    // still hold an object.  Kept equal to popcount(group_live_mask[slot]) by
-    // seal / release / mark_dead_group, and exposed so the group-aware release
-    // can be checked without reading the bitmask.
+    // True only for a live/in-progress split group at a data-segment address.
+    bool slot_group_is_split(uint64_t addr) const {
+        DecodedBinding binding;
+        if (!binding_for_addr(addr, &binding) ||
+            binding.shard_idx >= kDataShards) {
+            return false;
+        }
+        const Stripe *stripe = stripe_by_id(binding.stripe_id);
+        if (stripe == nullptr ||
+            !stripe->has_groups.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        const uint64_t base = stripe->shard_base[binding.shard_idx];
+        if (base == kInvalidRemoteAddr || addr < base ||
+            stripe->slot_size == 0) {
+            return false;
+        }
+        const uint64_t offset = addr - base;
+        if ((offset % stripe->slot_size) != 0) return false;
+        const uint64_t slot64 = offset / stripe->slot_size;
+        if (slot64 >= stripe->slots_per_shard ||
+            slot64 >= stripe->group_is_split.size()) {
+            return false;
+        }
+        return group_state_locked(*stripe, static_cast<uint32_t>(slot64)) !=
+                   kSlotGroupFree &&
+               stripe->group_is_split[static_cast<size_t>(slot64)] != 0;
+    }
+
+    // Live internal-segment counter of one group. For a split object it is
+    // four fragments for one public owner.
     bool get_slot_group_object_count(const SlotGroupId &id,
                                      uint32_t *count_out) const {
         const Stripe *stripe = stripe_by_id(id.stripe_id);
@@ -1531,6 +3226,68 @@ public:
                              : 0;
         }
         return true;
+    }
+
+    // O(stripes) accounting snapshot.  In the exact/quiescent mode no stripe
+    // mutates while this method runs, so the result is a coherent total.  If
+    // allocation/release continues concurrently, each stripe is copied while
+    // holding only that stripe's existing mutex; the returned total is a
+    // rolling per-stripe snapshot (not a globally linearizable instant).
+    SpaceUsage space_usage() const {
+        SpaceUsage result;
+        size_t endpoint_count =
+            ::FarLib::allocator::remote::remote_global_heap.endpoint_count();
+        if (endpoint_count == 0) {
+            const int configured = ::FarLib::get_config().server_count;
+            endpoint_count = configured > 0 ? static_cast<size_t>(configured) : 0;
+        }
+        result.endpoint_occupied_bytes.assign(endpoint_count, 0);
+
+        const size_t count = static_cast<size_t>(
+            stripe_count_.load(std::memory_order_acquire));
+        for (size_t i = 0; i < count && i < stripe_capacity_; i++) {
+            const Stripe *stripe = stripe_by_id(i);
+            if (stripe == nullptr) continue;
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            result.reserved_stripe_bytes +=
+                static_cast<uint64_t>(kShardCount) * shard_table_.shard_size();
+            result.occupied_group_bytes += stripe->occupied_group_bytes;
+            result.sealed_group_bytes += stripe->sealed_group_bytes;
+            result.live_payload_bytes += stripe->live_payload_bytes;
+            result.live_data_slot_bytes += stripe->live_data_slot_bytes;
+            result.parity_bytes += stripe->parity_bytes;
+            result.trapped_hole_bytes += stripe->trapped_hole_bytes;
+            result.padding_bytes += stripe->padding_bytes;
+            result.split_groups += stripe->split_groups;
+            result.in_progress_groups += stripe->in_progress_groups;
+            result.reusable_groups += stripe->reusable_groups;
+            result.reusable_group_bytes +=
+                stripe->reusable_groups * group_reserved_bytes(*stripe);
+            result.unknown_payload_objects += stripe->unknown_payload_objects;
+            result.sealed_small_groups += stripe->sealed_small_groups;
+            for (size_t live = 0; live < result.group_counts_by_live.size();
+                 live++) {
+                result.group_counts_by_live[live] +=
+                    stripe->group_counts_by_live[live];
+            }
+
+            // Endpoint occupancy is derived from active groups only.  Dead
+            // groups are reusable reservations and are intentionally excluded;
+            // including both their dead reservation and the next reuse would
+            // double count one physical six-segment offset.
+            const uint64_t group_bytes = group_reserved_bytes(*stripe);
+            const uint64_t active_groups =
+                group_bytes == 0 ? 0 : stripe->occupied_group_bytes / group_bytes;
+            for (uint8_t shard = 0; shard < kShardCount; shard++) {
+                const uint32_t endpoint = stripe->shard_endpoint[shard];
+                if (endpoint >= result.endpoint_occupied_bytes.size()) continue;
+                result.endpoint_occupied_bytes[endpoint] +=
+                    active_groups * stripe->slot_size;
+            }
+
+        }
+        result.live_slot_bytes = result.live_data_slot_bytes;
+        return result;
     }
 
     size_t stripe_count() const {

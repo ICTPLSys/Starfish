@@ -88,6 +88,9 @@ ClientControl::ClientControl(const Configure &config)
       remote_base_addr(0),
       remote_key(0) {
     INFO("initializing rdma client");
+    endpoint_dead_ = std::make_unique<std::atomic_bool[]>(server_count);
+    for (size_t endpoint = 0; endpoint < server_count; ++endpoint)
+        endpoint_dead_[endpoint].store(false, std::memory_order_relaxed);
 
     size_t data_qp_count = 0;
     if (config.enable_eager_evict) {
@@ -438,9 +441,15 @@ void ClientControl::post_stop() {
                   << read_batch.pending_reads << std::endl;
         std::abort();
     }
-    // Send stop message to all endpoints
+    size_t stopped = 0, skipped_dead = 0, failed = 0;
+    // The cache has already drained data ownership. STOP is only a server
+    // lifecycle notice; a failed peer must not prevent local destruction.
     for (size_t ep_idx = 0; ep_idx < server_count; ep_idx++) {
         if (endpoint_qps[ep_idx].control_qp == nullptr) continue;
+        if (endpoint_dead_[ep_idx].load(std::memory_order_acquire)) {
+            ++skipped_dead;
+            continue;
+        }
         
         ibv_send_wr stop_wr = {
             .wr_id = RQ_STOP,
@@ -450,26 +459,45 @@ void ClientControl::post_stop() {
             .opcode = IBV_WR_SEND,
             .send_flags = IBV_SEND_SIGNALED | IBV_SEND_SOLICITED,
         };
-        ibv_send_wr *bad_wr;
-    retry:
-        int send_ret = ibv_post_send(endpoint_qps[ep_idx].control_qp->queue_pair, &stop_wr, &bad_wr);
-        bool posted = check_ibv_post_send_ret(send_ret);
-        ibv_wc wc;
-        if (!posted) {
-            ibv_poll_cq(control_cq.complete_queue, 1, &wc);
-            goto retry;
-        }
-        while (true) {
-            std::size_t n = ibv_poll_cq(control_cq.complete_queue, 1, &wc);
-            ASSERT(n <= 1);
-            if (n == 1) {
-                if (wc.wr_id == stop_wr.wr_id && wc.opcode == IBV_WC_SEND) {
-                    assert(wc.status == IBV_WC_SUCCESS);
+        auto *qp = endpoint_qps[ep_idx].control_qp->queue_pair;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(30);
+        bool posted = false, completed = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (!posted) {
+                ibv_send_wr *bad_wr = nullptr;
+                const int ret = ibv_post_send(qp, &stop_wr, &bad_wr);
+                if (ret != 0 && ret != ENOMEM) {
+                    std::cerr << "RDMA_STOP_POST_FAILED endpoint=" << ep_idx
+                              << " error=" << ret << std::endl;
                     break;
                 }
+                posted = ret == 0;
             }
+            ibv_wc wc{};
+            const int n = ibv_poll_cq(control_cq.complete_queue, 1, &wc);
+            if (n < 0) break;
+            if (n != 1 || wc.wr_id != RQ_STOP || wc.qp_num != qp->qp_num)
+                continue;
+            // Only wr_id/status/qp_num/vendor_err are valid on a failed WC.
+            if (wc.status != IBV_WC_SUCCESS) {
+                std::cerr << "RDMA_STOP_COMPLETION_FAILED endpoint=" << ep_idx
+                          << " status=" << wc.status << std::endl;
+                break;
+            }
+            completed = wc.opcode == IBV_WC_SEND;
+            break;
+        }
+        if (completed) ++stopped;
+        else {
+            ++failed;
+            std::cerr << "RDMA_STOP_INCOMPLETE endpoint=" << ep_idx
+                      << " posted=" << posted << std::endl;
         }
     }
+    std::cerr << "rdma.shutdown_stop completed=" << stopped
+              << " skipped_dead=" << skipped_dead << " failed=" << failed
+              << std::endl;
 }
 
 void ConnectionPool::add_client(Client *client) {

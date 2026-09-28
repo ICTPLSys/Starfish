@@ -2,8 +2,7 @@
 
 The left panel shows normalized foreground throughput over time; the right
 compares recovery durations for one- and two-node failures. Throughput and
-recovery events must come from observed CSV data; this plotter does not
-synthesize them.
+recovery events come from observed CSV data.
 
 Two CSVs are required:
 
@@ -22,14 +21,12 @@ Two CSVs are required:
   under the same measurement boundary. The plotter rejects mixed denominators.
   An event-only row with `system=all,event=failure` gives the failure time;
   a row with `event=recovered` gives that system's observed recovery time.
-  Without those rows, the plot has no fabricated failure marker or shaded
-  recovery window.
+  Failure marker and recovery shading appear only when those rows are present.
 
 Duplicate conditions/timestamps, invalid units/values and mixed source types
 are rejected. Optional `exit_status` and `correctness` columns reject failed
 runs. `measured` is the default source type; `paper_reference` and `synthetic`
-require explicit flags and are exported under separate filenames. A blank
-input does not get replaced with the paper's generated trace.
+require explicit flags and are exported under separate filenames.
 
 ```bash
 python3 scripts/figure13/plot.py --recovery-csv data/figure13-recovery.csv \

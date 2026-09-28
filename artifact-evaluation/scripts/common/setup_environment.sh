@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prepare build dependencies without silently changing a shared server.
-# Source checkouts and installations live under ignored artifact-evaluation/deps/.
+# Prepare account-local dependencies; bootstrap missing OS packages as root.
+# Vendored source is copied to ignored artifact-evaluation/deps/ before build.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 DEPS="$ROOT/deps"
-LIBFIBRE_URL=https://github.com/Crazylqx/libfibre.git
 LIBFIBRE_REV=885d74dfb6746966a911ff6c821cc4a88fda3b91
+LIBFIBRE_SOURCE="$ROOT/third_party/libfibre"
+LIBFIBRE_MANIFEST="$ROOT/third_party/libfibre.vendor.json"
 HDR_URL=https://github.com/HdrHistogram/HdrHistogram_c.git
 HDR_REV=8dcce8f68512fca460b171bccc3a5afce0048779 # 0.11.8
 HDR_VERSION=0.11.8
@@ -15,27 +16,32 @@ HDR_SOURCE="$DEPS/hdr-histogram/src"
 HDR_PREFIX="$DEPS/hdr-histogram/install"
 EXTERNAL_LIBFIBRE=0
 EXTERNAL_HDR=0
-INSTALL_APT=0
-WITH_PLOT=0
+SYSTEM="${STARFISH_SYSTEM:-nonft}"
+INSTALL_APT=auto
+WITH_PLOT=1
 DRY_RUN=0
 JOBS=4
 
-APT_PACKAGES=(build-essential cmake ninja-build git pkg-config python3
-  libibverbs-dev libboost-program-options-dev libssl-dev zlib1g-dev
-  openssh-client ibverbs-utils numactl)
+APT_PACKAGES=(build-essential cmake ninja-build git curl ca-certificates gzip coreutils pkg-config python3 python3-venv
+  libibverbs-dev libboost-program-options-dev libssl-dev zlib1g-dev libisal-dev
+  openssh-client ibverbs-utils numactl iproute2)
 
 usage() {
   cat <<'EOF'
 Usage: setup_environment.sh [options]
 
 Prepare pinned libfibre and HdrHistogram_c under ignored deps/ (no sudo).
+The libfibre source is vendored under third_party/ and verified by its
+manifest; setup never clones libfibre from the network.
 The script does not configure RDMA, HugePages, WireGuard, or workload data.
 
 Options:
-  --install-apt          explicitly install Ubuntu/Debian packages with apt
+  --install-apt          install Ubuntu/Debian packages (automatic as root if missing)
+  --system NAME          runtime variant to preflight (default: nonft)
   --libfibre-dir DIR     reuse an existing checkout at the pinned revision
   --hdr-prefix DIR       reuse an existing HdrHistogram 0.11.8 installation
-  --with-plot            also create .venv-plot and install plot requirements
+  --with-plot            install plot requirements in .venv-plot (default)
+  --without-plot         skip plotting dependencies on a build-only host
   --jobs N               maximum build parallelism (default: 4)
   --dry-run              print plan; no downloads, builds, writes, or sudo
   -h, --help             show this help
@@ -59,11 +65,14 @@ hdr_config() {
 while (($#)); do
   case "$1" in
     --install-apt) INSTALL_APT=1; shift ;;
+    --system) (($# >= 2)) || die 'missing --system value'
+      SYSTEM=$2; shift 2 ;;
     --libfibre-dir) (($# >= 2)) || die 'missing --libfibre-dir value'
       LIBFIBRE_DIR=$2; EXTERNAL_LIBFIBRE=1; shift 2 ;;
     --hdr-prefix) (($# >= 2)) || die 'missing --hdr-prefix value'
       HDR_PREFIX=$2; EXTERNAL_HDR=1; shift 2 ;;
     --with-plot) WITH_PLOT=1; shift ;;
+    --without-plot) WITH_PLOT=0; shift ;;
     --jobs) (($# >= 2)) || die 'missing --jobs value'
       JOBS=$2; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -71,13 +80,34 @@ while (($#)); do
     *) die "unknown option: $1" ;;
   esac
 done
+case "$SYSTEM" in
+  nonft|starfish|carbink|hydra) ;;
+  *) die "unsupported system: $SYSTEM" ;;
+esac
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die '--jobs must be a positive integer'
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] ||
   die 'this AE setup requires Linux x86-64'
 
+# A fresh container can bootstrap itself with the same no-option command.
+# An ordinary reviewer account never invokes sudo implicitly.
+if [[ "$INSTALL_APT" = auto ]]; then
+  INSTALL_APT=0
+  missing=0
+  for cmd in git cmake make c++ cc python3 curl pkg-config gzip split wc ssh ss numactl; do
+    command -v "$cmd" >/dev/null || missing=1
+  done
+  for header in infiniband/verbs.h boost/program_options.hpp openssl/ssl.h zlib.h isa-l/erasure_code.h; do
+    [[ -f "/usr/include/$header" || -f "/usr/local/include/$header" ]] || missing=1
+  done
+  python3 -c 'import venv, ensurepip' >/dev/null 2>&1 || missing=1
+  if ((missing && EUID == 0)); then
+    INSTALL_APT=1
+  fi
+fi
+
 if ((DRY_RUN)); then
-  printf 'apt: %s\n' "$([[ $INSTALL_APT == 1 ]] && printf 'explicit install requested' || printf 'unchanged')"
-  printf 'libfibre: %s @ %s -> %s\n' "$LIBFIBRE_URL" "$LIBFIBRE_REV" "$LIBFIBRE_DIR"
+  printf 'apt: %s\n' "$([[ $INSTALL_APT == 1 ]] && printf 'install declared system packages' || printf 'unchanged')"
+  printf 'libfibre: bundled %s @ %s -> %s\n' "$LIBFIBRE_SOURCE" "$LIBFIBRE_REV" "$LIBFIBRE_DIR"
   printf 'HdrHistogram_c: %s @ %s -> %s\n' "$HDR_URL" "$HDR_REV" "$HDR_PREFIX"
   printf 'reuse existing libfibre=%s, HDR=%s; build jobs=%s; plot=%s\n' \
     "$EXTERNAL_LIBFIBRE" "$EXTERNAL_HDR" "$JOBS" "$WITH_PLOT"
@@ -93,7 +123,6 @@ if ((INSTALL_APT)); then
   fi
   "${APT[@]}" update
   "${APT[@]}" install -y "${APT_PACKAGES[@]}"
-  if ((WITH_PLOT)); then "${APT[@]}" install -y python3-venv; fi
 fi
 
 for cmd in git cmake make c++ cc python3; do
@@ -121,21 +150,23 @@ if ((EXTERNAL_LIBFIBRE)); then
   LIBFIBRE_DIR=$(cd "$LIBFIBRE_DIR" && pwd)
 else
   mkdir -p "$DEPS"
-  if [[ ! -d "$LIBFIBRE_DIR/.git" ]]; then
-    [[ ! -e "$LIBFIBRE_DIR" ]] || die "refusing to overwrite: $LIBFIBRE_DIR"
-    git clone --branch dev-hh --single-branch --no-checkout "$LIBFIBRE_URL" "$LIBFIBRE_DIR"
-    git -C "$LIBFIBRE_DIR" checkout --detach "$LIBFIBRE_REV"
+  [[ -d "$LIBFIBRE_SOURCE" ]] || die "vendored libfibre source not found: $LIBFIBRE_SOURCE"
+  [[ -f "$LIBFIBRE_MANIFEST" ]] || die "vendored libfibre manifest not found: $LIBFIBRE_MANIFEST"
+  python3 "$ROOT/scripts/common/prepare_libfibre.py" \
+    --source "$LIBFIBRE_SOURCE" --dest "$LIBFIBRE_DIR" \
+    --manifest "$LIBFIBRE_MANIFEST" --expected-revision "$LIBFIBRE_REV"
+  if [[ -d "$LIBFIBRE_DIR/.git" || -f "$LIBFIBRE_DIR/.git" ]]; then
+    [[ "$(git -C "$LIBFIBRE_DIR" rev-parse HEAD)" == "$LIBFIBRE_REV" ]] ||
+      die "existing libfibre must be at $LIBFIBRE_REV; refusing to change it"
   fi
 fi
-[[ "$(git -C "$LIBFIBRE_DIR" rev-parse HEAD)" == "$LIBFIBRE_REV" ]] ||
-  die "libfibre must be at $LIBFIBRE_REV; refusing to change an existing checkout"
 if ((EXTERNAL_LIBFIBRE)); then
+  [[ "$(git -C "$LIBFIBRE_DIR" rev-parse HEAD)" == "$LIBFIBRE_REV" ]] ||
+    die "libfibre must be at $LIBFIBRE_REV; refusing to change an existing checkout"
   expected_submodule=$(git -C "$LIBFIBRE_DIR" rev-parse HEAD:src/errnoname)
   actual_submodule=$(git -C "$LIBFIBRE_DIR/src/errnoname" rev-parse HEAD 2>/dev/null || true)
   [[ "$expected_submodule" == "$actual_submodule" ]] ||
     die 'existing libfibre needs its pinned src/errnoname submodule initialized'
-else
-  git -C "$LIBFIBRE_DIR" submodule update --init --recursive -- src/errnoname
 fi
 make -C "$LIBFIBRE_DIR/src" -j "$JOBS" all
 [[ -f "$LIBFIBRE_DIR/src/libfibre.so" && -f "$LIBFIBRE_DIR/src/libfibre/Fibre.h" ]] ||
@@ -164,7 +195,11 @@ if ((WITH_PLOT)); then
 fi
 
 LIBFIBRE_DIR="$LIBFIBRE_DIR" HDR_HISTOGRAM_PREFIX="$HDR_PREFIX" \
-  "$ROOT/scripts/common/check_environment.sh" --system nonft --mode build
+  "$ROOT/scripts/common/check_environment.sh" --system "$SYSTEM" --mode build
 printf 'AE dependencies ready. Build with:\n'
-printf '  LIBFIBRE_DIR=%q HDR_HISTOGRAM_PREFIX=%q bash scripts/common/build.sh --system nonft\n' \
-  "$LIBFIBRE_DIR" "$HDR_PREFIX"
+if [[ "$EXTERNAL_LIBFIBRE" = 0 && "$EXTERNAL_HDR" = 0 && "$SYSTEM" = nonft ]]; then
+  printf '  bash scripts/common/build.sh\n'
+else
+  printf '  LIBFIBRE_DIR=%q HDR_HISTOGRAM_PREFIX=%q bash scripts/common/build.sh --system %q\n' \
+    "$LIBFIBRE_DIR" "$HDR_PREFIX" "$SYSTEM"
+fi

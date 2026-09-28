@@ -3,6 +3,7 @@
 // Counts demand references to physical Region slots. No object census,
 // lifetime or quota accounting. Optional two-class labels use the same ranking.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -26,6 +27,7 @@ namespace FarLib::simple_region_heat {
 
 inline constexpr uint8_t kCold = 1, kHot = 4; // dirty dimension fixed Medium
 inline bool grouping_enabled() {
+    if (behavior_group_runtime::enabled()) return true;
     static const bool on = [] {
         const char *p = std::getenv("FARLIB_SIMPLE_HOTCOLD");
         return p && std::strcmp(p, "1") == 0;
@@ -36,13 +38,37 @@ inline size_t class_count() { return simple_region_budget::classes(); }
 inline bool is_hot(uint32_t c) { return simple_region_budget::six_enabled() ? c>=3 && c<6 : c==kHot; }
 inline uint8_t normalize_class(uint32_t c) { return simple_region_budget::six_enabled() ? uint8_t(c<6?c:kCold) : (c == kHot ? kHot : kCold); }
 inline uint8_t opposite_class(uint32_t c) { c=normalize_class(c); return simple_region_budget::six_enabled() ? uint8_t(c<3?c+3:c-3) : (c==kHot?kCold:kHot); }
+// In the resident-local compatibility mode the placement band is encoded in
+// the six-class tag: Streaming is [0,2], Resident is [3,5].  `klass` is the
+// measured dirtiness class and is deliberately reduced modulo three so an R/S
+// transition retains its dirty dimension.
+inline bool local_resident_enabled() {
+    return simple_region_budget::local_resident_enabled();
+}
+inline uint8_t class_for_placement(bool resident, uint8_t klass) {
+    return static_cast<uint8_t>((resident ? 3u : 0u) + (klass % 3u));
+}
 inline std::array<uint8_t,6> fallback_order(uint32_t requested) {
     std::array<uint8_t,6> result{}; result[0]=normalize_class(requested);result[1]=opposite_class(requested);
     size_t n=2; if(simple_region_budget::six_enabled()) for(uint8_t c=0;c<6;++c) if(c!=result[0] && c!=result[1]) result[n++]=c;
     return result;
 }
+inline std::array<uint8_t,6> local_fallback_order(uint32_t requested) {
+    if (!local_resident_enabled()) return fallback_order(requested);
+    const uint8_t normalized = normalize_class(requested);
+    std::array<uint8_t, 6> result{};
+    const uint8_t first = normalized < 3 ? 0 : 3;
+    size_t n = 0;
+    result[n++] = normalized;
+    for (uint8_t c = first; c < static_cast<uint8_t>(first + 3); ++c)
+        if (c != normalized) result[n++] = c;
+    for (uint8_t c = 0; c < 6; ++c)
+        if (c < first || c >= static_cast<uint8_t>(first + 3)) result[n++] = c;
+    return result;
+}
 
 inline bool relink_enabled() {
+    if (behavior_group_runtime::enabled()) return true;
     static const bool on = [] {
         const char *p = std::getenv("FARLIB_SIMPLE_HOTCOLD_RELINK");
         return !(p && std::strcmp(p, "0") == 0);
@@ -51,6 +77,7 @@ inline bool relink_enabled() {
 }
 
 inline bool local_routing_enabled() {
+    if (behavior_group_runtime::enabled()) return true;
     static const bool on = [] {
         const char *p = std::getenv("FARLIB_SIMPLE_LOCAL_ROUTING");
         return !(p && std::strcmp(p, "0") == 0);
@@ -61,6 +88,7 @@ inline bool local_routing_enabled() {
 // Independent ablation: local labels/lists remain enabled when this is off.
 // Remote grouping is opt-in; the default is the original unified allocator.
 inline bool remote_grouping_enabled() {
+    if (behavior_group_runtime::enabled()) return true;
     static const bool on = [] {
         const char *p = std::getenv("FARLIB_SIMPLE_REMOTE_HOTCOLD");
         return p && std::strcmp(p, "1") == 0;
@@ -89,14 +117,14 @@ public:
         // Cache setup may call monitor configuration more than once while
         // wiring callbacks.  Do not erase supply ownership after claims have
         // already been made for this exact physical heap.
-        if (simple_region_budget::enabled() && labels_ &&
+        if ((simple_region_budget::enabled() || local_resident_enabled()) && labels_ &&
             base_ == base && bytes_ == bytes &&
             region_bytes_ == region_bytes)
             return;
         base_=base; bytes_=bytes; region_bytes_=region_bytes;
         slots_=(bytes+region_bytes-1)/region_bytes;
         labels_=std::make_unique<std::atomic<uint8_t>[]>(slots_);
-        if (simple_region_budget::enabled()) {
+        if (simple_region_budget::enabled() || local_resident_enabled()) {
             supply_labels_=std::make_unique<std::atomic<uint8_t>[]>(slots_);
             supply_bins_=std::make_unique<std::atomic<int>[]>(slots_);
         } else {
@@ -105,7 +133,7 @@ public:
         }
         for(size_t i=0;i<slots_;++i) {
             labels_[i].store(kCold);
-            if (simple_region_budget::enabled()) {
+            if (simple_region_budget::enabled() || local_resident_enabled()) {
                 supply_labels_[i].store(kCold);
                 supply_bins_[i].store(-1);
             }
@@ -122,7 +150,7 @@ public:
     uint8_t allocation_class(uintptr_t address) const {
         if(!labels_ || address<base_ || address-base_>=bytes_)return kCold;
         const size_t slot = (address-base_)/region_bytes_;
-        if (!simple_region_budget::enabled())
+        if (!simple_region_budget::enabled() && !local_resident_enabled())
             return labels_[slot].load(std::memory_order_relaxed);
         if (!supply_labels_) return kCold;
         return supply_labels_[slot].load(std::memory_order_relaxed);
@@ -132,8 +160,16 @@ public:
         requested = normalize_class(requested);
         // The source/object hint remains a heat label even when the physical
         // supply class is budget-owned and stable across heat windows.
-        set(address, requested);
-        if (!simple_region_budget::enabled()) {
+        // Resident-local mode passes a placement class here; writing it into
+        // the measured heat table would turn Resident into a remote Hot hint.
+        if (local_resident_enabled())
+            // This API is used for a newly empty physical Region.  Start its
+            // measured heat evidence cold; the supply label below carries the
+            // actual R/S placement independently.
+            set(address, kCold);
+        else
+            set(address, requested);
+        if (!simple_region_budget::enabled() && !local_resident_enabled()) {
             return requested;
         }
 
@@ -149,6 +185,12 @@ public:
             old_bin = supply_bins_[slot].load(std::memory_order_relaxed);
             old_class = supply_labels_[slot].load(std::memory_order_relaxed);
         }
+        if (!simple_region_budget::enabled()) {
+            supply_labels_[slot].store(requested, std::memory_order_relaxed);
+            supply_bins_[slot].store(static_cast<int>(bin),
+                                     std::memory_order_relaxed);
+            return requested;
+        }
         const uint8_t chosen = simple_region_budget::local().claim(
             bin, requested, old_bin, old_class);
         if (mapped) {
@@ -157,6 +199,63 @@ public:
                                      std::memory_order_relaxed);
         }
         return chosen;
+    }
+    uint8_t sync_supply_placement(uintptr_t address, size_t bin,
+                                  bool resident) {
+        if (!local_resident_enabled()) return allocation_class(address);
+        const bool mapped = labels_ && address >= base_ &&
+                            address - base_ < bytes_;
+        if (!mapped || !supply_labels_ || !supply_bins_)
+            throw std::logic_error(
+                "simple resident local heap classes not configured");
+        const size_t slot = (address - base_) / region_bytes_;
+        const int old_bin = supply_bins_[slot].load(std::memory_order_acquire);
+        const uint8_t old_class = normalize_class(
+            supply_labels_[slot].load(std::memory_order_acquire));
+        const uint8_t new_class = class_for_placement(resident, old_class);
+        if (old_bin == static_cast<int>(bin) && old_class == new_class)
+            return old_class;
+        if (!simple_region_budget::enabled()) {
+            supply_labels_[slot].store(new_class, std::memory_order_release);
+            supply_bins_[slot].store(static_cast<int>(bin),
+                                     std::memory_order_release);
+            return new_class;
+        }
+        uint8_t chosen = new_class;
+        if (old_bin < 0) {
+            chosen = simple_region_budget::local().claim(bin, new_class);
+        } else if (old_bin != static_cast<int>(bin)) {
+            simple_region_budget::local().release_supply(
+                static_cast<size_t>(old_bin), old_class);
+            chosen = simple_region_budget::local().claim(bin, new_class);
+        } else {
+            chosen = simple_region_budget::local().reclassify_supply(
+                bin, old_class, new_class);
+        }
+        supply_labels_[slot].store(chosen, std::memory_order_release);
+        supply_bins_[slot].store(static_cast<int>(bin), std::memory_order_release);
+        return chosen;
+    }
+    bool release_supply(uintptr_t address) {
+        if (!simple_region_budget::enabled() && !local_resident_enabled())
+            return false;
+        const bool mapped = labels_ && address >= base_ &&
+                            address - base_ < bytes_;
+        if (!mapped || !supply_labels_ || !supply_bins_) return false;
+        const size_t slot = (address - base_) / region_bytes_;
+        const int old_bin = supply_bins_[slot].exchange(
+            -1, std::memory_order_acq_rel);
+        if (old_bin < 0) return false;
+        const uint8_t old_class = normalize_class(
+            supply_labels_[slot].load(std::memory_order_acquire));
+        if (!simple_region_budget::enabled()) {
+            supply_labels_[slot].store(kCold, std::memory_order_release);
+            return true;
+        }
+        const bool released = simple_region_budget::local().release_supply(
+            static_cast<size_t>(old_bin), old_class);
+        supply_labels_[slot].store(kCold, std::memory_order_release);
+        return released;
     }
     uint8_t reassign_supply_public(uintptr_t address, size_t bin,
                                    uint8_t old_class) {
@@ -196,12 +295,20 @@ inline uint8_t assign_supply_empty(uintptr_t address, size_t bin,
                                    uint8_t requested) {
     return classes().assign_supply_empty(address, bin, requested);
 }
+inline uint8_t sync_supply_placement(uintptr_t address, size_t bin,
+                                     bool resident) {
+    return classes().sync_supply_placement(address, bin, resident);
+}
+inline bool release_supply(uintptr_t address) {
+    return classes().release_supply(address);
+}
 inline uint8_t reassign_supply_public(uintptr_t address, size_t bin,
                                       uint8_t old_class) {
     return classes().reassign_supply_public(address, bin, old_class);
 }
 
 inline bool enabled() {
+    if (behavior_group_runtime::enabled()) return true;
     static const bool on = [] {
         const char *p = std::getenv("FARLIB_SIMPLE_REGION_HEAT");
         return p && std::strcmp(p, "1") == 0;
@@ -337,7 +444,8 @@ public:
         if (simple_region_budget::six_enabled() && !simple_region_budget::enabled())
             throw std::invalid_argument("semantic six groups require Region budgets");
         if (simple_region_budget::enabled() &&
-            (!grouping_enabled() || !local_routing_enabled() || !remote_grouping_enabled()))
+            ((!grouping_enabled() && !local_resident_enabled()) ||
+             !local_routing_enabled() || !remote_grouping_enabled()))
             throw std::invalid_argument("Region budgets require local and remote Hot/Cold routing");
         if (simple_region_budget::enabled())
             std::cerr << "simple_region_budget.config mode="
@@ -351,19 +459,28 @@ public:
                       << " max_step_pct=" << (simple_region_budget::fast_enabled() ? 10 : 1)
                       << " minimum_step_regions=1 live_migration=0 private_steal=0"
                       << " heat_and_supply_separate=1 scope=domain_bin"
-                      << " actuator=background_public_usable semantic_classes=" << simple_region_budget::classes() << std::endl;
+                      << " actuator=background_public_usable semantic_classes="
+                      << simple_region_budget::classes()
+                      << " local_resident=" << local_resident_enabled()
+                      << " local_band_semantics="
+                      << (local_resident_enabled() ? "streaming[0..2],resident[3..5]"
+                                                    : "none")
+                      << std::endl;
         for(const char *name:{"FARLIB_FIXED_SIX_GROUPS","FARLIB_FIXED_SIX_POOLS"}) {
             const char *v=std::getenv(name);
             if(v && std::strcmp(v,"0")!=0)
                 throw std::invalid_argument("simple heat must not run with old grouping");
         }
         counters_.configure(base,local_bytes,region_bytes);
-        if(grouping_enabled()) {
+        if(grouping_enabled() || local_resident_enabled()) {
             const char *lists=std::getenv("FARLIB_LIST_ONLY_SIX");
-            if(!lists || std::strcmp(lists,"1")!=0)
+            if(!behavior_group_runtime::enabled() && (!lists || std::strcmp(lists,"1")!=0))
                 throw std::invalid_argument("hotcold requires six child lists");
             classes().configure(base,local_bytes,region_bytes);
-            std::cerr << "simple_hotcold.config enabled=1 hot_percent=80 cold_class=1 hot_class=4 quota=0 denominator=physical_local_slots" << std::endl;
+            if (local_resident_enabled())
+                std::cerr << "simple_hotcold.config enabled=1 mode=local_resident measured_heat=remote_hint local_bands=streaming[0..2],resident[3..5] quota=0 denominator=physical_local_slots" << std::endl;
+            else
+                std::cerr << "simple_hotcold.config enabled=1 hot_percent=80 cold_class=1 hot_class=4 quota=0 denominator=physical_local_slots" << std::endl;
             std::cerr << "simple_remote_hotcold.config enabled=" << remote_grouping_enabled()
                       << " local_hint_preserved=1 relink_enabled=" << relink_enabled()
                       << " local_routing_enabled=" << local_routing_enabled() << std::endl;
@@ -376,7 +493,9 @@ public:
         std::cerr << "simple_region_heat.config sample_period=64 interval_ms="
                   << interval_ms()
                   << " metric=access_count migration=0 quota=0 slots="
-                  << counters_.slots() << std::endl;
+                  << counters_.slots()
+                  << " local_resident=" << local_resident_enabled()
+                  << " measured_heat_for_remote_hints=1" << std::endl;
     }
     void set_reclassify(std::function<size_t()> fn) { reclassify_=std::move(fn); }
     void set_budget_tick(std::function<void(uint64_t)> fn) { budget_tick_=std::move(fn); }
@@ -419,8 +538,15 @@ public:
                     const size_t moved=(relink_enabled() && reclassify_) ? reclassify_() : 0;
                     const auto finished=Clock::now();
                     const size_t hot=classes().slots()/5*4+(classes().slots()%5)*4/5;
-                    std::cout << "simple_hotcold.window index=" << window_
-                              << " hot=" << hot << " cold=" << classes().slots()-hot
+                    std::cout << "simple_hotcold.window index=" << window_;
+                    if (local_resident_enabled())
+                        std::cout << " measured_hot=" << hot
+                                  << " measured_cold=" << classes().slots()-hot
+                                  << " local_hot=resident local_cold=streaming";
+                    else
+                        std::cout << " hot=" << hot
+                                  << " cold=" << classes().slots()-hot;
+                    std::cout
                               << " labels_changed=" << changed << " shared_relinked=" << moved
                               << " relink_enabled=" << relink_enabled()
                               << " local_routing_enabled=" << local_routing_enabled()

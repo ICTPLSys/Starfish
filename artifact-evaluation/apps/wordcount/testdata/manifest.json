@@ -1,0 +1,7 @@
+{
+  "unique_words": 65536,
+  "total_words": 196606,
+  "bytes": 2162666,
+  "sha256": "21badbfc207d391acb799a30a35edbfff31fa1b30f7a0108330f48f790d92e3f",
+  "description": "65536 alphabetic ten-character words; per-word counts1..5; functional Wordcount input, not performance baseline"
+}

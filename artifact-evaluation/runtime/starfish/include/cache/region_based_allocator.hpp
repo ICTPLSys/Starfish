@@ -141,7 +141,8 @@ struct BlockHead {
     // Close new ordinary READ acquisition during recovery. Place the flag in
     // the existing tail padding so the x86-64 header remains 24 bytes.
     // Bit 0 closes ordinary READ admission; bit 1 pins this block for the
-    // single degraded-read owner. Both fit in the existing one-byte field.
+    // single degraded-read owner. Bit 2 borrows the source for direct EC WRITE.
+    // All fit in the existing byte; object/header sizes do not change.
     std::atomic<uint8_t> normal_read_recovery_active{0};
 
     void *get_object_ptr() { return static_cast<void *>(this + 1); }
@@ -180,10 +181,13 @@ inline uint16_t next_normal_read_generation(BlockHead *block) {
 // and completions release those pins independently, while a later allocator
 // reuse advances the generation exactly once after the old epoch drains.
 inline uint16_t acquire_normal_read_pin(BlockHead *block) {
-    while (block->rdma_read_pin_lock.test_and_set(std::memory_order_acquire)) {
-        // The critical section is a pair of atomic loads/stores; a plain
-        // acquire spin avoids yielding from a fibre while holding no runtime
-        // scheduling context.
+    if (block->rdma_read_pin_lock.test_and_set(std::memory_order_acquire)) {
+        while (block->rdma_read_pin_lock.test_and_set(
+            std::memory_order_acquire)) {
+            // The critical section is a pair of atomic loads/stores; a plain
+            // acquire spin avoids yielding from a fibre while holding no
+            // runtime scheduling context.
+        }
     }
     if (block->normal_read_recovery_active.load(std::memory_order_relaxed)) {
         block->rdma_read_pin_lock.clear(std::memory_order_release);
@@ -213,7 +217,29 @@ inline void begin_normal_read_recovery(BlockHead *block) {
 }
 
 inline bool normal_read_recovery_active(const BlockHead *block) {
-    return block->normal_read_recovery_active.load(std::memory_order_acquire);
+    return (block->normal_read_recovery_active.load(std::memory_order_acquire) & 3u) != 0;
+}
+
+inline bool ec_write_source_borrowed(const BlockHead *block) {
+    return (block->normal_read_recovery_active.load(std::memory_order_acquire) & 4u) != 0;
+}
+inline bool try_borrow_ec_write_source(BlockHead *block) {
+    // Reuse the existing per-block READ admission gate. Contention takes the
+    // snapshot fallback; eviction never spins here or takes a global lock.
+    if (block->rdma_read_pin_lock.test_and_set(std::memory_order_acquire)) return false;
+    const bool borrowed = block->pending_rdma_reads.load(std::memory_order_acquire) == 0 &&
+        block->normal_read_recovery_active.load(std::memory_order_relaxed) == 0;
+    // READ/recovery admission uses the same gate, so no second CAS is needed.
+    if (borrowed) block->normal_read_recovery_active.store(4, std::memory_order_release);
+    block->rdma_read_pin_lock.clear(std::memory_order_release);
+    return borrowed;
+}
+inline void release_ec_write_source(BlockHead *block) {
+    block->normal_read_recovery_active.fetch_and(static_cast<uint8_t>(~uint8_t{4}), std::memory_order_release);
+}
+
+inline bool block_has_completion_owner(const BlockHead *block) {
+    return (block->normal_read_recovery_active.load(std::memory_order_acquire) & 6u) != 0;
 }
 
 inline bool degraded_read_owned(const BlockHead *block) {

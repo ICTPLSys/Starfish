@@ -35,7 +35,8 @@ protected:
                 this->idx = GroupSize - 1;
                 this->cursor--;
             } else {
-                // Keep negative offsets signed and normalize into the group.
+                // Normalize a negative index into [0, GroupSize) without the
+                // unsigned conversion that `% GroupSize` would perform.
                 const index_type group_size = static_cast<index_type>(GroupSize);
                 const index_type offset =
                     (this->idx - group_size + 1) / group_size;

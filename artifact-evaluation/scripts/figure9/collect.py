@@ -16,6 +16,8 @@ FIELDS = ("workload", "system", "ratio", "elapsed_s", "source_type",
 SYSTEMS = {"Non-FT", "Starfish", "Carbink", "Hydra"}
 WORKLOADS = {"BFS", "LLM", "MG", "WC", "KV-B", "KV-A", "KV-S", "NQ"}
 AE_ROOT = Path(__file__).resolve().parents[2]
+SYSTEM_LABEL = {"nonft": "Non-FT", "starfish": "Starfish",
+                "hydra": "Hydra", "carbink": "Carbink"}
 
 
 def source_path(path: Path) -> str:
@@ -51,6 +53,9 @@ def collect(runs_dir: Path) -> tuple[list[dict], int]:
                 or not 1 <= record["ratio"] <= 100
                 or record.get("run_id") != analysis_path.parent.name
                 or plan.get("app") != record.get("application")
+                or SYSTEM_LABEL.get(plan.get("system")) != record.get("system")
+                or plan.get("failure_injection_endpoint") is not None
+                or record.get("failure_injection")
                 or plan.get("ratio") != record["ratio"]
                 or plan.get("run_id") != record["run_id"]
                 or not record.get("measurement_phase")):

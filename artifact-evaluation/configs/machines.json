@@ -1,0 +1,15 @@
+{
+  "verified_date": "2026-09-28",
+  "address_purpose": "SSH and TCP setup; bulk RDMA uses ib_device/ib_port",
+  "server_port": 1893,
+  "servers": [
+    {"ip": "10.208.130.22", "hostname": "cpuserver22", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 1, "link_layer": "InfiniBand", "link_gbps": 100},
+    {"ip": "10.208.130.54", "hostname": "memserver54", "cpu": "Xeon Silver 4316", "physical_cores_per_numa": 20, "ib_device": "mlx5_0", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100},
+    {"ip": "10.208.130.56", "hostname": "cpuserver56", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100, "fibre_workers": 24, "fibre_cpu_set": "0-17,24-29", "background_cpu_base": 18, "allow_cross_numa_app": true},
+    {"ip": "10.208.130.58", "hostname": "cpuserver58", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100},
+    {"ip": "10.208.130.74", "hostname": "cpuserver74", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100},
+    {"ip": "10.208.130.76", "hostname": "memserver76", "cpu": "Xeon Silver 4316", "physical_cores_per_numa": 20, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100},
+    {"ip": "10.208.130.82", "hostname": "cpuserver82", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_0", "ib_port": 1, "numa_node": 1, "link_layer": "InfiniBand", "link_gbps": 100},
+    {"ip": "10.208.130.84", "hostname": "memserver84", "cpu": "Xeon Silver 4316", "physical_cores_per_numa": 20, "ib_device": "mlx5_0", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100}
+  ]
+}

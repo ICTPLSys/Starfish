@@ -15,6 +15,7 @@ retry:
     switch (state.state) {
     case FREE:
         entry.set_free();
+        other->clear_recompute_metadata();
         return;
     case REMOTE:
         entry.store_placement_flags(other->load_placement_flags());
@@ -25,6 +26,7 @@ retry:
         entry.set_remote_addr(other->remote_addr());
         entry.copy_frequency_profile_from(*other);
         entry.take_six_metadata_from(*other);
+        entry.take_recompute_recipe_from(*other);
         break;
     case LOCAL:
     case PINNED:
@@ -50,6 +52,7 @@ retry:
         entry.set_remote_addr(other->remote_addr());
         entry.copy_frequency_profile_from(*other);
         entry.take_six_metadata_from(*other);
+        entry.take_recompute_recipe_from(*other);
         auto block = static_cast<allocator::BlockHead *>(local_addr) - 1;
         far_obj_t obj = block->obj_meta_data.load(std::memory_order::relaxed);
         obj.obj_id = reinterpret_cast<uint64_t>(this);
@@ -87,6 +90,7 @@ retry:
     switch (prev_state.state) {
     case FREE:
         to.entry.set_free();
+        entry.clear_recompute_metadata();
         return;
     case REMOTE:
         to.entry.store_placement_flags(entry.load_placement_flags());
@@ -97,6 +101,7 @@ retry:
         to.entry.set_remote_addr(entry.remote_addr());
         to.entry.copy_frequency_profile_from(entry);
         to.entry.take_six_metadata_from(entry);
+        to.entry.take_recompute_recipe_from(entry);
         break;
     case LOCAL:
     case PINNED:
@@ -112,6 +117,7 @@ retry:
         to.entry.set_remote_addr(entry.remote_addr());
         to.entry.copy_frequency_profile_from(entry);
         to.entry.take_six_metadata_from(entry);
+        to.entry.take_recompute_recipe_from(entry);
         auto block = static_cast<allocator::BlockHead *>(local_addr) - 1;
         far_obj_t obj = block->obj_meta_data.load(std::memory_order::relaxed);
         obj.obj_id = reinterpret_cast<uint64_t>(&to);
@@ -128,6 +134,7 @@ retry:
     entry.set_local_addr(nullptr);
     entry.set_remote_invalid();
     entry.store_placement_flags(0);
+    entry.clear_recompute_metadata();
     entry.set_logical_owner_id(0);
     entry.set_resident_group_id(0);
     entry.reset_frequency_profile();

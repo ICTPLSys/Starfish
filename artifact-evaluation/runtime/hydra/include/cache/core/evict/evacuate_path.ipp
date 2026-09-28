@@ -1,6 +1,5 @@
 #pragma once
 #include "cache/concurrent_cache.hpp"
-#include "utils/scope_diag.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -1170,10 +1169,6 @@ inline void ConcurrentArrayCache::mark_phase(
     std::atomic_size_t *ready_task_budget, size_t diag_worker_slot,
     std::atomic_size_t *legacy_region_budget,
     std::atomic_bool *mark_stop_after_evict) {
-        // Invocation-local (not OS-thread-local): safe across fibre migration.
-        const bool nq_result_diag = inclusive_reclaim_diag::enabled() &&
-            wait_trace::nq_supply_only.load(std::memory_order_relaxed);
-        uint64_t nq_mark_results[8]{};
         profile::DualFrequencyHistogramSnapshot local_frequency_histogram;
         local_frequency_histogram.timestamp = timestamp;
         local_frequency_histogram.mark_pass_ordinal =
@@ -1183,13 +1178,11 @@ inline void ConcurrentArrayCache::mark_phase(
         local_frequency_histogram.ema_updated =
             frequency_mark_pass.update_ema_this_pass;
         auto mark =
-            [this, &local_frequency_histogram, frequency_mark_pass,
-             nq_result_diag, &nq_mark_results](
+            [this, &local_frequency_histogram, frequency_mark_pass](
                         ::FarLib::allocator::BlockHead *b) {
             const auto result = this->try_mark(
                 b, &local_frequency_histogram,
                 frequency_mark_pass.update_ema_this_pass);
-            if (nq_result_diag) ++nq_mark_results[static_cast<size_t>(result)];
             return result;
         };
         int64_t mark_start = profile::start_mark();
@@ -1238,41 +1231,6 @@ inline void ConcurrentArrayCache::mark_phase(
         if (mark_diag.segment_enabled) {
             mark_diag.segment_body_cycles = get_cycles() - segment_start;
             inclusive_reclaim_diag::clear_hold(diag_worker_slot);
-            wait_trace::emit("reclaim_mark_scan", timestamp,
-                             mark_diag.nodes_examined,
-                             mark_diag.stamped_skips, diag_worker_slot);
-            wait_trace::emit("reclaim_mark_regions", timestamp,
-                             mark_diag.regions_popped,
-                             mark_diag.regions_marked, diag_worker_slot);
-            wait_trace::emit("reclaim_mark_lock", timestamp,
-                             mark_diag.list_lock_wait_cycles,
-                             mark_diag.list_lock_hold_cycles,
-                             diag_worker_slot);
-            wait_trace::emit("reclaim_mark_lock_samples", timestamp,
-                             mark_diag.pop_calls, mark_diag.pop_samples,
-                             diag_worker_slot);
-            wait_trace::emit("reclaim_mark_cycles", timestamp,
-                             mark_diag.region_mark_whole_cycles,
-                             mark_diag.pop_whole_cycles, diag_worker_slot);
-            wait_trace::emit("reclaim_mark_body", timestamp,
-                             mark_diag.segment_body_cycles,
-                             mark_diag.region_mark_whole_calls,
-                             diag_worker_slot);
-            wait_trace::emit("reclaim_mark_eligible", timestamp,
-                             mark_diag.eligible_calls,
-                             mark_diag.eligible_false, diag_worker_slot);
-            if (nq_result_diag) {
-                uint64_t total = 0;
-                for (uint64_t n : nq_mark_results) total += n;
-                wait_trace::emit("reclaim_mark_results", timestamp,
-                                 nq_mark_results[MARKED], total, diag_worker_slot);
-                wait_trace::emit("reclaim_mark_local_pinned", timestamp,
-                                 nq_mark_results[LOCAL], nq_mark_results[PINNED],
-                                 diag_worker_slot);
-                wait_trace::emit("reclaim_mark_free_busy", timestamp,
-                                 nq_mark_results[FREE], nq_mark_results[BUSY],
-                                 diag_worker_slot);
-            }
         }
         profile::end_mark(mark_start);
         if (hybrid_profiling_enabled()) {
@@ -1502,25 +1460,6 @@ inline void ConcurrentArrayCache::evict_post_worker_logic(
                                    std::memory_order_relaxed);
         if (evict_diag.segment_enabled) {
             inclusive_reclaim_diag::clear_hold(diag_worker_slot);
-            wait_trace::emit("reclaim_evict_scan", timestamp,
-                             evict_diag.nodes_examined,
-                             evict_diag.stamped_skips, diag_worker_slot);
-            wait_trace::emit("reclaim_evict_regions", timestamp,
-                             evict_diag.selected,
-                             evict_diag.selected_unmarked_nonempty,
-                             diag_worker_slot);
-            wait_trace::emit("reclaim_evict_lock", timestamp,
-                             evict_diag.list_lock_wait_cycles,
-                             evict_diag.list_lock_hold_cycles,
-                             diag_worker_slot);
-            wait_trace::emit("reclaim_evict_process", timestamp,
-                             evict_diag.processed_regions,
-                             evict_diag.processing_zero_reclaim,
-                             diag_worker_slot);
-            wait_trace::emit("reclaim_evict_cycles", timestamp,
-                             evict_diag.processing_cycles,
-                             evict_diag.reclaimed_bytes,
-                             diag_worker_slot);
         }
     }
 
@@ -1832,14 +1771,12 @@ inline void ConcurrentArrayCache::flip_scope_state(uint32_t epoch_to_release) {
                 ? static_cast<int64_t>(scope_counters.old_count(old_state))
                 : static_cast<int64_t>(mutator_states.count[old_state].load(std::memory_order::acquire));
         };
-        scope_diag::begin_flip(epoch_to_release, old_state);
         int64_t old_entry_count = old_count();
         if (old_entry_count > 0) {
             profile::count_evac_flip_wait_old_blocked_flip(old_entry_count);
         }
         while (true) {
             int64_t observed_old = old_count();
-            scope_diag::snapshot(epoch_to_release, observed_old);
             if (observed_old == 0) break;
             static thread_local uint64_t flip_wait_loop = 0;
             ++flip_wait_loop;
@@ -1855,7 +1792,6 @@ inline void ConcurrentArrayCache::flip_scope_state(uint32_t epoch_to_release) {
         if (epoch_to_release > 0) {
             safe_epoch.store(epoch_to_release, std::memory_order_release);
         }
-        scope_diag::end_flip(epoch_to_release);
         log_cache_progress("flip_scope_end", kAnyAllocBin, epoch_to_release);
     }
 

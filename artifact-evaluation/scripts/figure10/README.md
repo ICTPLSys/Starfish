@@ -1,8 +1,7 @@
 # Figure 10: tail latency
 
 The two-panel axes, line order, markers and log-latency scale follow the
-submitted figure. Data comes from the supplied CSV; this script does not run
-experiments or embed latency measurements.
+submitted figure. Data comes from the supplied CSV.
 
 Required CSV columns:
 
@@ -19,8 +18,6 @@ Required CSV columns:
   require explicit `--source-type` and are exported under distinct names.
   Nonblank values require a source identifier. Optional `exit_status` and
   `correctness` fields reject incomplete or failed runs.
-- The plotter checks the CSV contract; it does not verify that the underlying
-  runs have identical workloads, hardware, memory ratios and timing windows.
 
 Run with the shared environment's dependencies (Matplotlib and NumPy):
 
@@ -29,5 +26,5 @@ python3 scripts/figure10/plot.py --input data/figure10.csv
 python3 scripts/figure10/plot.py --input data/figure10.csv --validate-only
 ```
 
-The input file and PNG/PDF/JSON output are ignored by Git. A header-only CSV
-is valid and renders empty panels; no paper data is filled automatically.
+A header-only CSV is valid and renders empty panels; no paper data is filled
+automatically.

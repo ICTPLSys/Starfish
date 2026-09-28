@@ -25,5 +25,5 @@ integration. The Non-FT recipe disables selective backup by design.
   placement action.
 - Region snapshots are hints. A consumer must revalidate placement and epoch
   while holding the Region placement lock before changing a Region.
-- Physical Region reclassification and object-level fetch placement use
-  different names. Do not call both operations promotion or demotion.
+- Physical Region reclassification and object-level fetch placement are
+  distinct operations.

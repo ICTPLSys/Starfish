@@ -28,6 +28,3 @@ never silently clipped.
 python3 scripts/figure12/plot.py --input data/figure12.csv
 python3 scripts/figure12/plot.py --input data/figure12.csv --validate-only
 ```
-
-The figure compares complete runs, not isolated best sub-stages. The
-plotter checks the CSV schema but cannot establish workload comparability.

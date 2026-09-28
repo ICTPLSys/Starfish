@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Plot evaluation fault-tolerance metrics from explicit CSV data."""
+"""Plot evaluation fault-tolerance metrics from final logs or explicit CSV data."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import hashlib
+import json
 import math
 from pathlib import Path
 import sys
+
+sys.dont_write_bytecode = True
 
 import numpy as np
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 AE_ROOT = SCRIPTS.parent
+sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "common"))
 from plotting import SYSTEM_STYLES, export_figure, get_pyplot, read_csv
 
@@ -35,9 +39,27 @@ TITLES = {"bfs": "BFS", "llama": "LLM", "mg": "MG", "wc": "WC",
 
 
 def prepare(path: Path, source_type="measured"):
+    numbered_rows, digest = read_csv(path, REQUIRED)
+    return prepare_rows(numbered_rows, digest, str(path.resolve()), source_type)
+
+
+def prepare_logs(logs_root: Path, *, pattern="*.log", ratio=25, repeat=1):
+    from figure11.collect import collect_rows
+    rows = collect_rows(logs_root, pattern=pattern, ratio=ratio, repeat=repeat)
+    digest = hashlib.sha256(
+        json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    data = prepare_rows(list(enumerate(rows, 1)), digest,
+                        str(logs_root.resolve()), "measured")
+    data.update(input_format="figure11_result_logs",
+                input_hash_scope="canonical_collected_rows",
+                ratio=ratio, repeat=repeat, log_pattern=pattern,
+                collected_rows=rows)
+    return data
+
+
+def prepare_rows(numbered_rows, digest, input_name, source_type="measured"):
     if source_type not in SOURCE_TYPES:
         raise ValueError(f"unknown source type: {source_type}")
-    numbered_rows, digest = read_csv(path, REQUIRED)
     values = {}
     blanks = []
     for line, row in numbered_rows:
@@ -66,10 +88,10 @@ def prepare(path: Path, source_type="measured"):
                 raise ValueError("correctness must be pass")
             values[key] = {"value": value, "source": row["source"]}
         except (KeyError, ValueError) as exc:
-            raise ValueError(f"CSV line {line}: {exc}") from exc
+            raise ValueError(f"input row {line}: {exc}") from exc
     missing = [[w, s, c] for w in WORKLOADS for s in SYSTEMS for c in COMPONENTS
                if (w, s, c) not in values]
-    return {"figure": "figure11", "input": str(path.resolve()), "input_sha256": digest,
+    return {"figure": "figure11", "input": input_name, "input_sha256": digest,
             "source_type": source_type, "components": COMPONENTS,
             "input_rows": len(numbered_rows), "blank_rows": blanks,
             "missing_conditions": missing,
@@ -178,14 +200,25 @@ def draw(data):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, type=Path)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--input", type=Path, help="read an existing measurement CSV")
+    inputs.add_argument("--logs-root", type=Path, help="read figure11_result records directly")
+    parser.add_argument("--pattern", default="*.log", help="log filename glob for --logs-root")
+    parser.add_argument("--ratio", type=int, default=25, help="local-memory percentage in log mode")
+    parser.add_argument("--repeat", type=int, default=1, help="one repeat to select in log mode")
     parser.add_argument("--output-dir", type=Path,
                         default=AE_ROOT / "results/figures/figure11")
     parser.add_argument("--source-type", choices=sorted(SOURCE_TYPES), default="measured")
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     try:
-        data = prepare(args.input, args.source_type)
+        if args.logs_root is not None:
+            if args.source_type != "measured":
+                raise ValueError("--logs-root accepts measured records only")
+            data = prepare_logs(args.logs_root, pattern=args.pattern,
+                                ratio=args.ratio, repeat=args.repeat)
+        else:
+            data = prepare(args.input, args.source_type)
         if args.validate_only:
             print(f"validated {data['input_rows']} rows")
             return 0
@@ -199,7 +232,7 @@ def main(argv=None):
         finally:
             get_pyplot().close(fig)
         return 0
-    except (OSError, UnicodeError, csv.Error, ValueError, RuntimeError) as exc:
+    except (OSError, UnicodeError, csv.Error, ValueError, RuntimeError, OverflowError) as exc:
         parser.exit(2, f"error: {exc}\n")
 
 

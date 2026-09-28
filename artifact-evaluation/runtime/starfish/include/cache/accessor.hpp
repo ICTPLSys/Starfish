@@ -60,9 +60,22 @@ public:
 
     bool is_null() const { return entry.load_state().state == FREE; }
 
+    // Call immediately after allocation, in that DereferenceScope. Returns
+    // false without changing protection if the first eviction already began.
+    bool mark_recomputable() {
+        return Cache::get_default()->mark_recomputable(obj());
+    }
+
+    bool is_recomputable() const {
+        return !is_null() && entry.is_recomputable();
+    }
+
     template <bool Mut = false, typename Scope>
     __attribute__((always_inline)) LiteAccessor<T, Mut> access(
         Scope &&scope) const {
+        if constexpr (Mut) {
+            Cache::get_default()->guard_recompute_mutation(entry);
+        }
         bool fast = entry.load_state().is_deref_fast_path<Mut>();
         if (fast) [[likely]] {
             Cache::get_default()->record_local_fast_path_access(
@@ -80,6 +93,9 @@ public:
     template <bool Mut = false, typename Scope>
     __attribute__((always_inline)) LiteAccessor<T, Mut> access(
         __DMH__, Scope &&scope) const {
+        if constexpr (Mut) {
+            Cache::get_default()->guard_recompute_mutation(entry);
+        }
         bool fast = entry.load_state().is_deref_fast_path<Mut>();
         if (fast) [[likely]] {
             Cache::get_default()->record_local_fast_path_access(
@@ -264,6 +280,7 @@ public:
 
     LiteAccessor<T, true> as_mut() const {
         check(block, local_ptr);
+        Cache::get_default()->guard_recompute_mutation(*get_obj().get_entry_ptr());
         if constexpr (!Mut) {
             Cache::get_default()->mark_dirty(get_obj());
         }
@@ -403,6 +420,7 @@ public:
 
     LiteAccessor<void, true> as_mut() const {
         check(block, local_ptr);
+        Cache::get_default()->guard_recompute_mutation(*get_obj().get_entry_ptr());
         if constexpr (!Mut) {
             Cache::get_default()->mark_dirty(get_obj());
         }
@@ -435,6 +453,34 @@ using cache::RootDereferenceScope;
 using cache::UniqueFarPtr;
 
 static_assert(sizeof(far_obj_t) == sizeof(uint64_t));
+
+// Recipe declaration follows the output/inputs/callback/argument order.
+inline bool cache::DereferenceScope::mark_recomputable(
+    far_obj_t output, const recompute::Inputs &inputs,
+    recompute::EntryFn entry, uint64_t entry_args) {
+    return Cache::get_default()->register_recompute_recipe(
+        output, inputs, entry, entry_args);
+}
+
+// Applications promise that marked data can be regenerated. This annotation
+// skips EC; it does not register or automatically execute a rebuild callback.
+inline bool mark_recomputable(far_obj_t obj) {
+    return Cache::get_default()->mark_recomputable(obj);
+}
+
+inline bool is_recomputable(far_obj_t obj) {
+    return Cache::get_default()->is_recomputable(obj);
+}
+
+template <typename T>
+inline bool mark_recomputable(UniqueFarPtr<T> &obj) {
+    return obj.mark_recomputable();
+}
+
+template <typename T>
+inline bool is_recomputable(const UniqueFarPtr<T> &obj) {
+    return obj.is_recomputable();
+}
 
 inline LiteAccessor<void, true> alloc_uninitialized(size_t size,
                                                     DereferenceScope &scope) {

@@ -260,7 +260,7 @@ inline BlockHead *RegionHead::allocate(cache::far_obj_t obj,
     if (block != nullptr) {
         assert(block->obj_meta_data == cache::far_obj_t::null());
         assert(block->pending_rdma_reads.load(std::memory_order_acquire) == 0);
-        assert(!degraded_read_owned(block));
+        assert(!block_has_completion_owner(block));
         used_count++;
         free_list = block->next;
         block->next = active_list;
@@ -339,7 +339,7 @@ inline bool RegionHead::has_deallocated_blocks() const {
          block = block->next) {
         if (block->obj_meta_data.load(std::memory_order_acquire).is_null() &&
             block->pending_rdma_reads.load(std::memory_order_acquire) == 0 &&
-            !degraded_read_owned(block)) {
+            !block_has_completion_owner(block)) {
             return true;
         }
     }
@@ -347,7 +347,7 @@ inline bool RegionHead::has_deallocated_blocks() const {
          block = block->next) {
         if (block->obj_meta_data.load(std::memory_order_acquire).is_null() &&
             block->pending_rdma_reads.load(std::memory_order_acquire) == 0 &&
-            !degraded_read_owned(block)) {
+            !block_has_completion_owner(block)) {
             return true;
         }
     }
@@ -368,7 +368,7 @@ inline size_t RegionHead::reclaim_deallocated_blocks(bool force) {
         BlockHead *next = block->next;
         if (block->obj_meta_data.load(std::memory_order_acquire).is_null() &&
             block->pending_rdma_reads.load(std::memory_order_acquire) == 0 &&
-            !degraded_read_owned(block)) {
+            !block_has_completion_owner(block)) {
             block->next = new_free_list;
             new_free_list = block;
             ASSERT(used_count != 0);
@@ -386,7 +386,7 @@ inline size_t RegionHead::reclaim_deallocated_blocks(bool force) {
         BlockHead *next = block->next;
         if (block->obj_meta_data.load(std::memory_order_acquire).is_null() &&
             block->pending_rdma_reads.load(std::memory_order_acquire) == 0 &&
-            !degraded_read_owned(block)) {
+            !block_has_completion_owner(block)) {
             block->next = new_free_list;
             new_free_list = block;
             ASSERT(used_count != 0);
@@ -421,7 +421,7 @@ inline void RegionHead::mark(Fn &&fn) {
         // the completion path drops the final read pin.
         if (result == cache::FREE &&
             (block->pending_rdma_reads.load(std::memory_order_acquire) != 0 ||
-             degraded_read_owned(block))) {
+             block_has_completion_owner(block))) {
             block->next = new_active_list;
             new_active_list = block;
             block = next_block;
@@ -467,7 +467,7 @@ inline void RegionHead::evict(Fn &&fn) {
         // marked list while a late READ completion can still reference them.
         if (result == cache::FREE &&
             (block->pending_rdma_reads.load(std::memory_order_acquire) != 0 ||
-             degraded_read_owned(block))) {
+             block_has_completion_owner(block))) {
             block->next = new_marked_list;
             new_marked_list = block;
             block = next_block;

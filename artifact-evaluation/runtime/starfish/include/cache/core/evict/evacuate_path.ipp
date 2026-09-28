@@ -24,6 +24,19 @@ inline bool legacy_scan_cursors_enabled() {
     return enabled;
 }
 
+// Port the historical inclusive_optimized_v1 scheduling bundle without
+// importing Inclusive eligibility or its separate direct-GC path. The caller
+// must also be in the optimized legacy pipeline (checked below at dispatch).
+inline bool exclusive_work_alignment_enabled() {
+    static const bool requested = [] {
+        const char *value = std::getenv("FARLIB_EXCLUSIVE_WORK_ALIGNMENT");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return requested && ::FarLib::get_config().optimized_evacuator &&
+           exclusive_owned_batch_reclaim_enabled() &&
+           legacy_scan_cursors_enabled();
+}
+
 inline bool inclusive_single_wait_enabled() {
     static const bool enabled = [] {
         const char *value = std::getenv("FARLIB_INCLUSIVE_SINGLE_WAIT");
@@ -172,6 +185,7 @@ inline void ConcurrentArrayCache::run_streaming_mark_master(
             "streaming_mark_begin", kAnyAllocBin, args->timestamp,
             args->worker_count);
         auto mark_start = get_cycles();
+        auto mark_metrics = profile::evac_phase_enter(profile::EvacPhase::Mark);
         if (args->ready_tasks_out != nullptr) {
             std::vector<std::vector<::FarLib::allocator::EvictTask>>
                 worker_ready(args->worker_count);
@@ -265,6 +279,7 @@ inline void ConcurrentArrayCache::run_streaming_mark_master(
         }
         profile::get_tlpd().evac_mark_phase_cycles +=
             (int64_t)(get_cycles() - mark_start);
+        profile::evac_phase_leave(mark_metrics);
 
         if (args->flip_after_mark) {
             auto flip_start_ph = get_cycles();
@@ -307,6 +322,9 @@ inline void ConcurrentArrayCache::run_streaming_evict_master(
         }
 
         auto evict_start = get_cycles();
+        auto evict_metrics = profile::evac_phase_enter(profile::EvacPhase::Evict);
+        auto *breakdown_round = profile::evict_breakdown::open_round(
+            evict_start, args->worker_count);
         if (args->ready_tasks_in != nullptr) {
             std::vector<std::vector<::FarLib::allocator::EvictTask>>
                 worker_deferred(args->worker_count);
@@ -315,11 +333,16 @@ inline void ConcurrentArrayCache::run_streaming_evict_master(
                 [cache = args->cache, ready_tasks = args->ready_tasks_in,
                  current_safe_epoch = required_safe_epoch,
                  posted_wrs_total = args->posted_wrs_total,
-                 &next_task_idx, &worker_deferred](size_t worker_id) {
-                    cache->evict_ready_worker_logic(
-                        *ready_tasks, next_task_idx, current_safe_epoch,
-                        worker_deferred[worker_id], *posted_wrs_total);
-            };
+                 &next_task_idx, &worker_deferred, breakdown_round](size_t worker_id) {
+                     auto *bd = breakdown_round ? &breakdown_round->workers[worker_id] : nullptr;
+                     profile::evict_breakdown::WorkerRun worker_run(bd);
+                     auto *reusable_buffers =
+                         cache->persistent_evict_buffers(worker_id);
+                     cache->evict_ready_worker_logic(
+                         *ready_tasks, next_task_idx, current_safe_epoch,
+                         worker_deferred[worker_id], *posted_wrs_total, bd,
+                         reusable_buffers);
+             };
             uthread::fork_join<true>(args->worker_count, fn_evict,
                                      "streaming_evict");
             if (args->deferred_tasks_out != nullptr) {
@@ -361,7 +384,9 @@ inline void ConcurrentArrayCache::run_streaming_evict_master(
                      args->remaining_evict_post_workers,
                  mark_stop_after_evict =
                      args->mark_stop_after_evict,
-                 worker_count = args->worker_count](size_t worker_id) {
+                 worker_count = args->worker_count, breakdown_round](size_t worker_id) {
+                    auto *bd = breakdown_round ? &breakdown_round->workers[worker_id] : nullptr;
+                    profile::evict_breakdown::WorkerRun worker_run(bd);
                     auto post_start = get_cycles();
                     cache->evict_post_worker_logic(timestamp,
                                                    *posted_wrs_total,
@@ -370,7 +395,7 @@ inline void ConcurrentArrayCache::run_streaming_evict_master(
                                                    worker_id,
                                                    eligibility,
                                                    resume_scan,
-                                                   evict_stop_after_mark);
+                                                   evict_stop_after_mark, bd);
                     if (!owned_reclaim) {
                         profile::get_tlpd().evac_evict_post_cycles +=
                             (int64_t)(get_cycles() - post_start);
@@ -389,16 +414,23 @@ inline void ConcurrentArrayCache::run_streaming_evict_master(
                             true, std::memory_order_release);
                     }
                     if (!owned_reclaim) {
-                        cache->evict_drain_phase();
-                        cache->gc_phase(gc_timestamp, eligibility,
-                                        resume_scan);
+                        {
+                            profile::evict_breakdown::Scope scope(bd, profile::evict_breakdown::Stage::CqProcess);
+                            cache->evict_drain_phase();
+                        }
+                        {
+                            profile::evict_breakdown::Scope scope(bd, profile::evict_breakdown::Stage::GcPublish);
+                            cache->gc_phase(gc_timestamp, eligibility, resume_scan);
+                        }
                     }
             };
             uthread::fork_join<true>(args->worker_count, fn_evict,
                                      "streaming_evict");
         }
 
-        auto elapsed = (int64_t)(get_cycles() - evict_start);
+        const auto evict_end = get_cycles();
+        if (breakdown_round) breakdown_round->end = evict_end;
+        auto elapsed = (int64_t)(evict_end - evict_start);
         int64_t total_wrs = args->posted_wrs_total->load(std::memory_order_relaxed);
         profile::get_tlpd().evac_evict_rounds++;
         if (total_wrs > 0) {
@@ -410,6 +442,7 @@ inline void ConcurrentArrayCache::run_streaming_evict_master(
             profile::get_tlpd().evac_evict_empty_cycles += elapsed;
         }
         profile::get_tlpd().evac_evict_phase_cycles += elapsed;
+        profile::evac_phase_leave(evict_metrics);
         args->cache->log_cache_progress(
             "streaming_evict_end", kAnyAllocBin, args->evict_timestamp,
             static_cast<uint64_t>(total_wrs));
@@ -474,12 +507,26 @@ inline void ConcurrentArrayCache::evacuate_work() {
         const size_t configured_mark_workers = get_mark_worker_count();
         const size_t evict_workers = get_evict_worker_count(configured_mark_workers);
         const size_t mark_workers = configured_mark_workers;
+        const bool exclusive_alignment =
+            optimized_enabled && optimized_legacy_exclusive_pipeline_enabled() &&
+            exclusive_work_alignment_enabled() && mark_workers != 0 && evict_workers != 0;
         std::cerr << "runtime.exclusive_owned_batch="
                   << (optimized_enabled &&
                       optimized_legacy_exclusive_pipeline_enabled() &&
                       exclusive_owned_batch_reclaim_enabled())
                   << " mark_workers=" << mark_workers
                   << " evict_workers=" << evict_workers << std::endl;
+        std::cerr << "runtime.exclusive_work_alignment=" << exclusive_alignment
+                  << " mark_regions_per_worker=64 evict_scan_visits=4096"
+                  << " stop_evict_after_mark=" << exclusive_alignment
+                  << " stop_mark_after_evict=0 stop_boundary=owned_batch"
+                  << " exclusive_eligibility_unchanged=1 owned_gc=1" << std::endl;
+        // Only the sequential evacuation master updates these counters.
+        // Observe after worker join, never add per-object shared statistics.
+        uint64_t alignment_rounds = 0, alignment_work_rounds = 0;
+        uint64_t alignment_mark_regions = 0, alignment_mark_max = 0;
+        uint64_t alignment_work_mark_regions = 0, alignment_work_scan_visits = 0;
+        uint64_t alignment_work_scan_complete = 0;
         uint64_t handled_eviction_request_seq = 0;
         auto requeue_pending_pipeline_tasks = [&] {
             const size_t pending = pipeline_ready_tasks.size();
@@ -499,6 +546,17 @@ inline void ConcurrentArrayCache::evacuate_work() {
         while (true) {
             if (!working.load()) {
                 requeue_pending_pipeline_tasks();
+                if (exclusive_alignment) {
+                    std::cerr << "exclusive_alignment diag rounds=" << alignment_rounds
+                              << " mark_regions=" << alignment_mark_regions
+                              << " max_mark_regions_per_round=" << alignment_mark_max
+                              << " mark_region_limit=" << 64 * mark_workers
+                              << " work_rounds=" << alignment_work_rounds
+                              << " work_mark_regions=" << alignment_work_mark_regions
+                              << " work_scan_visits=" << alignment_work_scan_visits
+                              << " work_scan_complete_rounds=" << alignment_work_scan_complete
+                              << " work_gate=round_begin" << std::endl;
+                }
                 return;
             }
             // Publish ingress without forcing an otherwise unnecessary round.
@@ -519,6 +577,8 @@ inline void ConcurrentArrayCache::evacuate_work() {
                     }
 
                     auto evac_master_start_cycles = get_cycles();
+                    const bool alignment_round_in_work = exclusive_alignment &&
+                        profile::work_phase_active.load(std::memory_order_relaxed);
                     profile::count_evacuation();
                     log_cache_progress("evac_round_begin_legacy_opt",
                                        kAnyAllocBin, timestamp);
@@ -526,11 +586,12 @@ inline void ConcurrentArrayCache::evacuate_work() {
                     timestamp++;
                     std::atomic_int64_t posted_wrs_total{0};
                     const bool mark_one_batch_per_worker =
-                        !::FarLib::get_config().exclusive_cache &&
+                        exclusive_alignment ||
+                        (!::FarLib::get_config().exclusive_cache &&
                         legacy_scan_cursors_enabled() &&
                         inclusive_legacy_eligibility_enabled() &&
                         inclusive_legacy_cursors_enabled() &&
-                        inclusive_mark_one_batch_per_worker_enabled();
+                        inclusive_mark_one_batch_per_worker_enabled());
                     const size_t mark_round_limit =
                         mark_one_batch_per_worker
                             ? size_t{64} * mark_workers
@@ -542,13 +603,15 @@ inline void ConcurrentArrayCache::evacuate_work() {
                             : 0;
                     std::atomic_size_t mark_region_budget{mark_round_limit};
                     const bool resume_scan =
-                        mark_round_limit != 0 &&
+                        exclusive_alignment ||
+                        (mark_round_limit != 0 &&
                         !::FarLib::get_config().exclusive_cache &&
                         legacy_scan_cursors_enabled() &&
                         inclusive_legacy_eligibility_enabled() &&
                         inclusive_legacy_cursors_enabled() &&
-                        inclusive_resume_scan_enabled();
+                        inclusive_resume_scan_enabled());
                     const size_t scan_visit_limit =
+                        exclusive_alignment ? 4096 :
                         resume_scan ? inclusive_scan_visit_limit() : 0;
                     std::atomic_size_t evict_visit_budget{scan_visit_limit};
                     std::atomic_size_t gc_visit_budget{scan_visit_limit};
@@ -577,9 +640,10 @@ inline void ConcurrentArrayCache::evacuate_work() {
                         &posted_wrs_total, nullptr, nullptr};
                     evict_args.resume_scan = resume_scan ? &scan_round : nullptr;
                     const bool stop_evict_after_mark =
-                        !::FarLib::get_config().exclusive_cache &&
+                        exclusive_alignment ||
+                        (!::FarLib::get_config().exclusive_cache &&
                         inclusive_legacy_eligibility_enabled() &&
-                        inclusive_mark_stop_evict_enabled();
+                        inclusive_mark_stop_evict_enabled());
                     if (stop_evict_after_mark) {
                         mark_args.evict_stop_after_mark =
                             &evict_stop_after_mark;
@@ -623,6 +687,22 @@ inline void ConcurrentArrayCache::evacuate_work() {
                     log_cache_progress("tail_join_evict_begin", kAnyAllocBin, timestamp);
                     uthread::join(std::move(evict_master));
                     log_cache_progress("tail_join_evict_end", kAnyAllocBin, timestamp);
+                    if (exclusive_alignment) {
+                        const size_t remaining = mark_region_budget.load(std::memory_order_relaxed);
+                        const size_t visits_left = evict_visit_budget.load(std::memory_order_relaxed);
+                        if (remaining > mark_round_limit || visits_left > scan_visit_limit)
+                            ERROR("exclusive alignment budget did not close");
+                        const size_t consumed = mark_round_limit - remaining;
+                        ++alignment_rounds;
+                        alignment_mark_regions += consumed;
+                        alignment_mark_max = std::max<uint64_t>(alignment_mark_max, consumed);
+                        if (alignment_round_in_work) {
+                            ++alignment_work_rounds;
+                            alignment_work_mark_regions += consumed;
+                            alignment_work_scan_visits += scan_visit_limit - visits_left;
+                            alignment_work_scan_complete += evict_pass_complete.load(std::memory_order_relaxed);
+                        }
+                    }
                     if (resume_scan) {
                         const bool evict_complete = evict_pass_complete.load(
                             std::memory_order_relaxed);
@@ -803,15 +883,18 @@ inline void ConcurrentArrayCache::evacuate_work() {
                              frequency_mark_pass, ready_mark_limit,
                              &overlap_ready_budget, &worker_deferred,
                              &safe_evict_elapsed_max,
-                             &mark_elapsed_max,
-                             &update_max](size_t worker_id) {
-                                if (!pipeline_ready_tasks.empty()) {
-                                    auto evict_worker_start = get_cycles();
-                                    evict_ready_worker_logic(
-                                        pipeline_ready_tasks, next_task_idx,
-                                        pipeline_safe_mark_timestamp,
-                                        worker_deferred[worker_id],
-                                        posted_wrs_total);
+                              &mark_elapsed_max,
+                              &update_max](size_t worker_id) {
+                                 if (!pipeline_ready_tasks.empty()) {
+                                     auto evict_worker_start = get_cycles();
+                                     auto *reusable_buffers =
+                                         persistent_evict_buffers(worker_id);
+                                     evict_ready_worker_logic(
+                                         pipeline_ready_tasks, next_task_idx,
+                                         pipeline_safe_mark_timestamp,
+                                         worker_deferred[worker_id],
+                                         posted_wrs_total, nullptr,
+                                         reusable_buffers);
                                     update_max(
                                         safe_evict_elapsed_max,
                                         (int64_t)(get_cycles() -
@@ -895,15 +978,18 @@ inline void ConcurrentArrayCache::evacuate_work() {
                         std::function<void(size_t)> fn_future_evict =
                             [this, &mark_ready_tasks, &future_next_task_idx,
                              pipeline_safe_mark_timestamp,
-                             &future_worker_deferred, &posted_wrs_total,
-                             &future_evict_elapsed_max,
-                             &update_max](size_t worker_id) {
-                                auto evict_worker_start = get_cycles();
-                                evict_ready_worker_logic(
-                                    mark_ready_tasks, future_next_task_idx,
-                                    pipeline_safe_mark_timestamp,
-                                    future_worker_deferred[worker_id],
-                                    posted_wrs_total);
+                              &future_worker_deferred, &posted_wrs_total,
+                              &future_evict_elapsed_max,
+                              &update_max](size_t worker_id) {
+                                 auto evict_worker_start = get_cycles();
+                                 auto *reusable_buffers =
+                                     persistent_evict_buffers(worker_id);
+                                 evict_ready_worker_logic(
+                                     mark_ready_tasks, future_next_task_idx,
+                                     pipeline_safe_mark_timestamp,
+                                     future_worker_deferred[worker_id],
+                                     posted_wrs_total, nullptr,
+                                     reusable_buffers);
                                 update_max(
                                     future_evict_elapsed_max,
                                     (int64_t)(get_cycles() -
@@ -1192,10 +1278,11 @@ inline void ConcurrentArrayCache::mark_phase(
                                               ready_task_budget, legacy_cursors,
                                               eligibility, mark_diag_ptr,
                                               legacy_cursors &&
-                                                      eligibility ==
+                                                      (exclusive_work_alignment_enabled() ||
+                                                       eligibility ==
                                                           ::FarLib::allocator::
                                                               EvacuationEligibility::
-                                                                  LegacyConcurrent
+                                                                  LegacyConcurrent)
                                                   ? legacy_region_budget
                                                   : nullptr,
                                               mark_stop_after_evict == nullptr
@@ -1252,6 +1339,7 @@ inline void ConcurrentArrayCache::mark_phase(
     }
 inline void ConcurrentArrayCache::evict_post_phase(uint32_t timestamp) {
         EvictThreadWorkGuard guard;
+        EcWorkerActivityGuard ec_worker_guard(this);
         auto phase_start = get_cycles();
         auto &tlpd = profile::get_tlpd();
         int64_t posted_start = tlpd.rdma_write_post_count;
@@ -1282,6 +1370,15 @@ inline void ConcurrentArrayCache::evict_post_phase(uint32_t timestamp) {
 
         auto flush_start = get_cycles();
         buffer_set.flush_all(client_idx, this);
+        // A logical eviction invocation must not return with a partial RMW
+        // batch still owning EVICTING/source-borrowed objects.  Drain the
+        // invocation's owner, then flush any fresh-group fallbacks generated
+        // by a failed READ-phase update.
+        if (::FarLib::get_config().ft_incremental_one_sided &&
+            ec_rmw_workers_ && buffer_set.direct_builder) {
+            drain_ec_rmw_worker(buffer_set, client_idx);
+            flush_ec_direct_groups(buffer_set, client_idx);
+        }
         profile::get_tlpd().evac_flush_cycles += (int64_t)(get_cycles() - flush_start);
         auto elapsed = (int64_t)(get_cycles() - phase_start);
         int64_t posted_wrs = tlpd.rdma_write_post_count - posted_start;
@@ -1301,11 +1398,57 @@ inline void ConcurrentArrayCache::evict_post_worker_logic(
     bool ignore_safe_epoch, size_t diag_worker_slot,
     ::FarLib::allocator::EvacuationEligibility eligibility,
     StreamingEvictMasterArgs::ResumeScanRound *resume_scan,
-    std::atomic_bool *evict_stop_after_mark) {
+    std::atomic_bool *evict_stop_after_mark,
+    profile::evict_breakdown::Worker *breakdown) {
+        EcWorkerActivityGuard ec_worker_guard(this);
         if (ignore_safe_epoch && exclusive_owned_batch_reclaim_enabled()) {
             std::vector<::FarLib::allocator::EvictTask> collected_tasks;
+            // One logical worker owns the same queues across all of its region
+            // batches. Each batch still seals/posts its tail before reclaim.
+            EvictBufferSet local_buffers;
+            size_t persistent_owner = diag_worker_slot;
+            if (persistent_owner != inclusive_reclaim_diag::kNoWorker &&
+                persistent_owner >= evacuate_thread_cnt) {
+                // diag_worker_slot remains mark_workers + worker_id for
+                // diagnostics.  ready_full_workers can use all evacuation
+                // workers for posting, so fold that contiguous owner range
+                // back into the persistent bank's [0, evacuate_thread_cnt)
+                // namespace without aliasing two workers in one fork_join.
+                persistent_owner %= evacuate_thread_cnt;
+            }
+            EvictBufferSet *reusable_buffers_ptr =
+                diag_worker_slot == inclusive_reclaim_diag::kNoWorker
+                    ? nullptr
+                    : persistent_evict_buffers(persistent_owner);
+            EvictBufferSet &reusable_buffers =
+                reusable_buffers_ptr != nullptr ? *reusable_buffers_ptr
+                                                : local_buffers;
+            reusable_buffers.breakdown = breakdown;
+            if (reusable_buffers.server_count == 0) {
+                reusable_buffers.init(::FarLib::get_config().server_count);
+            }
+            if (reusable_buffers.ec_builder != nullptr) {
+                reusable_buffers.ec_builder->set_breakdown(breakdown);
+            }
+            if (reusable_buffers.direct_builder != nullptr) {
+                reusable_buffers.direct_builder->set_breakdown(breakdown);
+            }
             constexpr size_t batch_limit = 64;
             while (true) {
+                // A stop request prevents the NEXT owned batch only. The
+                // previous batch has sealed/flushed all partial EC groups,
+                // polled completions, completed its existing local GC and
+                // requeued deferred tasks. In-flight DMA lifetime remains
+                // governed by the persistent bank/source-borrow mechanism.
+                if (evict_stop_after_mark != nullptr &&
+                    evict_stop_after_mark->load(std::memory_order_acquire)) {
+                    log_cache_progress("exclusive_evict_scan_stop", kAnyAllocBin, timestamp);
+                    break;
+                }
+                std::vector<::FarLib::allocator::EvictTask> owned_tasks;
+                {
+                profile::evict_breakdown::Scope collect_scope(
+                    breakdown, profile::evict_breakdown::Stage::CollectAdopt);
                 collected_tasks.clear();
                 // Keep the current collector eligibility and cursor policy.
                 ::FarLib::allocator::global_heap.collect_evict_tasks(
@@ -1316,7 +1459,6 @@ inline void ConcurrentArrayCache::evict_post_worker_logic(
                     resume_scan == nullptr ? nullptr : resume_scan->evict_pass_complete);
                 if (collected_tasks.empty()) break;
 
-                std::vector<::FarLib::allocator::EvictTask> owned_tasks;
                 owned_tasks.reserve(collected_tasks.size());
                 for (auto &task : collected_tasks) {
                     if (!::FarLib::allocator::global_heap
@@ -1326,6 +1468,7 @@ inline void ConcurrentArrayCache::evict_post_worker_logic(
                     }
                     owned_tasks.push_back(std::move(task));
                 }
+                }
                 if (owned_tasks.empty()) continue;
 
                 std::atomic_size_t next_task_idx{0};
@@ -1334,7 +1477,10 @@ inline void ConcurrentArrayCache::evict_post_worker_logic(
                 // not an all-WR barrier: the ready worker only frees FREE
                 // slots, and retains tasks with remaining marked work.
                 evict_ready_worker_logic(owned_tasks, next_task_idx, 0,
-                                         deferred_tasks, posted_wrs_total);
+                                         deferred_tasks, posted_wrs_total, breakdown,
+                                         &reusable_buffers);
+                profile::evict_breakdown::Scope requeue_scope(
+                    breakdown, profile::evict_breakdown::Stage::CollectAdopt);
                 for (auto &task : deferred_tasks) {
                     ::FarLib::allocator::global_heap.requeue_evict_task(task);
                 }
@@ -1347,8 +1493,28 @@ inline void ConcurrentArrayCache::evict_post_worker_logic(
         EvictThreadWorkGuard guard;
         auto &tlpd = profile::get_tlpd();
         const int64_t posted_start = tlpd.rdma_write_post_count;
-        EvictBufferSet buffer_set;
-        buffer_set.init(::FarLib::get_config().server_count);
+        EvictBufferSet local_buffers;
+        size_t persistent_owner = diag_worker_slot;
+        if (persistent_owner != inclusive_reclaim_diag::kNoWorker &&
+            persistent_owner >= evacuate_thread_cnt) {
+            persistent_owner %= evacuate_thread_cnt;
+        }
+        EvictBufferSet *reusable_buffers =
+            diag_worker_slot == inclusive_reclaim_diag::kNoWorker
+                ? nullptr
+                : persistent_evict_buffers(persistent_owner);
+        EvictBufferSet &buffer_set =
+            reusable_buffers != nullptr ? *reusable_buffers : local_buffers;
+        buffer_set.breakdown = breakdown;
+        if (buffer_set.server_count == 0) {
+            buffer_set.init(::FarLib::get_config().server_count);
+        }
+        if (buffer_set.ec_builder != nullptr) {
+            buffer_set.ec_builder->set_breakdown(breakdown);
+        }
+        if (buffer_set.direct_builder != nullptr) {
+            buffer_set.direct_builder->set_breakdown(breakdown);
+        }
 
         const bool epoch_release_enabled =
             ::FarLib::get_config().optimized_evacuator && !ignore_safe_epoch;
@@ -1454,6 +1620,11 @@ inline void ConcurrentArrayCache::evict_post_worker_logic(
                 auto client_idx = rdma::thread_info.thread_id;
                 auto flush_start = get_cycles();
                 buffer_set.flush_all(client_idx, this);
+                if (::FarLib::get_config().ft_incremental_one_sided &&
+                    ec_rmw_workers_ && buffer_set.direct_builder) {
+                    drain_ec_rmw_worker(buffer_set, client_idx);
+                    flush_ec_direct_groups(buffer_set, client_idx);
+                }
                 profile::get_tlpd().evac_flush_cycles +=
                     (int64_t)(get_cycles() - flush_start);
             }
@@ -1495,17 +1666,31 @@ inline void ConcurrentArrayCache::evict_ready_worker_logic(
     const std::vector<::FarLib::allocator::EvictTask> &ready_tasks,
     std::atomic_size_t &next_task_idx, uint32_t current_safe_epoch,
     std::vector<::FarLib::allocator::EvictTask> &deferred_tasks,
-    std::atomic_int64_t &posted_wrs_total) {
+    std::atomic_int64_t &posted_wrs_total,
+    profile::evict_breakdown::Worker *breakdown,
+    EvictBufferSet *reusable_buffers) {
+        EcWorkerActivityGuard ec_worker_guard(this);
         std::vector<::FarLib::allocator::EvictTask> processed_tasks;
         processed_tasks.reserve(ready_tasks.size());
 
         {
             EvictThreadWorkGuard guard;
+            profile::evict_breakdown::Scope scan_scope(
+                breakdown, profile::evict_breakdown::Stage::ObjectScan);
             auto post_start = get_cycles();
             auto &tlpd = profile::get_tlpd();
             const int64_t posted_start = tlpd.rdma_write_post_count;
-            EvictBufferSet buffer_set;
-            buffer_set.init(::FarLib::get_config().server_count);
+            EvictBufferSet local_buffers;
+            EvictBufferSet &buffer_set = reusable_buffers ? *reusable_buffers : local_buffers;
+            buffer_set.breakdown = breakdown;
+            if (buffer_set.server_count == 0)
+                buffer_set.init(::FarLib::get_config().server_count);
+            if (buffer_set.ec_builder != nullptr) {
+                buffer_set.ec_builder->set_breakdown(breakdown);
+            }
+            if (buffer_set.direct_builder != nullptr) {
+                buffer_set.direct_builder->set_breakdown(breakdown);
+            }
 
             while (true) {
                 size_t task_idx =
@@ -1558,6 +1743,11 @@ inline void ConcurrentArrayCache::evict_ready_worker_logic(
                 auto client_idx = rdma::thread_info.thread_id;
                 auto flush_start = get_cycles();
                 buffer_set.flush_all(client_idx, this);
+                if (::FarLib::get_config().ft_incremental_one_sided &&
+                    ec_rmw_workers_ && buffer_set.direct_builder) {
+                    drain_ec_rmw_worker(buffer_set, client_idx);
+                    flush_ec_direct_groups(buffer_set, client_idx);
+                }
                 profile::get_tlpd().evac_flush_cycles +=
                     (int64_t)(get_cycles() - flush_start);
             }
@@ -1567,7 +1757,14 @@ inline void ConcurrentArrayCache::evict_ready_worker_logic(
                 (int64_t)(get_cycles() - post_start);
         }
 
-        evict_drain_phase();
+        {
+            profile::evict_breakdown::Scope poll_scope(
+                breakdown, profile::evict_breakdown::Stage::CqProcess);
+            evict_drain_phase();
+        }
+
+        profile::evict_breakdown::Scope gc_scope(
+            breakdown, profile::evict_breakdown::Stage::GcPublish);
 
         auto gc = [this](::FarLib::allocator::BlockHead *b) {
             retry:

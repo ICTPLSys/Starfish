@@ -29,6 +29,7 @@
 
 #include "design2/behavior_group_refinement.hpp"
 #include "design2/object_group_trace.hpp"
+#include "design2/behavior_group_runtime.hpp"
 
 namespace FarLib::allocator::six_group {
 
@@ -69,6 +70,7 @@ inline constexpr std::size_t kChildCount = 6;
 // size/placement parent, without enabling the old fixed-six policy metadata.
 // Regions are assigned round-robin by the parent list itself.
 inline bool grouped() noexcept {
+    if (::FarLib::behavior_group_runtime::enabled()) return false;
     static const bool value = [] {
 #if defined(_WIN32)
         char *raw = nullptr;
@@ -89,6 +91,7 @@ inline bool grouped() noexcept {
 }
 
 inline bool enabled() noexcept {
+    if (::FarLib::behavior_group_runtime::enabled()) return true;
     static const bool value = [] {
 #if defined(_WIN32)
         char *raw = nullptr;

@@ -1,0 +1,23 @@
+foreach(test_name IN ITEMS page_layout page_handles configuration page_codec write_ring write_banks split_buffer_cookie diagnostic_counter page_write write_batch)
+    add_executable(test_hydra_${test_name} ${test_name}.cpp)
+    target_compile_options(test_hydra_${test_name} PRIVATE -UNDEBUG)
+    target_link_libraries(test_hydra_${test_name} PRIVATE Threads::Threads hydra_isal)
+    add_test(NAME hydra_${test_name} COMMAND test_hydra_${test_name})
+    set_tests_properties(hydra_${test_name} PROPERTIES TIMEOUT 60)
+endforeach()
+target_link_options(test_hydra_page_codec PRIVATE -Wl,--wrap=ec_init_tables)
+
+if(FARLIB_BUILD_DIAGNOSTICS)
+add_executable(test_hydra_page_rdma page_rdma.cpp)
+target_compile_options(test_hydra_page_rdma PRIVATE -UNDEBUG)
+target_link_libraries(test_hydra_page_rdma PRIVATE ${COMMON_LIBS})
+
+# Run separately on an idle compute host; this is not RDMA bandwidth.
+add_executable(bench_hydra_page_codec page_codec_bench.cpp)
+target_link_libraries(bench_hydra_page_codec PRIVATE Threads::Threads hydra_isal)
+add_executable(bench_hydra_page_token page_token_bench.cpp)
+target_link_libraries(bench_hydra_page_token PRIVATE Threads::Threads hydra_isal)
+add_executable(bench_hydra_page_stream page_stream_bench.cpp)
+target_compile_options(bench_hydra_page_stream PRIVATE -UNDEBUG)
+target_link_libraries(bench_hydra_page_stream PRIVATE ${COMMON_LIBS})
+endif()

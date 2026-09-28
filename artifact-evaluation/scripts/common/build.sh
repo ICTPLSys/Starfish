@@ -8,9 +8,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SYSTEM="${STARFISH_SYSTEM:-nonft}"
 RUNTIME_DIR=""
 BUILD_DIR=""
-JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
+JOBS="${JOBS:-4}"
 DRY_RUN=0
 ENABLE_PAPI=0
+BUILD_TESTS=OFF
 TARGETS=(server run_chat_far gapbs_bfs_chunked)
 
 usage() {
@@ -21,9 +22,10 @@ Options:
   --system NAME       runtime variant (default: nonft)
   --runtime-dir DIR   explicit runtime source directory
   --build-dir DIR     explicit CMake build directory
-  --jobs N             parallel build jobs
-  --targets LIST      comma-separated CMake target names
+  --jobs N             parallel build jobs (default: 4)
+  --targets LIST      comma-separated targets (also supports mg,wordcount_far,kvs_throughput,nhop_graph,object_size)
   --enable-papi       opt in to hardware event profiling (off by default)
+  --with-tests        build the Starfish Design 2 CPU and external-RDMA tests
   --dry-run            print commands without configuring or building
 
 By default, runtime source is selected from artifact-evaluation/runtime/<name>.
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --jobs) JOBS=$2; shift 2 ;;
     --targets) IFS=',' read -r -a TARGETS <<< "$2"; shift 2 ;;
     --enable-papi) ENABLE_PAPI=1; shift ;;
+    --with-tests) BUILD_TESTS=ON; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -48,6 +51,14 @@ case "$SYSTEM" in
   nonft|starfish|carbink|hydra) ;;
   *) echo "unsupported system: $SYSTEM" >&2; exit 2 ;;
 esac
+
+if [[ "$BUILD_TESTS" = ON ]]; then
+  [[ "$SYSTEM" = starfish ]] || {
+    echo '--with-tests currently requires --system starfish' >&2; exit 2;
+  }
+  TARGETS+=(test_simple_resident_budget test_simple_resident_allocator
+    test_simple_resident_transitions test_simple_resident_integration)
+fi
 
 if [[ -z "$RUNTIME_DIR" ]]; then
   RUNTIME_DIR="$ROOT/runtime/$SYSTEM"
@@ -63,7 +74,13 @@ RUNTIME_DIR=$(cd "$RUNTIME_DIR" 2>/dev/null && pwd || true)
 if [[ -z "$BUILD_DIR" ]]; then
   BUILD_DIR="$ROOT/build/$SYSTEM"
 fi
-BUILD_DIR=$(mkdir -p "$BUILD_DIR" && cd "$BUILD_DIR" && pwd)
+if [[ "$DRY_RUN" = 1 ]]; then
+  # A dry run must not create a build tree. Keep an explicit relative path
+  # relative to the caller; CMake will resolve it if the command is executed.
+  BUILD_DIR="$BUILD_DIR"
+else
+  BUILD_DIR=$(mkdir -p "$BUILD_DIR" && cd "$BUILD_DIR" && pwd)
+fi
 
 # setup_environment.sh installs these in ignored deps/. Explicit environment
 # values take precedence over the bundled dependency paths.
@@ -114,15 +131,30 @@ if [[ "$ENABLE_PAPI" = 1 ]]; then
 else
   PAPI_OPTIONS=(-DPAPI_INCLUDE_DIR:PATH=OFF -DPAPI_LIBRARY:FILEPATH=OFF)
 fi
-APP_OPTIONS=()
+APP_OPTIONS=(-DFARLIB_BUILD_MG=OFF -DFARLIB_BUILD_WORDCOUNT=OFF
+  -DFARLIB_BUILD_WORDCOUNT_RECOVERY=OFF -DFARLIB_BUILD_KVS=OFF
+  -DFARLIB_BUILD_NQ=OFF -DFARLIB_BUILD_OBJECT_SIZE=OFF)
+if [[ "$SYSTEM" = hydra ]]; then
+  if [[ "$ENABLE_PAPI" = 1 ]]; then
+    APP_OPTIONS+=(-DFARLIB_ENABLE_PAPI=ON)
+  else
+    APP_OPTIONS+=(-DFARLIB_ENABLE_PAPI=OFF)
+  fi
+fi
 for target in "${TARGETS[@]}"; do
   case "$target" in
-    mg|test_mg_iterator_boundaries) APP_OPTIONS=(-DFARLIB_BUILD_MG=ON); break ;;
+    mg|test_mg_iterator_boundaries) APP_OPTIONS+=(-DFARLIB_BUILD_MG=ON) ;;
+    kvs_throughput) APP_OPTIONS+=(-DFARLIB_BUILD_KVS=ON) ;;
+    nhop_graph) APP_OPTIONS+=(-DFARLIB_BUILD_NQ=ON) ;;
+    object_size|object_size_512) APP_OPTIONS+=(-DFARLIB_BUILD_OBJECT_SIZE=ON) ;;
+    wordcount_far|wordcount_native|word_length_stats)
+      APP_OPTIONS+=(-DFARLIB_BUILD_WORDCOUNT=ON) ;;
+    wordcount_recovery)
+      APP_OPTIONS+=(-DFARLIB_BUILD_WORDCOUNT=ON -DFARLIB_BUILD_WORDCOUNT_RECOVERY=ON) ;;
   esac
 done
-
 configure=(cmake -S "$RUNTIME_DIR" -B "$BUILD_DIR" "${GENERATOR[@]}"
-  -DCMAKE_BUILD_TYPE=Release -DFARLIB_BUILD_TESTS=OFF
+  -DCMAKE_BUILD_TYPE=Release -DFARLIB_BUILD_TESTS="$BUILD_TESTS"
   "${PAPI_OPTIONS[@]}" "${HDR_OPTIONS[@]}" "${APP_OPTIONS[@]}")
 build=(cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j "$JOBS")
 

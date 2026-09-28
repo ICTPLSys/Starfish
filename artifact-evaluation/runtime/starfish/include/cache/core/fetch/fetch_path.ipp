@@ -50,7 +50,8 @@ retry:
         signal::disable_signal();
         auto allocation = this->allocate_local(
             obj.size, obj, scope, placement.requested_placement,
-            placement.allocation_group_id, current_behavior_group(entry));
+            placement.allocation_group_id,
+            local_behavior_group(entry, placement.requested_placement));
         void* local_ptr = allocation.get();
         new_state.state = FETCHING;
         if (!entry.cas_state_weak(old_state, new_state)) {
@@ -128,6 +129,12 @@ template <bool Mut, bool Profile>
 inline bool ConcurrentArrayCache::post_fetch_lite_slow_path(
     FarObjectEntry &entry, far_obj_t obj, DereferenceScope &scope,
     bool sync_batch_eligible) {
+    if constexpr (Mut) {
+        // Reject before invalidating retained backups or dirtying the state.
+        // Flag-only recomputable annotations remain writable; only a bound
+        // immutable recipe is protected.
+        guard_recompute_mutation(entry);
+    }
     auto old_state = entry.load_state(std::memory_order::relaxed);
 retry:
     if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
@@ -138,6 +145,23 @@ retry:
         goto retry;
     }
     if constexpr (Mut) {
+        if (::FarLib::get_config().is_ec_batch_mode() &&
+            (old_state.state == LOCAL || old_state.state == MARKED || old_state.state == EVICTING) &&
+            entry.local_addr() != nullptr &&
+            ::FarLib::allocator::ec_write_source_borrowed(
+                static_cast<::FarLib::allocator::BlockHead *>(entry.local_addr()) - 1)) {
+            // Rescue as clean LOCAL before waiting, so completion keeps this
+            // local copy. Only after every shard WRITE may it become writable.
+            if (old_state.state == EVICTING) {
+                auto rescued = old_state;
+                rescued.state = LOCAL;
+                rescued.inc_hotness();
+                if (!entry.cas_state_weak(old_state, rescued)) goto retry;
+            }
+            wait_ec_write_source(entry);
+            old_state = entry.load_state(std::memory_order_acquire);
+            goto retry;
+        }
         if (invalidate_retained_backup_for_write(entry, obj.size)) {
             old_state = entry.load_state(std::memory_order::relaxed);
         }
@@ -206,7 +230,8 @@ retry:
         signal::disable_signal();
         auto allocation = this->allocate_local(
             obj.size, obj, scope, placement.requested_placement,
-            placement.allocation_group_id, current_behavior_group(entry));
+            placement.allocation_group_id,
+            local_behavior_group(entry, placement.requested_placement));
         void* local_ptr = allocation.get();
         new_state.state = FETCHING;
         if (!entry.cas_state_weak(old_state, new_state)) {
@@ -289,37 +314,44 @@ inline bool ConcurrentArrayCache::check_fetch(FarObjectEntry *entry,
     return false;
 }
 
-inline void ConcurrentArrayCache::fetch_wait_until_local(
-    FarObjectEntry *entry, far_obj_t obj, size_t qp_idx, size_t client_idx,
+inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
+    FarObjectEntry *entry, void *wait_local_addr, size_t qp_idx, size_t client_idx,
     size_t endpoint_idx) {
+    // Keep the allocator block as the wait identity.  Accessor moves transfer
+    // FETCHING and the recipe binding to a new FarObjectEntry, while the
+    // original waiter's entry pointer becomes FREE; resolving this metadata
+    // on every round prevents a waiter from spinning on that stale pointer.
+    // Capture the local address before calling the miss handler: the handler
+    // may itself move the accessor and clear the old entry's address.
+    auto *wait_block = wait_local_addr != nullptr
+        ? static_cast<::FarLib::allocator::BlockHead *>(wait_local_addr) - 1
+        : nullptr;
+    auto resolve_wait_entry = [&]() -> FarObjectEntry * {
+        if (wait_block == nullptr) return entry;
+        const auto current_obj = wait_block->obj_meta_data.load(
+            std::memory_order_acquire);
+        return current_obj.is_null() ? entry : &get_entry_of(current_obj);
+    };
     auto *diag_fibre = fibre_self();
     scope_diag::set_pending(
         diag_fibre, reinterpret_cast<uintptr_t>(entry));
     {
         scope_diag::Guard diag_guard(diag_fibre, scope_diag::RDMA_WAIT);
-        const bool ec_wait = ::FarLib::get_config().is_ec_batch_mode();
-        const auto ec_wait_started = ec_wait
-            ? std::chrono::steady_clock::now()
-            : std::chrono::steady_clock::time_point{};
-        uint64_t ec_wait_rounds = 0;
-        while (!entry->is_local()) {
-            // An unavailable recovery is not a completed read. Keep helping
-            // all data queues (including requests posted before a failed
-            // recovery attempt), but never turn an irrecoverable fetch into
-            // an unbounded busy loop or return unverified local bytes.
-            if (ec_wait && (++ec_wait_rounds & 1023u) == 0) {
-                (void)ec_batch_poll_all_cqs_once();
-                if (entry->is_local()) break;
-                if (std::chrono::steady_clock::now() - ec_wait_started >=
-                    std::chrono::seconds(30)) {
-                    ec_read_recovery_diag_report("fetch_wait_timeout");
-                    ERROR("ec_batch: fetch did not complete within 30 seconds");
-                }
-                uthread::yield();
+        while (true) {
+            entry = resolve_wait_entry();
+            if (entry->is_local()) break;
+            client_idx = entry->get_client_idx();
+            if (auto *current_client = rdma::get_client(client_idx)) {
+                qp_idx = current_client->get_qp_idx();
+            }
+            const auto current_remote = entry->remote_addr();
+            if (current_remote != FarObjectEntry::RemoteAddrInvalid48) {
+                endpoint_idx = ::FarLib::get_config().map_remote_addr(
+                    current_remote).first;
             }
             // While the endpoint of this object's own segment is gone, the
             // degraded read of its slot group is what completes the fetch; the
-            // assist reaps the CQEs of every endpoint itself (the five reads of
+            // assist reaps the CQEs of every endpoint itself (the four reads of
             // the group do not arrive on the dead one).
             if (ec_recovery_assist_wait(entry, qp_idx, client_idx)) {
                 continue;
@@ -328,13 +360,8 @@ inline void ConcurrentArrayCache::fetch_wait_until_local(
                                                   endpoint_idx);
         }
     }
-    if (auto *diag_slot = scope_diag::current(diag_fibre)) {
-        request_interval_diag::requester_resumed(
-            scope_diag::index(diag_slot),
-            reinterpret_cast<uint64_t>(diag_fibre),
-            reinterpret_cast<uint64_t>(entry));
-    }
     scope_diag::clear_pending(diag_fibre);
+    return entry;
 }
 
 inline void *ConcurrentArrayCache::fetch_with_miss_handler(
@@ -345,13 +372,15 @@ inline void *ConcurrentArrayCache::fetch_with_miss_handler(
     if (!at_local) [[unlikely]] {
         fetch_ddl_t ddl = create_fetch_ddl();
         profile::resume_work(work_suspended);
-        handler(entry, ddl);
+        void *wait_local_addr = entry->local_addr();
         auto client_idx = entry->get_client_idx();
         auto *client = rdma::get_client(client_idx);
         size_t qp_idx = client->get_qp_idx();
         auto [endpoint_idx, _offset] =
             ::FarLib::get_config().map_remote_addr(entry->remote_addr());
-        fetch_wait_until_local(entry, obj, qp_idx, client_idx, endpoint_idx);
+        handler(entry, ddl);
+        entry = fetch_wait_until_local(entry, wait_local_addr, qp_idx, client_idx,
+                                      endpoint_idx);
     }
     profile::resume_work(work_suspended);
     void *local_ptr = entry->local_addr();
@@ -395,14 +424,16 @@ inline void *ConcurrentArrayCache::fetch_lite_no_profile(
 
     if (!at_local) [[unlikely]] {
         fetch_ddl_t ddl = create_fetch_ddl();
-        handler(entry, ddl);
+        void *wait_local_addr = entry->local_addr();
         auto client_idx = entry->get_client_idx();
         auto *client = rdma::get_client(client_idx);
         size_t qp_idx = client->get_qp_idx();
         auto [endpoint_idx, _offset] =
             ::FarLib::get_config().map_remote_addr(entry->remote_addr());
 
-        fetch_wait_until_local(entry, obj, qp_idx, client_idx, endpoint_idx);
+        handler(entry, ddl);
+        entry = fetch_wait_until_local(entry, wait_local_addr, qp_idx, client_idx,
+                                      endpoint_idx);
     }
 
     profile::resume_work(work_suspended);
@@ -421,14 +452,16 @@ inline void *ConcurrentArrayCache::fetch_lite_slow_path(
 
     if (!at_local) [[unlikely]] {
         fetch_ddl_t ddl = create_fetch_ddl();
-        handler(entry, ddl);
+        void *wait_local_addr = entry->local_addr();
         auto client_idx = entry->get_client_idx();
         auto *client = rdma::get_client(client_idx);
         size_t qp_idx = client->get_qp_idx();
         auto [endpoint_idx, _offset] =
             ::FarLib::get_config().map_remote_addr(entry->remote_addr());
 
-        fetch_wait_until_local(entry, obj, qp_idx, client_idx, endpoint_idx);
+        handler(entry, ddl);
+        entry = fetch_wait_until_local(entry, wait_local_addr, qp_idx, client_idx,
+                                      endpoint_idx);
     }
 
     profile::resume_work(work_suspended);

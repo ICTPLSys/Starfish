@@ -8,3 +8,13 @@ if(DEFINED FARLIB_BFS_OUTPUT_DIR)
                           PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                      "${FARLIB_BFS_OUTPUT_DIR}")
 endif()
+
+if(FARLIB_BUILD_TESTS)
+    add_executable(graph_loader_affinity_test tests/graph_loader_affinity.cpp)
+    target_include_directories(graph_loader_affinity_test PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_options(graph_loader_affinity_test PRIVATE -UNDEBUG)
+    target_link_libraries(graph_loader_affinity_test PRIVATE Threads::Threads)
+    add_test(NAME bfs_graph_loader_affinity COMMAND graph_loader_affinity_test)
+    set_tests_properties(bfs_graph_loader_affinity PROPERTIES TIMEOUT 90)
+endif()

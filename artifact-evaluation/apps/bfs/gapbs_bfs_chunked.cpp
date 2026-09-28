@@ -339,10 +339,11 @@ std::string env_string(const char *name, const std::string &default_value = "") 
 }
 
 void read_graph(const std::string &filename, Graph &graph,
-                uint64_t &num_vertices) {
+                uint64_t &num_vertices,
+                const GraphLoadAffinity &loader_affinity) {
     std::vector<std::vector<uint64_t>> adj_list;
     uint64_t start_tsc = __rdtsc();
-    ASSERT(readGraph_parallel(filename, adj_list, num_vertices));
+    ASSERT(readGraph_parallel(filename, adj_list, num_vertices, loader_affinity));
     uint64_t end_tsc = __rdtsc();
     std::cout << "readGraph_parallel time: " << end_tsc - start_tsc
               << " cycles" << std::endl;
@@ -423,10 +424,11 @@ void build_grid3d_graph(Graph &graph, uint64_t &num_vertices) {
 }
 
 void load_or_generate_graph(const std::string &filename, Graph &graph,
-                            uint64_t &num_vertices) {
+                            uint64_t &num_vertices,
+                            const GraphLoadAffinity &loader_affinity) {
     std::string generator = env_string("GAPBS_GRAPH_GENERATOR");
     if (generator.empty() || generator == "file") {
-        read_graph(filename, graph, num_vertices);
+        read_graph(filename, graph, num_vertices, loader_affinity);
         return;
     }
     if (generator == "grid3d") {
@@ -869,6 +871,9 @@ int main(int argc, char *argv[]) {
     std::string config_path = argv[1];
     std::string graph_path = argv[2];
 
+    // Preserve taskset/cgroup restrictions before runtime_init narrows each
+    // fibre worker to one CPU. Only native read/fill threads use this snapshot.
+    const GraphLoadAffinity loader_affinity;
     FarLib::rdma::Configure config;
     config.from_file(config_path.c_str());
     runtime_init(config);
@@ -881,7 +886,7 @@ int main(int argc, char *argv[]) {
     uint64_t num_vertices = 0;
     auto phase_before = collect_phase_stats();
     auto phase_start = std::chrono::steady_clock::now();
-    load_or_generate_graph(graph_path, graph, num_vertices);
+    load_or_generate_graph(graph_path, graph, num_vertices, loader_affinity);
     auto phase_stop = std::chrono::steady_clock::now();
     print_phase_stats(
         "load_build",

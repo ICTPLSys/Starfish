@@ -2,10 +2,13 @@
 
 #include "cache/cache.hpp"
 #include "rdma/config.hpp"
+#include "design2/behavior_group_runtime.hpp"
 #include "utils/fork_join.hpp"
 #include "utils/uthreads.hpp"
 
 #include <vector>
+#include <cstdlib>
+#include <cstring>
 
 #ifndef NO_REMOTE
 
@@ -34,6 +37,21 @@ void runtime_init(const rdma::Configure &config, bool enable_cache) {
     mode = 0;
     global_config = config;
     global_config.self_check();
+    // Keep EC size-class geometry independent from the optional Design2
+    // placement policy. This switch is read once, before any worker starts.
+    bool behavior_routing = global_config.behavior_group;
+    const char *routing = std::getenv("FARLIB_EC_BEHAVIOR_ROUTING");
+    if (routing != nullptr) {
+        if (std::strcmp(routing, "0") != 0 &&
+            std::strcmp(routing, "1") != 0) {
+            ERROR("FARLIB_EC_BEHAVIOR_ROUTING must be 0 or 1");
+        }
+        if (routing[0] == '0') behavior_routing = false;
+    }
+    behavior_group_runtime::configure(behavior_routing);
+    std::cout << "runtime.behavior_routing enabled=" << behavior_routing
+              << " ec_size_class=" << global_config.behavior_group
+              << std::endl;
     
     // Run mapping self-check (fast verification)
     global_config.verify_mapping();

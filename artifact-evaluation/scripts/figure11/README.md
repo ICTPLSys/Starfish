@@ -27,7 +27,3 @@ Optional `exit_status` and `correctness` fields reject failed runs.
 python3 scripts/figure11/plot.py --input data/figure11.csv
 python3 scripts/figure11/plot.py --input data/figure11.csv --validate-only
 ```
-
-This input contract does not make measurements comparable automatically;
-the experiment collector must use the same workload and metric definitions
-for all systems. No paper-reference values are filled into missing cells.

@@ -1,9 +1,9 @@
 /*
 MIT License
 
-Copyright (c) 2021 Parallel Applications Modelling Group - GMAP
+Copyright (c) 2021 Parallel Applications Modelling Group - GMAP 
 	GMAP website: https://gmap.pucrs.br
-
+	
 	Pontifical Catholic University of Rio Grande do Sul (PUCRS)
 	Av. Ipiranga, 6681, Porto Alegre - Brazil, 90619-900
 
@@ -27,7 +27,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-The original NPB 3.4.1 version was written in Fortran and belongs to:
+The original NPB 3.4.1 version was written in Fortran and belongs to: 
 	http://www.nas.nasa.gov/Software/NPB/
 
 ------------------------------------------------------------------------------
@@ -35,11 +35,11 @@ The original NPB 3.4.1 version was written in Fortran and belongs to:
 The serial C++ version is a translation of the original NPB 3.4.1
 Serial C++ version: https://github.com/GMAP/NPB-CPP/tree/master/NPB-SER
 
-Authors of the C++ code:
+Authors of the C++ code: 
 	Dalvan Griebler <dalvangriebler@gmail.com>
 	Gabriell Araujo <hexenoften@gmail.com>
-	Júnior Löff <loffjh@gmail.com>
-*/
+ 	Júnior Löff <loffjh@gmail.com>
+*/ 
 
 #include <cstdlib>
 #include <cstdio>
@@ -50,7 +50,7 @@ Authors of the C++ code:
 /*****************************************************************/
 void c_print_results(char* name,
 		char class_npb,
-		int n1,
+		int n1, 
 		int n2,
 		int n3,
 		int niter,
@@ -86,7 +86,7 @@ void c_print_results(char* name,
 				sprintf(size, "%15.0lf", pow(2.0, n1));
 				j = 14;
 				if(size[j] == '.'){
-					size[j] = ' ';
+					size[j] = ' '; 
 					j--;
 				}
 				size[j+1] = '\0';
@@ -97,8 +97,8 @@ void c_print_results(char* name,
 		}else{
 			printf(" Size            =           %4dx%4dx%4d\n", n1, n2, n3);
 		}
-	}
-	printf(" Iterations      =             %12d\n", niter);
+	}	
+	printf(" Iterations      =             %12d\n", niter); 
 	printf(" Time in seconds =             %12.2f\n", t);
 	printf(" Mop/s total     =             %12.2f\n", mops);
 	printf(" Operation type  = %24s\n", optype);
@@ -123,8 +123,8 @@ void c_print_results(char* name,
 #ifdef SMP
 	evalue = getenv("MP_SET_NUMTHREADS");
 	printf("   MULTICPUS = %s\n", evalue);
-#endif
-	/*
+#endif    
+	/* 
 	 * printf(" Please send the results of this run to:\n\n");
 	 * printf(" NPB Development Team\n");
 	 * printf(" Internet: npb@nas.nasa.gov\n \n");
@@ -135,14 +135,14 @@ void c_print_results(char* name,
 	 * printf(" Fax: 650-604-3957\n\n");
 	 */
 	printf("\n\n");
-
+	
 	printf("----------------------------------------------------------------------\n");
 	printf("    NPB-CPP is developed by: \n");
 	printf("        Dalvan Griebler\n");
 	printf("        Gabriell Araujo (Sequential Porting)\n");
 	printf("        Júnior Löff (Parallel Implementation)\n");
 	printf("\n");
-	printf("    In case of questions or problems, please send an e-mail to us:\n");
+	printf("    In case of questions or problems, please send an e-mail to us:\n");	
 	printf("        dalvan.griebler; gabriell.araujo; junior.loff@edu.pucrs.br\n");
 	printf("----------------------------------------------------------------------\n");
 	printf("\n");

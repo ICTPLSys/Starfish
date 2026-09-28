@@ -6,6 +6,7 @@
 #include <iostream>
 
 #include "cache/alloc/small_object_stripe.hpp"
+#include "cache/alloc/ec_space_reporter.hpp"
 #include "utils/debug.hpp"
 #define REMOTE_REGION_ALLOCATOR
 
@@ -15,6 +16,9 @@
 namespace FarLib {
 
 namespace cache {
+// Defined out of line with the RMW coordinator; initialize diagnostic banks
+// during setup even when phased mode bypasses RMW throughout warmup.
+void prepare_ec_rmw_timing(size_t owners);
 
 #ifdef REMOTE_REGION_ALLOCATOR
 using FarLib::allocator::remote::InvalidRemoteAddr;
@@ -26,6 +30,7 @@ private:
     // ft_method != none; while ft_method == none every dispatch below takes the
     // plain remote_thread_heap path and no stripe code executes.
     SmallObjectStripeManager small_object_stripes;
+    std::unique_ptr<EcSpaceReporter> ec_space_reporter_;
 
     // Cached fault-tolerance state.  The configuration is frozen before the
     // cache is constructed, so these are constant for the process lifetime.
@@ -38,8 +43,23 @@ private:
 
 public:
     RemoteAllocator(size_t buffer_size) {
+        // The backing remote heap is process-global and already requires one
+        // live allocator. Keep the diagnostic callback contract in Release too.
+        if (profile::memory_usage_observer_context != nullptr) {
+            ERROR("RemoteAllocator construction requires the previous EC allocator to be destroyed");
+        }
         remote_global_heap.register_remote(buffer_size);
         const auto &config = ::FarLib::get_config();
+        if (::FarLib::ec_benchmark_phase::enabled()) {
+            if (!config.is_ec_batch_mode() || !config.ft_incremental_update ||
+                !config.ft_incremental_one_sided || !config.exclusive_cache)
+                ERROR("FARLIB_EC_BENCHMARK_PHASED requires exclusive one-sided incremental ec_batch mode");
+            ::FarLib::ec_benchmark_phase::begin_runtime();
+            std::cout << "INFO: ec_benchmark_phase enabled=1 init=full_stripe"
+                         " work=one_sided_rmw dead_index=1 fresh_fallback=0"
+                         " behavior_reuse=prefer_same_allow_other" << std::endl;
+            prepare_ec_rmw_timing(std::max<size_t>(1, config.evacuate_thread_cnt));
+        }
         ft_enabled_ = config.ft_enabled();
         if (ft_enabled_) {
             if (config.ft_small_stripe_shard_size_bytes !=
@@ -48,6 +68,39 @@ public:
             }
             ft_cutoff_ = config.ft_small_object_cutoff;
             small_object_stripes.init(buffer_size, SmallObjectStripeShardSize);
+        }
+        if (config.is_ec_batch_mode()) {
+            profile::evict_breakdown::prepare();
+            small_object_stripe_initialize_encoder();
+            std::cout << "ec_codec backend=isa-l data_shards=4 parity_shards=2"
+                         " table_setup=process_once table_bytes=256" << std::endl;
+            remote_global_heap.set_ec_group_usage_reader(
+                &small_object_stripes, +[](const void *context) {
+                    return static_cast<const SmallObjectStripeManager *>(context)
+                        ->space_usage().endpoint_occupied_bytes;
+                });
+            ec_space_reporter_ = std::make_unique<EcSpaceReporter>(small_object_stripes);
+            assert(profile::memory_usage_observer_context == nullptr);
+            profile::memory_usage_observer_context = ec_space_reporter_.get();
+            profile::memory_usage_begin_observer = +[](void *context) {
+                static_cast<EcSpaceReporter *>(context)->begin_work();
+            };
+            profile::memory_usage_end_observer = +[](void *context) {
+                static_cast<EcSpaceReporter *>(context)->end_work();
+            };
+            ec_space_reporter_->start();
+        }
+    }
+
+    ~RemoteAllocator() {
+        if (::FarLib::ec_benchmark_phase::enabled())
+            small_object_stripes.release_retained_empty_groups_for_shutdown();
+        if (ec_space_reporter_) {
+            ec_space_reporter_->final_report();
+            profile::memory_usage_begin_observer = nullptr;
+            profile::memory_usage_end_observer = nullptr;
+            profile::memory_usage_observer_context = nullptr;
+            remote_global_heap.set_ec_group_usage_reader(nullptr, nullptr);
         }
     }
 
@@ -61,8 +114,13 @@ public:
     uint64_t allocate(size_t size,
                       allocator::six_group::GroupId behavior_group_id = 0) {
         if (size < ft_cutoff_) return allocate_small_object(size);
-        uint64_t addr = remote_thread_heap.allocate(size,
-                                                    behavior_group_id);
+        return allocate_flat(size, behavior_group_id);
+    }
+
+    // Explicit flat storage for recomputable objects, retaining Design2 routing.
+    uint64_t allocate_flat(size_t size,
+                           allocator::six_group::GroupId behavior_group_id = 0) {
+        uint64_t addr = remote_thread_heap.allocate(size, behavior_group_id);
         if (addr == InvalidRemoteAddr) [[unlikely]] {
             info();
             ERROR("Out Of Remote Memory!");

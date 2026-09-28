@@ -17,3 +17,8 @@
 /runtime/*/scripts/
 /runtime/*/test/
 /runtime/*/tests/
+!/runtime/starfish/tests/
+/runtime/starfish/tests/*
+!/runtime/starfish/tests/design2/
+!/runtime/starfish/tests/recovery/
+!/runtime/starfish/tests/integration/

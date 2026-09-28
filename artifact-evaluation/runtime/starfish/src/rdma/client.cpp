@@ -212,6 +212,22 @@ ClientControl::ClientControl(const Configure &config)
 
     // Only materializes the EC commit RPC state when ft_method != none.
     init_sponge_rpc_resources();
+    if (config.ft_incremental_update && config.ft_incremental_one_sided) {
+        // The one-sided coordinator uses the same connected data QPs but has
+        // its own bounded, fully registered bank.  Allocate it once before
+        // any Work phase can obtain an exchange.
+        ec_rmw_transport_.reset(new ec_rmw::ClientTransport);
+        ec_rmw_transport_->init(pd.protection_domain,
+                                 config.evacuate_thread_cnt);
+    } else if (config.ft_incremental_update) {
+        std::vector<ibv_qp *> lanes;
+        for (auto &endpoint : endpoint_qps)
+            for (size_t qp = 0; qp < endpoint.data_qp_count; ++qp)
+                lanes.push_back(endpoint.data_qps[qp].queue_pair);
+        ec_update_transport_.reset(new ec_update::ClientTransport);
+        ec_update_transport_->init(pd.protection_domain,
+                                  config.evacuate_thread_cnt, lanes);
+    }
 }
 
 void ClientControl::release_sponge_rpc_resources() {

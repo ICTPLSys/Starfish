@@ -29,6 +29,7 @@
 
 #include "cache/entry.hpp"
 #include "hydra/page_pool.hpp"
+#include "hydra/runtime_packing.hpp"
 #include "hydra/page_codec.hpp"
 #include "cache/diagnostics/simple_dirty_observer.hpp"
 #include "cache/base/handler.hpp"
@@ -60,9 +61,6 @@
 #include "cache/core/common/sharded_scope_counters.hpp"
 #include "utils/wait_trace.hpp"
 #include "utils/inclusive_reclaim_diag.hpp"
-#include "utils/scope_diag.hpp"
-#include "utils/read_supply_timeline.hpp"
-#include "utils/request_interval_diag.hpp"
 
 // Compile the complete client and its static libraries with the same value.
 // This experiment changes cache-object layout only, not backup admission.
@@ -204,13 +202,14 @@ inline bool alloc_scope_checkpoint_enabled() {
 }
 
 class ConcurrentArrayCache {
+    std::unique_ptr<hydra::RuntimePacking> hydra_runtime_packing_;
     std::array<hydra::Lane, hydra::kAllocationLanes> hydra_lanes_;
     std::mutex hydra_pages_mutex_;
     std::vector<std::unique_ptr<hydra::Page>> hydra_pages_;
     std::atomic<uint64_t> hydra_pages_created_{0}, hydra_pages_released_{0};
     std::atomic<uint64_t> hydra_objects_created_{0}, hydra_objects_released_{0};
     std::pair<far_obj_t, void *> hydra_allocate(
-        FarObjectEntry *, size_t, bool, DereferenceScope &);
+        FarObjectEntry *, size_t, bool, DereferenceScope &, uint8_t);
     void hydra_release_page_reference(hydra::Page *);
     void hydra_release_handle(FarObjectEntry &);
     void hydra_shutdown_pages();
@@ -218,6 +217,20 @@ class ConcurrentArrayCache {
     friend struct detail::FullPopulationFrequencyTracker;
 
 public:
+    int hydra_packing_root_enter();
+    void hydra_packing_root_exit(int token);
+    void hydra_record_demand(const FarObjectEntry &handle);
+    void hydra_rebind_slot(FarObjectEntry &handle);
+    void hydra_repack_learned();
+    // Optional explicit end-of-learning request; actual migration still waits
+    // for a new root and the same admission/drain protocol.
+    bool hydra_request_repacking() {
+        if (!hydra_runtime_packing_ || hydra_runtime_packing_->phase.load() != hydra::RuntimePacking::Learning) return false;
+        hydra_runtime_packing_->published_references.store(hydra::RuntimePacking::LearnReferences, std::memory_order_relaxed);
+        return true;
+    }
+    // Call only when allocation is quiescent; reports native page descriptors.
+    void hydra_report_packing();
     enum MutatorState { OutOfScope, InScopeV0, InScopeV1, MutatorStateCount };
 
     struct alignas(64) {
@@ -244,7 +257,6 @@ public:
             ::FarLib::allocator::RegionPlacement::Unclassified,
         uint32_t requested_group_id = 0,
         uint32_t requested_behavior_group_id = 0) {
-        scope_diag::Guard sd_alloc_guard(fibre_self(), scope_diag::ALLOC);
         auto *wc_sample = wc_object_diag::find_object(obj.obj_id);
         const uint64_t wc_alloc_begin = wc_sample ? wc_object_diag::stamp() : 0;
         if (alloc_scope_checkpoint_enabled()) {
@@ -267,16 +279,7 @@ public:
 #ifdef ASSERT_ALL_LOCAL
             ERROR("should not evict in allocate local");
 #endif
-            if (inclusive_reclaim_diag::enabled()) {
-                reclaim_diag_last_alloc_bin.store(alloc_bin,
-                                                  std::memory_order_relaxed);
-            }
             log_cache_progress("alloc_wait_begin", alloc_bin, size);
-            if (wait_trace::nq_supply_only.load(std::memory_order_relaxed)) {
-                log_cache_progress("alloc_wait_placement", alloc_bin,
-                                   static_cast<uint64_t>(requested_placement),
-                                   requested_group_id);
-            }
             // Time the whole allocation retry interval, including scheduler
             // waits. The summed counter is fibre elapsed-time, not CPU usage
             // or the wall-time union of simultaneous allocation stalls.
@@ -337,20 +340,7 @@ public:
                                                stw_start_cycles);
             auto *allocated_region =
                 ::FarLib::allocator::block_to_region(block);
-            if (inclusive_reclaim_diag::enabled() &&
-                inclusive_reclaim_diag::sample_region(allocated_region)) {
-                wait_trace::emit(
-                    "reclaim_alloc_take", alloc_bin, retry_count,
-                    allocated_region->placement_epoch.load(
-                        std::memory_order_relaxed),
-                    reinterpret_cast<uint64_t>(allocated_region));
-            }
             log_cache_progress("alloc_wait_end", alloc_bin, retry_count);
-            if (wait_trace::nq_supply_only.load(std::memory_order_relaxed)) {
-                log_cache_progress("alloc_take_placement", alloc_bin,
-                                   static_cast<uint64_t>(allocated_region->load_placement()),
-                                   reinterpret_cast<uint64_t>(allocated_region));
-            }
         }
         assert(obj == block->obj_meta_data);
         wc_object_diag::allocation_done(wc_sample, wc_alloc_begin);
@@ -609,10 +599,6 @@ private:
     size_t evacuate_thread_cnt;
     std::atomic_flag flag;
     std::atomic_bool stw_active{false};
-    std::atomic_bool read_supply_timeline_stop{false};
-    std::thread read_supply_timeline_thread;
-    std::atomic<size_t> reclaim_diag_last_alloc_bin{
-        inclusive_reclaim_diag::kNoAllocBin};
     FullPopulationFrequencyTracker full_population_frequency_tracker;
 
     static std::unique_ptr<ConcurrentArrayCache> default_instance;
@@ -660,9 +646,6 @@ private:
                             uint64_t a = 0, uint64_t b = 0) {
         wait_trace::emit(name, bin, a, b, (uint64_t)uthread::get_tls());
     }
-
-    void start_read_supply_timeline();
-    void stop_read_supply_timeline();
 
     static bool full_population_frequency_stats_enabled();
     static size_t full_population_frequency_scan_period_ms();
@@ -3958,19 +3941,9 @@ public:
         }
         const bool use_read_batch = IsReadRequest && sync_batch_eligible &&
                                     client->sync_read_batching_enabled();
-        request_interval_diag::Token request_interval_token{};
         if constexpr (IsReadRequest) {
             if (!use_read_batch) {
                 client->record_immediate_read_generated(obj.size);
-                auto *diag_slot = scope_diag::current(fibre_self());
-                if (diag_slot != nullptr) {
-                    request_interval_token =
-                        request_interval_diag::request_prepost(
-                            scope_diag::index(diag_slot),
-                            reinterpret_cast<uint64_t>(fibre_self()),
-                            reinterpret_cast<uint64_t>(&entry), wr_id,
-                            mutator_waiters.load(std::memory_order_relaxed));
-                }
             }
         }
         
@@ -4011,11 +3984,9 @@ public:
                     recomputable_flat_read_posts_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            request_interval_diag::set_post_context(request_interval_token);
             posted = client->post_read(
                 offset, local_addr, obj.size, wr_id, obj.obj_id, 0,
                 endpoint_idx);
-            request_interval_diag::clear_post_context();
         } else {
             // Use original post_write for now
             wr_id = encode_normal_write_wr_id(local_addr);
@@ -4030,9 +4001,6 @@ public:
         if constexpr (IsReadRequest) {
             if (recomputable_diag_enabled_ && entry.is_recomputable())
                 recomputable_flat_read_posts_.fetch_add(1, std::memory_order_relaxed);
-            // B1 observer: count only after ibv_post_send accepted the READ.
-            read_supply_timeline::record_read_accepted(client_idx, qp_idx,
-                                                        wr_id);
         } else {
             profile::count_rdma_write_post(obj.size);
         }
@@ -4099,9 +4067,6 @@ public:
 
         // All WRs in this buffer have now been accepted, including any suffix
         // retried after a partial post.
-        read_supply_timeline::record_write_posts(client_idx, qp_idx,
-                                                 posted_count);
-
         profile::count_evacuation_bytes(total_bytes);
         profile::count_evac_flush(posted_count, posted_count == EvictBatchSize);
         buffer.count = 0;
@@ -4760,6 +4725,18 @@ public:
                 !resident_profile_manual_trigger_flag,
                 std::memory_order_release);
         }
+        if (hydra::runtime_packing_enabled()) {
+            if (!config.is_hydra_mode())
+                throw std::invalid_argument("runtime hot packing requires Hydra");
+            hydra_runtime_packing_ = std::make_unique<hydra::RuntimePacking>();
+            hydra_runtime_packing_->hot_byte_budget = local_buf_size / 8;
+            std::cout << "hydra.runtime_packing enabled=1 oracle=0 learn_references="
+                      << hydra::RuntimePacking::LearnReferences
+                      << " hot_byte_budget=" << local_buf_size / 8
+                      << " policy=one_shot_demand_rank scope_gate=root_lifetime\n";
+        } else {
+            std::cout << "hydra.runtime_packing enabled=0\n";
+        }
         ::FarLib::allocator::global_heap.register_heap(local_buf, local_buf_size);
         if (::FarLib::simple_dirty_observer::enabled()) {
             // The two-byte trace handle has one owner. Do not combine this
@@ -4897,15 +4874,13 @@ public:
             resident_profile_thread =
                 std::thread([this] { run_resident_profile_planner(); });
         }
-        start_read_supply_timeline();
     }
 
     ~ConcurrentArrayCache() {
         ::FarLib::simple_region_heat::end_work();
         ec_batch_diag_report("cache_dtor_begin");
-        ec_read_recovery_diag_report("cache_dtor_begin");
-        stop_read_supply_timeline();
         quiesce_background_evacuation();
+        ec_read_recovery_diag_report("cache_quiesced");
         hydra_shutdown_pages();
         if (::FarLib::allocator::six_group::enabled()) {
             ::FarLib::allocator::six_group::registry().stop();
@@ -5317,9 +5292,10 @@ public:
     template <bool Lite = false>
     std::pair<far_obj_t, void *> allocate(FarObjectEntry *entry, size_t size,
                                           bool dirty, DereferenceScope &scope,
-                                          uint32_t logical_owner_id = 0) {
+                                          uint32_t logical_owner_id = 0,
+                                          uint8_t packing_class = 0) {
         if (::FarLib::get_config().is_hydra_mode() && size <= hydra::kPageBytes) {
-            auto result = hydra_allocate(entry, size, dirty, scope);
+            auto result = hydra_allocate(entry, size, dirty, scope, packing_class);
             if constexpr (!Lite) entry->pin();
             return result;
         }
@@ -5835,15 +5811,6 @@ public:
         return ::FarLib::allocator::global_heap.memory_low();
     }
 
-    // Diagnostics-only lifetime fence: the benchmark calls this before its
-    // object metadata vectors are cleared so the observer cannot dereference
-    // a stale pending-entry pointer during teardown.
-    static void stop_default_read_supply_timeline_for_diagnostics() {
-        if (default_instance) {
-            default_instance->stop_read_supply_timeline();
-        }
-    }
-
 public:
     size_t check_cq();
     size_t check_cq_idx(size_t qp_idx);
@@ -6049,5 +6016,5 @@ private:
 #include "recovery/ec_read_recovery.ipp"
 #include "recovery/recompute_recipe_path.ipp"
 #include "cache/core/common/common_path.ipp"
-#include "cache/core/diagnostics/read_supply_timeline.ipp"
 #include "hydra/page_path.ipp"
+#include "hydra/runtime_packing_path.ipp"

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "rdma/exchange_msg.hpp"
+#include "rdma/ec_update_server.hpp"
 #include "rdma/rdma.hpp"
 #include "utils/debug.hpp"
 
@@ -56,7 +57,11 @@ public:
     void *get(size_t offset) { return static_cast<char *>(buffer) + offset; }
 
     void start() {
-        control_cq.req_notify(true);
+        // The incremental participant has to poll the existing control CQ
+        // alongside the data receive/send CQs.  The legacy stop path keeps
+        // its completion-channel notification and blocking wait unchanged.
+        if (!config.ft_incremental_update || config.ft_incremental_one_sided)
+            control_cq.req_notify(true);
         connect();
         std::cout << "server started" << std::endl;
 
@@ -72,6 +77,21 @@ public:
         QueuePair &qp = qps[0];
 
         ibv_post_recv(qp.queue_pair, &recv_stop_wr, &bad_wr);
+
+        if (config.ft_incremental_update && !config.ft_incremental_one_sided) {
+            // The adapter owns registered receive/response banks.  Destroy
+            // the QPs first so their posted receives are flushed before the
+            // adapter deregisters those banks.
+            auto adapter = std::make_unique<ec_update::ServerTransport>(
+                config, pd, qps, data_cq, data_send_cq, buffer,
+                config.server_buffer_size);
+            adapter->run_until_stop(control_cq.complete_queue, RQ_STOP);
+            qps.clear();
+            adapter->drain_after_qp_destroy();
+            adapter.reset();
+            return;
+        }
+
         channel.wait_cq_event();
         // construct order must be cq->qp
         while (true) {

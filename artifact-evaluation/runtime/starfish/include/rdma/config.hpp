@@ -5,13 +5,16 @@
 
 #include <infiniband/verbs.h>
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "utils/debug.hpp"
@@ -22,6 +25,40 @@ namespace FarLib {
 constexpr size_t PAGE_SIZE = 4096;
 
 namespace rdma {
+
+namespace detail {
+
+template <typename T>
+bool read_config_value(std::istream &input, T &value) {
+    return static_cast<bool>(input >> value);
+}
+
+// uint8_t is commonly an unsigned char, so operator>> would consume one
+// character instead of a decimal value. Validate the token and range first.
+inline bool read_config_value(std::istream &input, uint8_t &value) {
+    std::string token;
+    if (!(input >> token)) return false;
+    for (const char character : token) {
+        if (character < '0' || character > '9') {
+            input.setstate(std::ios::failbit);
+            return false;
+        }
+    }
+    unsigned int parsed = 0;
+    const char *first = token.data();
+    const char *last = first + token.size();
+    const auto result = std::from_chars(first, last, parsed, 10);
+    if (result.ec != std::errc{} || result.ptr != last ||
+        parsed > static_cast<unsigned int>(
+                     std::numeric_limits<uint8_t>::max())) {
+        input.setstate(std::ios::failbit);
+        return false;
+    }
+    value = static_cast<uint8_t>(parsed);
+    return true;
+}
+
+}  // namespace detail
 
 struct Configure {
 #define CONFIG(TYPE, VAR, DEFAULT) TYPE VAR = DEFAULT;
@@ -65,6 +102,7 @@ struct Configure {
     // size; cache/alloc/small_object_stripe.hpp static_asserts that it matches
     // ::FarLib::allocator::RegionSize, so the two cannot drift apart.
     static constexpr size_t ft_ec_shard_size_bytes = 256 * 1024;
+    static constexpr size_t behavior_group_max_whole_object_bytes = 4096;
 
     // Derived profiling flags
     bool profiling_enabled = false;
@@ -109,7 +147,7 @@ struct Configure {
             }
 #define CONFIG(TYPE, VAR, DEFAULT)                                      \
     if (name == #VAR) {                                                 \
-        if (!(ifs >> this->VAR)) {                                      \
+        if (!detail::read_config_value(ifs, this->VAR)) {               \
             std::cerr << "Error when reading configuration of " << name \
                       << ". Expected type is " << #TYPE << std::endl;   \
             std::abort();                                               \
@@ -124,6 +162,9 @@ struct Configure {
         
         // Post-processing for multi-endpoint configuration
         post_process_config();
+        if (ft_incremental_one_sided && !ft_incremental_update) {
+            config_error("ft_incremental_one_sided requires ft_incremental_update=1");
+        }
     }
     
     void post_process_config() {
@@ -242,23 +283,30 @@ struct Configure {
         std::exit(2);
     }
 
-    bool ft_enabled() const { return ft_method_type != FT_NONE; }
+    bool ft_enabled() const { return behavior_group || ft_method_type != FT_NONE; }
 
     // ft_method=ec_batch: the batched four-object group write path (staging +
     // local RS(4,2) encode + six single-sided writes).  Every ec_batch-only
     // code path must be guarded by this predicate so that ft_method=none (and
     // sponge) keep their behaviour unchanged.
     bool is_ec_batch_mode() const {
-        return ft_method_type == FT_EC_BATCH;
+        return behavior_group || ft_method_type == FT_EC_BATCH;
     }
     // ft_method=sponge only: the sponge commit path (control CQ ACKs) is the
     // only user of check_sponge_ack_cq_ft(); ec_batch never commits through it,
     // so polling must stay off for ec_batch and none.
-    bool is_sponge_mode() const { return ft_method_type == FT_SPONGE; }
+    bool is_sponge_mode() const { return !behavior_group && ft_method_type == FT_SPONGE; }
 
     // True for objects that the EC stripe layout takes over.
     bool ft_small_object(size_t size) const {
+        if (behavior_group)
+            return size <= behavior_group_max_whole_object_bytes;
         return ft_enabled() && size < ft_small_object_cutoff;
+    }
+
+    bool ec_object_uses_split(size_t size) const {
+        if (behavior_group) return size > behavior_group_max_whole_object_bytes;
+        return size > behavior_group_max_whole_object_bytes || !ft_small_object(size);
     }
     
     std::vector<std::string> parse_string_list(const std::string& s) {
@@ -332,6 +380,13 @@ struct Configure {
     void self_check() {
         std::cerr << max_thread_cnt * qp_count * qp_send_cap << std::endl;
         post_process_config();
+        if (ft_incremental_update &&
+            (!behavior_group || !exclusive_cache || qp_recv_cap < 64 || qp_send_cap < 64)) {
+            config_error("ft_incremental_update requires behavior_group=1, exclusive_cache=1 and QP send/recv capacities>=64");
+        }
+        if (behavior_group && ft_method_type == FT_SPONGE) {
+            config_error("behavior_group cannot be combined with legacy ft_method=sponge");
+        }
         // ASSERT(cq_entries >= max_thread_cnt * qp_count * qp_send_cap);
         // ASSERT(server_buffer_size >= client_buffer_size);
         std::cout << "cq_entries " << cq_entries << std::endl;
@@ -478,7 +533,15 @@ struct Configure {
             // path are not wired yet, so such a run is only usable up to the
             // point where the write path is needed.  This is informational, not
             // an error - the configuration itself is legal.
-            if (is_ec_batch_mode()) {
+            if (behavior_group) {
+                std::cout << "behavior_group enabled=1 classes=6"
+                             " small=whole_size_class max_whole_bytes=4096"
+                             " large=split4 codec=isa-l layout=4+2"
+                             " incremental_server_parity="
+                          << (ft_incremental_update && !ft_incremental_one_sided)
+                          << " incremental_worker_rmw=" << ft_incremental_one_sided
+                          << std::endl;
+            } else if (is_ec_batch_mode()) {
                 std::cerr
                     << "Warning: ft_method=" << ft_method
                     << " accepted (client-side group staging + RS(4,2) parity "
@@ -512,6 +575,13 @@ struct Configure {
         std::cout << "remote_mapping: " << (mapping_type == MAPPING_RANGE ? "range" : "stripe") << std::endl;
         std::cout << "ft_method: " << (ft_method.empty() ? "none" : ft_method)
                   << std::endl;
+        std::cout << "behavior_group: " << behavior_group
+                  << " effective_ec=" << is_ec_batch_mode() << std::endl;
+        std::cout << "ft_incremental_update: " << ft_incremental_update
+                  << " protocol=" << (ft_incremental_one_sided ? "one-sided-rmw" : "prepare-commit")
+                  << " dead_slot_only=1" << std::endl;
+        std::cout << "ft_incremental_one_sided: " << ft_incremental_one_sided
+                  << " worker_private=1" << std::endl;
     }
     
     // Fast mapping self-check for verification

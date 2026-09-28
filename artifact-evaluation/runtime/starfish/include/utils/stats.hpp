@@ -13,6 +13,9 @@
 #include <vector>
 
 #include "cpu_cycles.hpp"
+#include "evac_phase_metrics.hpp"
+#include "evict_breakdown.hpp"
+#include "ec_benchmark_phase.hpp"
 #include "read_size_profile.hpp"
 #include "design2/object_group_trace.hpp"
 #include "design2/simple_region_heat.hpp"
@@ -233,6 +236,7 @@ struct ProfileData {
     int64_t rdma_write_post_bytes;
     int64_t dirty_evict_bytes;
     int64_t clean_evict_bytes;
+    EvacPhaseMetricsShard evac_phase_metrics;
     int64_t ref_read_cold_count;
     int64_t ref_read_warm_count;
     int64_t ref_read_hot_count;
@@ -405,6 +409,7 @@ struct ProfileData {
         rdma_write_post_bytes = 0;
         dirty_evict_bytes = 0;
         clean_evict_bytes = 0;
+        evac_phase_metrics.reset();
         ref_read_cold_count = 0;
         ref_read_warm_count = 0;
         ref_read_hot_count = 0;
@@ -581,6 +586,43 @@ extern bool working;
 extern std::atomic_bool work_phase_active;
 extern uint64_t global_start_cycles, global_cycles;
 
+// Record one successfully accepted RDMA payload in the current phase
+// coverage.  This is intentionally a thread-shard update: the only shared
+// operation is a relaxed read of evac_phase_active_mask, so normal READ/WRITE
+// posting does not contend on a global counter.  Callers should invoke this
+// after the corresponding post was accepted; retries must not be counted as
+// additional payloads.
+inline void count_evac_phase_rdma_payload(EvacRdmaTraffic traffic,
+                                           EvacRdmaDirection direction,
+                                           size_t bytes) noexcept {
+    if (bytes == 0) return;
+    if (!evac_phase_metrics_collecting.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const auto coverage = evac_phase_coverage_from_mask(
+        evac_phase_active_mask.load(std::memory_order_relaxed));
+    if (coverage == EvacPhaseCoverage::Count) return;
+    const size_t coverage_index = static_cast<size_t>(coverage);
+    const size_t traffic_index = static_cast<size_t>(traffic);
+    const size_t direction_index = static_cast<size_t>(direction);
+    auto &metrics = get_tlpd().evac_phase_metrics;
+    EvacPhaseMetricsShard::add_relaxed(
+        metrics.payload_bytes[coverage_index][traffic_index][direction_index],
+        static_cast<uint64_t>(bytes));
+    EvacPhaseMetricsShard::add_relaxed(
+        metrics.payload_ops[coverage_index][traffic_index][direction_index], 1);
+}
+
+inline void count_evac_phase_rdma_read(EvacRdmaTraffic traffic,
+                                       size_t bytes) noexcept {
+    count_evac_phase_rdma_payload(traffic, EvacRdmaDirection::Read, bytes);
+}
+
+inline void count_evac_phase_rdma_write(EvacRdmaTraffic traffic,
+                                        size_t bytes) noexcept {
+    count_evac_phase_rdma_payload(traffic, EvacRdmaDirection::Write, bytes);
+}
+
 void reset_all();
 void record_frequency_histogram_pass(
     uint32_t timestamp, const DualFrequencyHistogramSnapshot &local_snapshot);
@@ -635,6 +677,7 @@ int64_t collect_evac_evict_phase_cycles();
 int64_t collect_evac_gc_phase_cycles();
 int64_t collect_evac_flip_scope_cycles();
 int64_t collect_evac_flush_cycles();
+EvacPhaseMetricsShard collect_evac_phase_metrics();
 
 int64_t collect_excl_remote_alloc_count();
 int64_t collect_excl_remote_alloc_bytes();
@@ -849,21 +892,36 @@ inline bool suspend_work() {
     }
     return false;
 }
+// Cold boundary observer, installed during cache construction only. Memory
+// diagnostics run outside the Work timer, never on object access.
+inline void *memory_usage_observer_context = nullptr;
+inline void (*memory_usage_begin_observer)(void *) = nullptr;
+inline void (*memory_usage_end_observer)(void *) = nullptr;
+
 inline void start_work() {
     assert(!working);
+    ::FarLib::ec_benchmark_phase::begin_work();
+    if (memory_usage_begin_observer)
+        memory_usage_begin_observer(memory_usage_observer_context);
     ::FarLib::object_group_trace::phase_start();
     working = true;
     global_start_cycles = get_cycles();
+    evict_breakdown::begin_window(global_start_cycles);
     work_phase_active.store(true, std::memory_order_release);
+    begin_evac_phase_metrics_window();
     ::FarLib::simple_region_heat::begin_work();
 }
 inline void end_work() {
     assert(working);
     ::FarLib::simple_region_heat::end_work();
+    end_evac_phase_metrics_window();
     work_phase_active.store(false, std::memory_order_release);
     working = false;
     global_cycles = get_cycles() - global_start_cycles;
+    evict_breakdown::end_window(global_start_cycles + global_cycles);
     ::FarLib::object_group_trace::phase_end();
+    if (memory_usage_end_observer)
+        memory_usage_end_observer(memory_usage_observer_context);
 }
 inline bool is_working() {
     return work_phase_active.load(std::memory_order_acquire);

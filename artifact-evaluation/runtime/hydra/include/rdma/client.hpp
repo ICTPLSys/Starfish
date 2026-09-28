@@ -28,7 +28,6 @@
 #include "rdma.hpp"
 #include "rdma/sponge_rpc.hpp"
 #include "utils/debug.hpp"
-#include "utils/request_interval_diag.hpp"
 #include "utils/wc_object_diag.hpp"
 #include "utils/stats.hpp"
 
@@ -242,6 +241,8 @@ private:
     // Multi-endpoint support: vector of endpoint controls
     std::vector<EndpointControl> endpoints;
     size_t server_count;
+    // Retained past cache teardown solely for best-effort STOP handshakes.
+    std::unique_ptr<std::atomic_bool[]> endpoint_dead_;
     
     // Per-endpoint QPs/CQs: for each endpoint, we have control_qp, data_qps, data_cqs
     struct EndpointQPs {
@@ -404,6 +405,9 @@ public:
     ~ClientControl() {
         INFO("destroying rdma client");
         post_stop();
+        // STOP can fail, and ACK receive WRs may still own RPC buffers.
+        // Destroy every QP before deregistering or freeing its memory.
+        endpoint_qps.clear();
         release_sponge_rpc_resources();
         deallocate_buffer(buffer, config.client_buffer_size);
     }
@@ -438,6 +442,11 @@ public:
     
     // Multi-endpoint accessors
     size_t get_server_count() const { return server_count; }
+
+    void mark_endpoint_dead(size_t endpoint_idx) {
+        if (endpoint_idx < server_count)
+            endpoint_dead_[endpoint_idx].store(true, std::memory_order_release);
+    }
     
     const EndpointControl& get_endpoint(size_t idx) const {
         if (idx >= server_count) {
@@ -1139,7 +1148,6 @@ public:
         auto &diag = get_client(thread_info.thread_id)->immediate_read_diag;
         ++diag.physical_submit_calls;
         ++diag.attempted_chain_1;
-        ::FarLib::request_interval_diag::post_attempt_begin();
         auto *wc_sample = ::FarLib::wc_object_diag::find_object(obj_id);
         const uint64_t wc_submit_begin = wc_sample ? ::FarLib::wc_object_diag::stamp() : 0;
         int send_ret = ibv_post_send(endpoint_qp->queue_pair, &read_wr, &bad_wr);
@@ -1152,7 +1160,6 @@ public:
                 wc_sample->submit_return.store(wc_submit_return);
             }
         }
-        ::FarLib::request_interval_diag::post_attempt_result(ret);
         if (ret) {
             ++diag.accepted_prefix_1;
             ++diag.accepted_reads;

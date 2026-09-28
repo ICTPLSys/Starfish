@@ -96,17 +96,42 @@ inline GlobalHeap::GlobalHeap()
 
 inline void GlobalHeap::register_heap(void *buffer, size_t size) {
     ASSERT(heap == nullptr);
-    if (simple_region_budget::enabled()) {
+    if (simple_region_budget::enabled() ||
+        simple_region_heat::local_resident_enabled()) {
         // The local ownership ledger must exist before the first Region can
         // be claimed.  Heat Classes are configured later by cache setup, but
         // this controller is independent of that physical-address table.
         simple_region_budget::local().configure(RegionSize);
     }
-    if(simple_region_heat::grouping_enabled() &&
-       (!simple_region_heat::enabled() || !list_only_six::enabled() ||
-        FarLib::get_config().enable_region_resident_placement ||
-        !FarLib::get_config().exclusive_cache || FarLib::get_config().enable_selective_backup))
-        throw std::invalid_argument("simple hotcold requires heat, six lists, exclusive, Resident/backup OFF");
+    const bool resident_mode = simple_region_heat::local_resident_enabled();
+    if (resident_mode && !simple_region_heat::grouping_enabled()) {
+        throw std::invalid_argument(
+            "simple resident routing requires FARLIB_SIMPLE_HOTCOLD=1");
+    }
+    if (simple_region_heat::grouping_enabled()) {
+        const auto &config = FarLib::get_config();
+        const bool legacy_invalid =
+            !simple_region_heat::enabled() || !list_only_six::enabled() ||
+            config.enable_region_resident_placement ||
+            !config.exclusive_cache || config.enable_selective_backup;
+        const bool resident_invalid =
+            !simple_region_heat::enabled() || !list_only_six::enabled() ||
+            !simple_region_budget::six_enabled() ||
+            !simple_region_budget::enabled() ||
+            !simple_region_heat::local_routing_enabled() ||
+            list_only_six::grouped() ||
+            !config.enable_region_resident_placement ||
+            config.region_placement_bind_groups || !config.exclusive_cache;
+        if ((resident_mode && resident_invalid) ||
+            (!resident_mode && legacy_invalid)) {
+            if (resident_mode) {
+                throw std::invalid_argument(
+                    "simple resident routing requires heat, six lists, six semantic classes, Resident placement, unbound groups, exclusive cache");
+            }
+            throw std::invalid_argument(
+                "simple hotcold requires heat, six lists, exclusive, Resident/backup OFF");
+        }
+    }
     if (list_only_six::enabled()) {
         for (auto &placement_lists : usable_region_list) {
             for (auto &list : placement_lists)
@@ -260,43 +285,68 @@ inline void GlobalHeap::tick_simple_budget(uint64_t window) {
                     1, static_cast<size_t>(std::min<uint64_t>(
                            pending_for_bin, candidate_budget /
                                                 std::max<size_t>(1, pending_bins_left)))));
-            SimpleBudgetExtractStats stats;
-            std::vector<RegionHead *> detached;
-            detached.reserve(candidate_quota);
-            usable_region_list[placement_index(RegionPlacement::Unclassified)]
-                [bin]
+            const bool resident_mode =
+                simple_region_heat::local_resident_enabled();
+            const std::array<RegionPlacement, 2> source_placements{
+                resident_mode ? RegionPlacement::Streaming
+                               : RegionPlacement::Unclassified,
+                RegionPlacement::Resident};
+            const size_t source_count = resident_mode ? 2 : 1;
+            for (size_t source_index = 0; source_index < source_count;
+                 ++source_index) {
+                if (candidate_budget == 0 || scan_budget == 0) break;
+                const RegionPlacement source = source_placements[source_index];
+                if (resident_mode) {
+                    const size_t first =
+                        source == RegionPlacement::Resident ? 3 : 0;
+                    const size_t last = first + 3;
+                    bool band_pending = false;
+                    for (size_t c = first; c < last; ++c)
+                        band_pending |= remaining[bin][c] != 0;
+                    if (!band_pending) continue;
+                }
+                SimpleBudgetExtractStats stats;
+                std::vector<RegionHead *> detached;
+                const size_t source_quota = std::min(candidate_quota,
+                                                     candidate_budget);
+                detached.reserve(source_quota);
+                usable_region_list[placement_index(source)][bin]
                     .extract_simple_budget_usable(
-                        detached, remaining, bin, candidate_quota,
+                        detached, remaining, bin, source_quota,
                         visit_quota, stats);
-            scanned += stats.scanned;
-            eligible += stats.eligible;
-            busy += stats.busy;
-            scan_budget -= std::min(scan_budget, stats.scanned);
-            candidate_budget -= std::min(candidate_budget, detached.size());
+                scanned += stats.scanned;
+                eligible += stats.eligible;
+                busy += stats.busy;
+                scan_budget -= std::min(scan_budget, stats.scanned);
+                candidate_budget -=
+                    std::min(candidate_budget, detached.size());
 
-            for (RegionHead *region : detached) {
-                const uintptr_t address = reinterpret_cast<uintptr_t>(region);
-                const uint8_t old_class =
-                    simple_region_heat::allocation_class_for(address);
-                const uint8_t actual_class =
-                    simple_region_heat::reassign_supply_public(
-                        address, bin, old_class);
-                if (actual_class == old_class) {
+                for (RegionHead *region : detached) {
+                    const uintptr_t address =
+                        reinterpret_cast<uintptr_t>(region);
+                    const uint8_t old_class =
+                        simple_region_heat::allocation_class_for(address);
+                    const uint8_t actual_class =
+                        simple_region_heat::reassign_supply_public(
+                            address, bin, old_class);
+                    if (actual_class == old_class) {
+                        usable_region_list[placement_index(
+                            region->load_placement())][region->bin]
+                            .push_dbg(region, "simple_budget.actuation.noop");
+                        continue;
+                    }
+
+                    // This is a public USABLE->USABLE relabel only. Preserve
+                    // every Region/block header, list, epoch and address;
+                    // only the persistent supply label and child change.
+                    if (region->used_count != 0) ++nonempty_regions;
+                    free_bytes_reclassified += region->free_size();
                     usable_region_list[placement_index(
                         region->load_placement())][region->bin]
-                        .push_dbg(region, "simple_budget.actuation.noop");
-                    continue;
+                        .push_dbg(region, "simple_budget.actuation");
+                    ++applied;
                 }
-
-                // This is a public USABLE->USABLE relabel only.  Preserve
-                // every Region/block header, list, epoch and address; only
-                // the persistent supply label and receiving child change.
-                if (region->used_count != 0) ++nonempty_regions;
-                free_bytes_reclassified += region->free_size();
-                usable_region_list[placement_index(
-                    region->load_placement())][region->bin]
-                    .push_dbg(region, "simple_budget.actuation");
-                ++applied;
+                if (candidate_budget == 0 || scan_budget == 0) break;
             }
             if (pending_bins_left != 0) --pending_bins_left;
         }
@@ -376,6 +426,11 @@ inline void GlobalHeap::sub_resident_counted_free_size(int64_t bytes) {
 
 inline RegionPlacement GlobalHeap::resolve_allocation_placement(
     RegionPlacement requested_placement, uint32_t requested_group_id) const {
+    if (simple_region_heat::local_resident_enabled() &&
+        (requested_placement == RegionPlacement::Unclassified ||
+         requested_placement == RegionPlacement::Mixed)) {
+        return RegionPlacement::Streaming;
+    }
     if (!region_placement_enabled) {
         return RegionPlacement::Unclassified;
     }
@@ -394,6 +449,14 @@ inline RegionPlacement GlobalHeap::resolve_allocation_placement(
 inline RegionHead *GlobalHeap::allocate_region(
     size_t bin, RegionPlacement requested_placement,
     uint32_t requested_group_id, uint32_t requested_behavior_group_id) {
+    if (simple_region_heat::local_resident_enabled() &&
+        (requested_placement == RegionPlacement::Unclassified ||
+         requested_placement == RegionPlacement::Mixed)) {
+        // Resident-mapped local routing has no third supply band.  Callers
+        // without an explicit R/S hint use the conservative Streaming band.
+        requested_placement = RegionPlacement::Streaming;
+        requested_group_id = 0;
+    }
     if (!region_placement_enabled) {
         requested_placement = RegionPlacement::Unclassified;
         requested_group_id = 0;
@@ -435,6 +498,12 @@ inline void GlobalHeap::check_free_size_negative_after_alloc(
 inline RegionHead *GlobalHeap::allocate_region_impl(
     size_t bin, RegionPlacement requested_placement,
     uint32_t requested_group_id, uint32_t requested_behavior_group_id) {
+    if (simple_region_heat::local_resident_enabled() &&
+        (requested_placement == RegionPlacement::Unclassified ||
+         requested_placement == RegionPlacement::Mixed)) {
+        requested_placement = RegionPlacement::Streaming;
+        requested_group_id = 0;
+    }
     const bool bind_groups = FarLib::get_config().region_placement_bind_groups;
     auto pop_usable = [&](RegionPlacement placement, const char *debug_tag,
                           int class_override = -1) -> RegionHead * {
@@ -447,13 +516,19 @@ inline RegionHead *GlobalHeap::allocate_region_impl(
         };
         auto &list = usable_region_list[placement_index(placement)][bin];
         RegionHead *candidate = nullptr;
-        if(simple_region_heat::local_routing_enabled()) {
+        if (simple_region_heat::local_routing_enabled()) {
             const uint8_t requested_class =
-                simple_region_heat::normalize_class(requested_behavior_group_id);
+                simple_region_heat::local_resident_enabled()
+                    ? simple_region_heat::class_for_placement(
+                          placement == RegionPlacement::Resident,
+                          static_cast<uint8_t>(requested_behavior_group_id % 3))
+                    : simple_region_heat::normalize_class(
+                          requested_behavior_group_id);
             const size_t selected_class = class_override >= 0
                                               ? static_cast<size_t>(class_override)
                                               : requested_class;
-            candidate = list.list_only_six_child(selected_class)->pop();
+            auto *child = list.list_only_six_child(selected_class);
+            candidate = child == nullptr ? nullptr : child->pop();
             // Count only the exact requested global pop.  Any private-slot or
             // opposite-class fallback is a separate path and must not be
             // reported as an exact-class hit/miss.
@@ -480,6 +555,11 @@ inline RegionHead *GlobalHeap::allocate_region_impl(
         }
         if (candidate == nullptr) {
             return nullptr;
+        }
+        if (simple_region_heat::local_resident_enabled()) {
+            simple_region_heat::sync_supply_placement(
+                reinterpret_cast<uintptr_t>(candidate), candidate->bin,
+                placement == RegionPlacement::Resident);
         }
         ASSERT(candidate->placement_class_matches(placement));
         const int64_t region_free =
@@ -526,6 +606,11 @@ inline RegionHead *GlobalHeap::allocate_region_impl(
     }
 
     RegionPlacement actual_placement = requested_placement;
+    if (simple_region_heat::local_resident_enabled() &&
+        (actual_placement == RegionPlacement::Unclassified ||
+         actual_placement == RegionPlacement::Mixed)) {
+        actual_placement = RegionPlacement::Streaming;
+    }
     bool reserved_new_resident_region = false;
     if (actual_placement == RegionPlacement::Resident) {
         size_t observed =
@@ -553,13 +638,57 @@ inline RegionHead *GlobalHeap::allocate_region_impl(
     if (simple_region_budget::six_enabled() &&
         simple_region_heat::local_routing_enabled()) {
         const uint8_t requested_class =
-            simple_region_heat::normalize_class(requested_behavior_group_id);
-        const auto order = simple_region_heat::fallback_order(requested_class);
-        for (size_t i = 1; i < simple_region_budget::classes(); ++i) {
+            simple_region_heat::local_resident_enabled()
+                ? simple_region_heat::class_for_placement(
+                      actual_placement == RegionPlacement::Resident,
+                      static_cast<uint8_t>(requested_behavior_group_id % 3))
+                : simple_region_heat::normalize_class(
+                      requested_behavior_group_id);
+        const auto order = simple_region_heat::local_resident_enabled()
+                               ? simple_region_heat::local_fallback_order(
+                                     requested_class)
+                               : simple_region_heat::fallback_order(
+                                     requested_class);
+        const size_t class_count = simple_region_heat::local_resident_enabled()
+                                       ? 3
+                                       : simple_region_budget::classes();
+        for (size_t i = 1; i < class_count; ++i) {
             region = pop_usable(actual_placement, "usable.class_fallback",
                                 order[i]);
-            if (region != nullptr) return region;
+            if (region != nullptr) {
+                if (reserved_new_resident_region) {
+                    account_region_release(RegionPlacement::Resident);
+                    reserved_new_resident_region = false;
+                }
+                return region;
+            }
         }
+    }
+
+    // If the resident budget selected Streaming as the effective fresh
+    // placement, consume an already-public Resident alternative before
+    // committing a new Streaming Region. This keeps public fallback ahead of
+    // fresh supply and preserves the actual R/S placement invariant.
+    if (simple_region_heat::local_resident_enabled() &&
+        actual_placement != requested_placement &&
+        (requested_placement == RegionPlacement::Resident ||
+         requested_placement == RegionPlacement::Streaming)) {
+        start_fallback(requested_placement, actual_placement);
+        const uint8_t requested_class =
+            simple_region_heat::class_for_placement(
+                requested_placement == RegionPlacement::Resident,
+                static_cast<uint8_t>(requested_behavior_group_id % 3));
+        const auto order = simple_region_heat::local_fallback_order(
+            requested_class);
+        for (size_t i = 0; i < 3; ++i) {
+            region = pop_usable(requested_placement,
+                                "usable.requested_before_fresh", order[i]);
+            if (region != nullptr) {
+                record_fallback_success(region->free_size());
+                return region;
+            }
+        }
+        active_fallback_direction = -1;
     }
 
     region = static_cast<RegionHead *>(free_region_list.pop());
@@ -575,15 +704,26 @@ inline RegionHead *GlobalHeap::allocate_region_impl(
         }
 #endif
         sub_free_size(RegionSize);
+        if (simple_region_heat::local_resident_enabled())
+            simple_region_heat::release_supply(
+                reinterpret_cast<uintptr_t>(region));
         region->init(bin, allocate_placement_epoch(), true);
         if (simple_region_heat::local_routing_enabled())
             simple_region_heat::assign_supply_empty(
                 reinterpret_cast<uintptr_t>(region), bin,
-                simple_region_heat::normalize_class(
-                    requested_behavior_group_id));
+                simple_region_heat::local_resident_enabled()
+                    ? simple_region_heat::class_for_placement(
+                          actual_placement == RegionPlacement::Resident,
+                          static_cast<uint8_t>(requested_behavior_group_id % 3))
+                    : simple_region_heat::normalize_class(
+                          requested_behavior_group_id));
         region->claim_placement(actual_placement,
                                 bind_groups ? requested_group_id : 0,
                                 allocate_placement_epoch());
+        if (simple_region_heat::local_resident_enabled())
+            simple_region_heat::sync_supply_placement(
+                reinterpret_cast<uintptr_t>(region), bin,
+                actual_placement == RegionPlacement::Resident);
         if (!list_only_six::enabled())
             region->ensure_six_group(requested_behavior_group_id);
         if (!reserved_new_resident_region) {
@@ -611,11 +751,19 @@ retry_alloc:
         if (simple_region_heat::local_routing_enabled())
             simple_region_heat::assign_supply_empty(
                 reinterpret_cast<uintptr_t>(region), bin,
-                simple_region_heat::normalize_class(
-                    requested_behavior_group_id));
+                simple_region_heat::local_resident_enabled()
+                    ? simple_region_heat::class_for_placement(
+                          actual_placement == RegionPlacement::Resident,
+                          static_cast<uint8_t>(requested_behavior_group_id % 3))
+                    : simple_region_heat::normalize_class(
+                          requested_behavior_group_id));
         region->claim_placement(actual_placement,
                                 bind_groups ? requested_group_id : 0,
                                 allocate_placement_epoch());
+        if (simple_region_heat::local_resident_enabled())
+            simple_region_heat::sync_supply_placement(
+                reinterpret_cast<uintptr_t>(region), bin,
+                actual_placement == RegionPlacement::Resident);
         if (!list_only_six::enabled())
             region->ensure_six_group(requested_behavior_group_id);
         if (!reserved_new_resident_region) {
@@ -633,13 +781,30 @@ retry_alloc:
     if (simple_region_budget::six_enabled() &&
         simple_region_heat::local_routing_enabled()) {
         const uint8_t requested_class =
-            simple_region_heat::normalize_class(requested_behavior_group_id);
-        const auto order = simple_region_heat::fallback_order(requested_class);
-        for (size_t i = 1; i < simple_region_budget::classes(); ++i) {
+            simple_region_heat::local_resident_enabled()
+                ? simple_region_heat::class_for_placement(
+                      actual_placement == RegionPlacement::Resident,
+                      static_cast<uint8_t>(requested_behavior_group_id % 3))
+                : simple_region_heat::normalize_class(
+                      requested_behavior_group_id);
+        const auto order = simple_region_heat::local_resident_enabled()
+                               ? simple_region_heat::local_fallback_order(
+                                     requested_class)
+                               : simple_region_heat::fallback_order(
+                                     requested_class);
+        const size_t class_count = simple_region_heat::local_resident_enabled()
+                                       ? 3
+                                       : simple_region_budget::classes();
+        for (size_t i = 1; i < class_count; ++i) {
             if (auto *fallback = pop_usable(
                     actual_placement, "usable.class_fallback_after_fresh",
-                    order[i]))
+                    order[i])) {
+                if (reserved_new_resident_region) {
+                    account_region_release(RegionPlacement::Resident);
+                    reserved_new_resident_region = false;
+                }
                 return fallback;
+            }
         }
     } else if (simple_region_heat::local_routing_enabled()) {
         const auto opposite=simple_region_heat::normalize_class(requested_behavior_group_id)==simple_region_heat::kHot ? simple_region_heat::kCold : simple_region_heat::kHot;
@@ -659,13 +824,35 @@ retry_alloc:
                 ? RegionPlacement::Streaming
                 : RegionPlacement::Resident;
         start_fallback(requested_placement, fallback_placement);
-        region = pop_usable(fallback_placement,
-                            requested_placement == RegionPlacement::Resident
-                                ? "usable.resident_to_streaming_fallback"
-                                : "usable.streaming_to_resident_fallback");
-        if (region != nullptr) {
-            record_fallback_success(region->free_size());
-            return region;
+        if (simple_region_heat::local_resident_enabled()) {
+            const uint8_t requested_class =
+                simple_region_heat::class_for_placement(
+                    fallback_placement == RegionPlacement::Resident,
+                    static_cast<uint8_t>(requested_behavior_group_id % 3));
+            const auto order =
+                simple_region_heat::local_fallback_order(requested_class);
+            for (size_t i = 0; i < 3; ++i) {
+                region = pop_usable(
+                    fallback_placement,
+                    requested_placement == RegionPlacement::Resident
+                        ? "usable.resident_to_streaming_fallback"
+                        : "usable.streaming_to_resident_fallback",
+                    order[i]);
+                if (region != nullptr) {
+                    record_fallback_success(region->free_size());
+                    return region;
+                }
+            }
+        } else {
+            region = pop_usable(
+                fallback_placement,
+                requested_placement == RegionPlacement::Resident
+                    ? "usable.resident_to_streaming_fallback"
+                    : "usable.streaming_to_resident_fallback");
+            if (region != nullptr) {
+                record_fallback_success(region->free_size());
+                return region;
+            }
         }
     }
     return nullptr;
@@ -686,6 +873,9 @@ inline void GlobalHeap::return_back_region(RegionHead *region) {
 #endif
     if (region->is_empty()) [[unlikely]] {
         account_region_release(region->load_placement());
+        if (simple_region_heat::local_resident_enabled())
+            simple_region_heat::release_supply(
+                reinterpret_cast<uintptr_t>(region));
         region->reset_placement(allocate_placement_epoch());
         region->state.store(FREE, std::memory_order_relaxed);
         add_free_size((int64_t)RegionSize);
@@ -741,6 +931,9 @@ inline void GlobalHeap::publish_owned_evict_region(RegionHead *region) {
     if (region->is_empty()) [[unlikely]] {
         profile::count_evac_evict_region_to_free();
         account_region_release(region->load_placement());
+        if (simple_region_heat::local_resident_enabled())
+            simple_region_heat::release_supply(
+                reinterpret_cast<uintptr_t>(region));
         region->reset_placement(allocate_placement_epoch());
         region->state.store(FREE, std::memory_order::relaxed);
         add_free_size((int64_t)RegionSize);
@@ -824,6 +1017,9 @@ inline void GlobalHeap::requeue_evict_task(EvictTask &task) {
                 static_cast<int64_t>(current_free_size));
         }
         account_region_release(placement);
+        if (simple_region_heat::local_resident_enabled())
+            simple_region_heat::release_supply(
+                reinterpret_cast<uintptr_t>(region));
         region->reset_placement(allocate_placement_epoch());
         region->state.store(FREE, std::memory_order_release);
         free_region_list.push_dbg(region, "task.requeue.empty");
@@ -1376,6 +1572,10 @@ inline RegionReclassifyResult GlobalHeap::try_reclassify_hotness_region(
     region->placement.store(to, std::memory_order_release);
     region->placement_epoch.store(allocate_placement_epoch(),
                                   std::memory_order_release);
+    if (simple_region_heat::local_resident_enabled())
+        simple_region_heat::sync_supply_placement(
+            reinterpret_cast<uintptr_t>(region), region->bin,
+            to == RegionPlacement::Resident);
     region->profile_last_target_placement.store(
         static_cast<uint8_t>(to), std::memory_order_relaxed);
     region->profile_target_streak.store(0, std::memory_order_relaxed);
@@ -1642,6 +1842,13 @@ inline RegionExchangeResult GlobalHeap::try_exchange_hotness_regions(
                                 std::memory_order_release);
     hot_region->placement_epoch.store(allocate_placement_epoch(),
                                       std::memory_order_release);
+    if (simple_region_heat::local_resident_enabled()) {
+        simple_region_heat::sync_supply_placement(
+            reinterpret_cast<uintptr_t>(cold_region), cold_region->bin,
+            false);
+        simple_region_heat::sync_supply_placement(
+            reinterpret_cast<uintptr_t>(hot_region), hot_region->bin, true);
+    }
     hot_region->profile_last_target_placement.store(
         static_cast<uint8_t>(RegionPlacement::Resident),
         std::memory_order_relaxed);
@@ -1766,6 +1973,10 @@ inline size_t GlobalHeap::reclassify_region_placement_group(
         region->placement.store(to, std::memory_order_release);
         region->placement_epoch.store(allocate_placement_epoch(),
                                       std::memory_order_release);
+        if (simple_region_heat::local_resident_enabled())
+            simple_region_heat::sync_supply_placement(
+                reinterpret_cast<uintptr_t>(region), region->bin,
+                to == RegionPlacement::Resident);
         region->unlock_placement();
         ++changed;
     }
@@ -2720,6 +2931,9 @@ inline void GlobalHeap::process_evict_task(EvictTask &task, Fn &&fn,
     if (region->is_empty()) {
         profile::count_evac_evict_region_to_free();
         account_region_release(region->load_placement());
+        if (simple_region_heat::local_resident_enabled())
+            simple_region_heat::release_supply(
+                reinterpret_cast<uintptr_t>(region));
         region->reset_placement(allocate_placement_epoch());
         region->state.store(FREE, std::memory_order::relaxed);
         int64_t delta = (int64_t)RegionSize - (int64_t)origin_free_size;
@@ -2885,6 +3099,9 @@ inline size_t GlobalHeap::evict_list(Fn &&fn, RegionList &list,
         bool new_slots_published = false;
         if (region->is_empty()) {
             account_region_release(region->load_placement());
+            if (simple_region_heat::local_resident_enabled())
+                simple_region_heat::release_supply(
+                    reinterpret_cast<uintptr_t>(region));
             region->reset_placement(allocate_placement_epoch());
             region->state.store(FREE, std::memory_order::relaxed);
             int64_t delta = (int64_t)RegionSize - (int64_t)origin_free_size;

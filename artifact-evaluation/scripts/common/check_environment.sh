@@ -122,7 +122,15 @@ need_library 'Boost program_options' boost_program_options
 need_file 'OpenSSL header' /usr/include/openssl/ssl.h /usr/local/include/openssl/ssl.h
 need_library 'OpenSSL crypto' crypto
 optional_file 'PAPI header (optional)' /usr/include/papi.h /usr/local/include/papi.h
-optional_file 'ISA-L header (optional)' /usr/include/isa-l.h /usr/local/include/isa-l.h
+if [[ "$SYSTEM" = hydra ]]; then
+  need_file 'ISA-L header' \
+    /usr/include/isa-l/erasure_code.h /usr/local/include/isa-l/erasure_code.h
+  need_library 'ISA-L' isal
+else
+  optional_file 'ISA-L header (optional)' \
+    /usr/include/isa-l/erasure_code.h /usr/local/include/isa-l/erasure_code.h \
+    /usr/include/isa-l.h /usr/local/include/isa-l.h
+fi
 
 if [[ -z "${HDR_HISTOGRAM_PREFIX:-}" && -d "$ROOT/deps/hdr-histogram/install" ]]; then
   export HDR_HISTOGRAM_PREFIX="$ROOT/deps/hdr-histogram/install"
@@ -145,7 +153,7 @@ if [[ -z "${LIBFIBRE_DIR:-}" && -f "$ROOT/deps/libfibre/src/libfibre.so" ]]; the
   export LIBFIBRE_DIR="$ROOT/deps/libfibre"
 fi
 if [[ -n "${LIBFIBRE_DIR:-}" ]]; then
-  need_file 'libfibre shared library' "$LIBFIBRE_DIR/src/libfibre.so" "$LIBFIBRE_DIR/src/libfibre.so.0" "$LIBFIBRE_DIR/src/libfibre.a"
+  need_file 'libfibre shared library' "$LIBFIBRE_DIR/src/libfibre.so" "$LIBFIBRE_DIR/src/libfibre.so.0"
   need_file 'libfibre header' "$LIBFIBRE_DIR/src/libfibre/Fibre.h"
 else
   fail 'libfibre missing: run scripts/common/setup_environment.sh or set LIBFIBRE_DIR'
@@ -154,11 +162,12 @@ fi
 if [[ "$MODE" = run || "$MODE" = full ]]; then
   need_cmd ssh
   need_cmd scp
+  need_cmd ss
   need_cmd ibv_devinfo
   optional_cmd ibdev2netdev
-  optional_cmd numactl
+  need_cmd numactl
   optional_cmd taskset
-  optional_cmd ip
+  need_cmd ip
   if [[ -z "${STARFISH_SERVER_HOST:-}" && "${STARFISH_NO_SERVER:-0}" != 1 ]]; then
     warn 'STARFISH_SERVER_HOST is unset; a run must provide a server or use STARFISH_NO_SERVER=1'
   fi

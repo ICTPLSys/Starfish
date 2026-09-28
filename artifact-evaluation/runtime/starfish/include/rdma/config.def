@@ -43,6 +43,15 @@ CONFIG(size_t, stripe_size_bytes, 0)
 //            batches objects and tracks completion of all segment writes.
 // ---------------------------------------------------------------------------
 CONFIG(std::string, ft_method, "none")  // none | sponge | ec_batch
+// Opt-in semantic-six, size-class whole-object RS(4,2) backend. One feature
+// switch; endpoint, cache and memory budgets remain ordinary configuration.
+CONFIG(bool, behavior_group, false)
+// Opt-in transactional dead-slot reuse for size-classed KV EC. MG split and
+// the established immutable ec_batch path remain unchanged by default.
+CONFIG(bool, ft_incremental_update, false)
+// Keep the original participant RPC implementation available. Opt-in worker
+// RMW uses only one-sided RDMA; both endpoints must parse the same config.
+CONFIG(bool, ft_incremental_one_sided, false)
 CONFIG(size_t, ft_small_object_cutoff, 4096)
 // Shard size of one EC shard.  Must equal the library's region size
 // (include/cache/region_based_allocator.hpp: RegionSize == 256 KiB); the

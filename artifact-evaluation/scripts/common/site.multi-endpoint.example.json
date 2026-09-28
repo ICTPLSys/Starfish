@@ -1,0 +1,11 @@
+{
+  "name": "six-memory-endpoint-example",
+  "memory_endpoints": [
+    {"ip": "192.0.2.20", "server_port": 1400},
+    {"ip": "192.0.2.20", "server_port": 1401},
+    {"ip": "192.0.2.20", "server_port": 1402},
+    {"ip": "192.0.2.20", "server_port": 1403},
+    {"ip": "192.0.2.20", "server_port": 1404},
+    {"ip": "192.0.2.20", "server_port": 1405}
+  ]
+}

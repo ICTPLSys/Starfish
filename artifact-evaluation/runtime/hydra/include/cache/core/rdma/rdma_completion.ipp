@@ -639,17 +639,7 @@ retry:
         auto expected = lock_state;
         uint32_t finalize_retry_count = 0;
         while (true) {
-            request_interval_diag::Stamp local_before{};
-            if (request_interval_diag::completion_context.active) {
-                local_before = request_interval_diag::ordered_stamp();
-            }
             if (entry.cas_state_strong(expected, new_state)) {
-                request_interval_diag::Stamp local_after{};
-                if (request_interval_diag::completion_context.active) {
-                    local_after = request_interval_diag::ordered_stamp();
-                    request_interval_diag::local_published(
-                        wc.wr_id, local_before, local_after);
-                }
                 break;
             }
             const bool retryable =
@@ -673,20 +663,12 @@ retry:
             ++finalize_retry_count;
         }
 
-        // Sparse observer timestamp after the LOCAL state is published.  The
-        // requesting fibre may resume before the remote accounting below ends.
-        read_supply_timeline::record_lifecycle_local(wc.wr_id);
-
         if (retain_backup) {
             return;
         }
 
         auto free_start = get_cycles();
-        {
-            scope_diag::Guard remote_free_guard(fibre_self(),
-                                                scope_diag::REMOTE_FREE);
-            remote_allocator.deallocate(old_remote);
-        }
+        remote_allocator.deallocate(old_remote);
         auto remote_free_cycles = get_cycles() - free_start;
         profile::count_excl_remote_free_on_fetch_cycles(remote_free_cycles);
         profile::count_excl_remote_free_on_fetch(obj.size);
@@ -699,7 +681,6 @@ retry:
         auto new_state = old_state;
         new_state.state = LOCAL;
         if (!entry.cas_state_weak(old_state, new_state)) goto retry;
-        read_supply_timeline::record_lifecycle_local(wc.wr_id);
     }
 }
 

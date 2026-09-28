@@ -1,5 +1,4 @@
 #include "cache/cache.hpp"
-
 #include <sys/cdefs.h>
 
 #include <algorithm>
@@ -704,6 +703,11 @@ private:
         size_t bin, cache::far_obj_t obj, cache::DereferenceScope *scope,
         RegionPlacement requested_placement, uint32_t requested_group_id,
         uint32_t requested_behavior_group_id, bool pin_publication) {
+        if (simple_region_heat::local_resident_enabled()) {
+            return allocate_local_resident_block(
+                bin, obj, scope, requested_placement, requested_group_id,
+                requested_behavior_group_id, pin_publication);
+        }
         // Hot/cold grouping is deliberately the small list-only variant.  It
         // does not participate in placement or in the fixed-six registry;
         // all local capacity is held in the semantic-class slots under the
@@ -988,6 +992,299 @@ private:
         }
     }
 
+    // Resident-mapped simple routing keeps the measured dirty class (Low,
+    // Medium, or High) as the modulo-three class and uses the physical Region
+    // placement as its high-band bit.  This path deliberately uses the same
+    // bounded private-slot matrix as the legacy Hot/Cold allocator, but never
+    // turns a Resident request into an Unclassified allocation.
+    BlockHead *allocate_local_resident_block(
+        size_t bin, cache::far_obj_t obj, cache::DereferenceScope *scope,
+        RegionPlacement requested_placement, uint32_t requested_group_id,
+        uint32_t requested_behavior_group_id, bool pin_publication) {
+        constexpr size_t kDirtyClassCount = 3;
+        constexpr size_t kMaxDetached = 2 * SixGroupSlotCount;
+
+        auto normalize_placement = [&](RegionPlacement placement) {
+            if (placement == RegionPlacement::Resident ||
+                placement == RegionPlacement::Streaming) {
+                return placement;
+            }
+            // Resident-mapped mode is only admitted with placement enabled.
+            // A caller that has no placement hint is conservatively routed to
+            // Streaming; this keeps its supply band and its Region placement
+            // consistent instead of manufacturing a third local class.
+            return RegionPlacement::Streaming;
+        };
+        const RegionPlacement requested =
+            normalize_placement(requested_placement);
+        const uint8_t dirty_class = static_cast<uint8_t>(
+            requested_behavior_group_id % kDirtyClassCount);
+        auto class_for = [&](RegionPlacement placement) {
+            return simple_region_heat::class_for_placement(
+                placement == RegionPlacement::Resident, dirty_class);
+        };
+        auto class_order = [&](RegionPlacement placement) {
+            return simple_region_heat::local_fallback_order(
+                class_for(placement));
+        };
+        auto placement_order = [&] {
+            std::array<RegionPlacement, 2> order{requested, requested};
+            size_t count = 1;
+            if (global_heap.region_placement_is_enabled() &&
+                !global_heap.can_allocate_region_directly_now(bin,
+                                                               requested)) {
+                order[count++] = requested == RegionPlacement::Resident
+                                     ? RegionPlacement::Streaming
+                                     : RegionPlacement::Resident;
+            }
+            return std::pair{order, count};
+        };
+        auto retry_current = [&] {
+            return current().allocate_local_resident_block(
+                bin, obj, scope, requested_placement, requested_group_id,
+                requested_behavior_group_id, pin_publication);
+        };
+        auto return_detached = [&](RegionHead *region, bool full) {
+            if (full && thread_heap_full_return_batch_enabled()) {
+                return_full_region_batched(region);
+            } else {
+                return_region(region);
+            }
+            thread_heap_diag_registry().region_returns.fetch_add(
+                1, std::memory_order_relaxed);
+        };
+
+        // Region placement transitions are serialized by the global
+        // placement lock while a descriptor is public. A private descriptor
+        // therefore only needs a bounded class/placement rebucket here; the
+        // check also repairs stale private epochs before a slot is reused.
+        auto rebucket_slots = [&](RegionPlacement placement,
+                                  RegionHead **slots,
+                                  RegionHead **detached,
+                                  bool *detached_full,
+                                  size_t &detached_count) {
+            auto queue = [&](RegionHead *region, bool full) {
+                if (region == nullptr) return;
+                for (size_t i = 0; i < detached_count; ++i) {
+                    if (detached[i] == region) return;
+                }
+                assert(detached_count < kMaxDetached);
+                detached[detached_count] = region;
+                detached_full[detached_count] = full;
+                ++detached_count;
+            };
+
+            RegionHead *held[SixGroupSlotCount]{};
+            for (size_t slot = 0; slot < SixGroupSlotCount; ++slot) {
+                held[slot] = slots[slot];
+                slots[slot] = nullptr;
+            }
+            RegionHead *seen[SixGroupSlotCount]{};
+            size_t seen_count = 0;
+            for (RegionHead *region : held) {
+                if (region == nullptr) continue;
+                bool duplicate = false;
+                for (size_t i = 0; i < seen_count; ++i)
+                    duplicate |= seen[i] == region;
+                if (duplicate) continue;
+                assert(seen_count < SixGroupSlotCount);
+                seen[seen_count++] = region;
+                if (region->bin != bin ||
+                    !region->placement_class_matches(placement)) {
+                    thread_heap_diag_registry().slot_placement_mismatches
+                        .fetch_add(1, std::memory_order_relaxed);
+                    queue(region, !region->can_allocate());
+                    continue;
+                }
+                size_t actual_class =
+                    simple_region_heat::normalize_class(
+                        simple_region_heat::allocation_class_for(
+                            reinterpret_cast<uintptr_t>(region)));
+                const bool resident = placement == RegionPlacement::Resident;
+                const bool class_in_band =
+                    resident ? actual_class >= 3 && actual_class < 6
+                             : actual_class < 3;
+                if (!class_in_band) {
+                    simple_region_heat::sync_supply_placement(
+                        reinterpret_cast<uintptr_t>(region), region->bin,
+                        resident);
+                    actual_class = simple_region_heat::normalize_class(
+                        simple_region_heat::allocation_class_for(
+                            reinterpret_cast<uintptr_t>(region)));
+                }
+                if (actual_class >= SixGroupSlotCount ||
+                    (resident ? actual_class < 3 : actual_class >= 3)) {
+                    queue(region, !region->can_allocate());
+                    continue;
+                }
+                if (slots[actual_class] == nullptr) {
+                    slots[actual_class] = region;
+                } else {
+                    queue(region, !region->can_allocate());
+                }
+            }
+        };
+
+        for (;;) {
+            const auto [placements, placement_count] = placement_order();
+            RegionHead *detached[kMaxDetached]{};
+            bool detached_full[kMaxDetached]{};
+            size_t detached_count = 0;
+            BlockHead *block = nullptr;
+
+            // A fibre-local heap has one owner, so the common path remains
+            // lock-free with respect to the management lock. Native callers
+            // use the existing lock to protect the slot matrix.
+            const bool management_lock = owner_fibre == nullptr;
+            if (management_lock) lock_regions();
+            for (size_t p = 0; p < placement_count && block == nullptr; ++p) {
+                auto &slots = six_group_regions[placement_index(placements[p])]
+                                               [bin];
+                rebucket_slots(placements[p], slots, detached, detached_full,
+                               detached_count);
+                if (detached_count != 0) continue;
+
+                const auto order = class_order(placements[p]);
+                for (size_t i = 0; i < kDirtyClassCount; ++i) {
+                    const size_t slot = order[i];
+                    RegionHead *region = slots[slot];
+                    if (region == nullptr) continue;
+                    block = region->allocate(obj, pin_publication);
+                    if (block != nullptr) {
+                        if (slot != class_for(requested))
+                            ++six_group_fallback_allocations;
+                        break;
+                    }
+                    slots[slot] = nullptr;
+                    assert(detached_count < kMaxDetached);
+                    detached[detached_count] = region;
+                    detached_full[detached_count] = true;
+                    ++detached_count;
+                    thread_heap_diag_registry().slot_exhaustions.fetch_add(
+                        1, std::memory_order_relaxed);
+                    break;
+                }
+            }
+            if (management_lock) unlock_regions();
+
+            for (size_t i = 0; i < detached_count; ++i)
+                return_detached(detached[i], detached_full[i]);
+            if (detached_count != 0) {
+                if (&current() != this) return retry_current();
+                continue;
+            }
+            if (block != nullptr) return block;
+
+            auto &diag = thread_heap_diag_registry();
+            scope_diag::refill(fibre_self());
+            const uint64_t global_alloc_start = get_cycles();
+            RegionHead *candidate = global_heap.allocate_region(
+                bin, requested, requested_group_id, class_for(requested));
+            diag.global_region_alloc_calls.fetch_add(
+                1, std::memory_order_relaxed);
+            diag.global_region_alloc_cycles.fetch_add(
+                get_cycles() - global_alloc_start,
+                std::memory_order_relaxed);
+            if (candidate != nullptr)
+                diag.region_acquires.fetch_add(1, std::memory_order_relaxed);
+
+            Cache *cache = Cache::get_default();
+            const bool evacuator_waiting =
+                cache != nullptr && cache->evacuator_waiting();
+            const bool memory_low = global_heap.need_evacuate(false);
+            if (candidate == nullptr ||
+                (evacuator_waiting &&
+                 diag.full_return_pending_current.load(
+                     std::memory_order_relaxed) != 0)) {
+                flush_all_thread_heap_pending_full_returns();
+                if (candidate == nullptr) global_heap.drain_async_full_returns(64);
+            }
+            if (memory_low || evacuator_waiting) [[unlikely]] {
+                const uint64_t memory_low_start = get_cycles();
+                diag.memory_low_calls.fetch_add(1, std::memory_order_relaxed);
+                diag.memory_low_free_calls.fetch_add(
+                    memory_low, std::memory_order_relaxed);
+                diag.memory_low_evacuator_calls.fetch_add(
+                    evacuator_waiting, std::memory_order_relaxed);
+                global_heap.on_memory_low();
+                if (cache != nullptr && scope != nullptr)
+                    cache->update_scope(*scope);
+                diag.memory_low_cycles.fetch_add(
+                    get_cycles() - memory_low_start,
+                    std::memory_order_relaxed);
+            }
+
+            if (&current() != this) [[unlikely]] {
+                if (candidate == nullptr) return retry_current();
+                candidate->state.store(IN_USE, std::memory_order_relaxed);
+                diag.migrated_candidate_returns.fetch_add(
+                    1, std::memory_order_relaxed);
+                return_region(candidate);
+                diag.region_returns.fetch_add(1, std::memory_order_relaxed);
+                return retry_current();
+            }
+            if (candidate == nullptr) return nullptr;
+
+            candidate->state.store(IN_USE, std::memory_order_relaxed);
+            const RegionPlacement actual = candidate->load_placement();
+            size_t candidate_class = simple_region_heat::normalize_class(
+                simple_region_heat::allocation_class_for(
+                    reinterpret_cast<uintptr_t>(candidate)));
+            if (actual == RegionPlacement::Resident && candidate_class < 3) {
+                simple_region_heat::sync_supply_placement(
+                    reinterpret_cast<uintptr_t>(candidate), candidate->bin,
+                    true);
+                candidate_class = simple_region_heat::normalize_class(
+                    simple_region_heat::allocation_class_for(
+                        reinterpret_cast<uintptr_t>(candidate)));
+            } else if (actual == RegionPlacement::Streaming &&
+                       candidate_class >= 3) {
+                simple_region_heat::sync_supply_placement(
+                    reinterpret_cast<uintptr_t>(candidate), candidate->bin,
+                    false);
+                candidate_class = simple_region_heat::normalize_class(
+                    simple_region_heat::allocation_class_for(
+                        reinterpret_cast<uintptr_t>(candidate)));
+            }
+            if ((actual != RegionPlacement::Resident &&
+                 actual != RegionPlacement::Streaming) ||
+                candidate_class >= SixGroupSlotCount ||
+                (actual == RegionPlacement::Resident
+                     ? candidate_class < 3
+                     : candidate_class >= 3)) {
+                return_detached(candidate, !candidate->can_allocate());
+                if (&current() != this) return retry_current();
+                continue;
+            }
+
+            auto &candidate_slots =
+                six_group_regions[placement_index(actual)][bin];
+            const bool candidate_management_lock = owner_fibre == nullptr;
+            if (candidate_management_lock) lock_regions();
+            if (candidate_slots[candidate_class] != nullptr) {
+                if (candidate_management_lock) unlock_regions();
+                diag.prevented_slot_overwrites.fetch_add(
+                    1, std::memory_order_relaxed);
+                return_region(candidate);
+                diag.region_returns.fetch_add(1, std::memory_order_relaxed);
+                if (&current() != this) return retry_current();
+                continue;
+            }
+            candidate_slots[candidate_class] = candidate;
+            block = candidate->allocate(obj, pin_publication);
+            if (block == nullptr) candidate_slots[candidate_class] = nullptr;
+            if (candidate_management_lock) unlock_regions();
+            if (block != nullptr) {
+                record_fallback_slot_allocation(requested, actual, bin);
+                return block;
+            }
+            thread_heap_diag_registry().slot_exhaustions.fetch_add(
+                1, std::memory_order_relaxed);
+            return_detached(candidate, true);
+            if (&current() != this) return retry_current();
+        }
+    }
+
     BlockHead *allocate_six_group_block(
         size_t bin, cache::far_obj_t obj, cache::DereferenceScope *scope,
         RegionPlacement requested_placement, uint32_t placement_group,
@@ -1097,8 +1394,7 @@ private:
                         auto *record = region->six_record.load(
                             std::memory_order_acquire);
                         if (record == nullptr) continue;
-                        std::lock_guard<std::mutex> routing_guard(
-                            record->routing_mutex);
+                        std::lock_guard<std::mutex> routing_guard(record->routing_mutex);
                         if (six_group::group_of(record) != requested_group) {
                             continue;
                         }
@@ -1356,8 +1652,7 @@ private:
                 auto *record = candidate->six_record.load(
                     std::memory_order_acquire);
                 if (record != nullptr) {
-                    std::lock_guard<std::mutex> routing_guard(
-                        record->routing_mutex);
+                    std::lock_guard<std::mutex> routing_guard(record->routing_mutex);
                     if (six_group::group_of(record) == allocation_group) {
                         block = candidate->allocate(obj, pin_publication);
                     }

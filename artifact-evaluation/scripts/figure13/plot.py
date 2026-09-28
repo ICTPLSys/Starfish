@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Plot evaluation failure recovery from explicit CSV data."""
+"""Plot evaluation failure recovery from final logs or explicit CSV data."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import hashlib
+import json
 import math
 from pathlib import Path
 import sys
 
+sys.dont_write_bytecode = True
+
 SCRIPTS = Path(__file__).resolve().parents[1]
 AE_ROOT = SCRIPTS.parent
+sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "common"))
 from plotting import SYSTEM_STYLES, export_figure, get_pyplot, read_csv
 
@@ -35,10 +39,35 @@ def check_source(row, source_type):
 
 
 def prepare(recovery_csv: Path, throughput_csv: Path, source_type="measured"):
-    if source_type not in SOURCE_TYPES:
-        raise ValueError(f"unknown source type: {source_type}")
     recovery_rows, recovery_digest = read_csv(recovery_csv, RECOVERY_FIELDS)
     trace_rows, trace_digest = read_csv(throughput_csv, TRACE_FIELDS)
+    return prepare_rows(recovery_rows, trace_rows, recovery_digest, trace_digest,
+                        str(recovery_csv.resolve()), str(throughput_csv.resolve()), source_type)
+
+
+def prepare_logs(logs_root: Path, *, pattern="*.log", ratio=25, repeat=1,
+                 trace_scenario="1-node", failure_at_s=20.0):
+    from figure13.collect import collect_rows
+    recovery, trace, info = collect_rows(
+        logs_root, pattern=pattern, ratio=ratio, repeat=repeat,
+        trace_scenario=trace_scenario, failure_at_s=failure_at_s)
+    def digest(rows):
+        return hashlib.sha256(json.dumps(
+            rows, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    name = str(logs_root.resolve())
+    data = prepare_rows(list(enumerate(recovery, 1)), list(enumerate(trace, 1)),
+                        digest(recovery), digest(trace), name, name, "measured")
+    data.update(info)
+    data.update(input_format="figure13_result_and_sample_logs",
+                input_hash_scope="canonical_collected_rows", log_pattern=pattern,
+                collected_recovery_rows=recovery, collected_throughput_rows=trace)
+    return data
+
+
+def prepare_rows(recovery_rows, trace_rows, recovery_digest, trace_digest,
+                 recovery_name, trace_name, source_type="measured"):
+    if source_type not in SOURCE_TYPES:
+        raise ValueError(f"unknown source type: {source_type}")
     recovery = {}
     blank_recovery = []
     for line, row in recovery_rows:
@@ -65,6 +94,7 @@ def prepare(recovery_csv: Path, throughput_csv: Path, source_type="measured"):
     events = {"failure": None, "recovered": {}}
     seen_samples = set()
     reference_ops_per_s = None
+    time_alignment = None
     for line, row in trace_rows:
         try:
             system = row["system"].lower()
@@ -83,9 +113,17 @@ def prepare(recovery_csv: Path, throughput_csv: Path, source_type="measured"):
             elif not math.isclose(denominator, reference_ops_per_s,
                                   rel_tol=1e-9, abs_tol=1e-9):
                 raise ValueError("all series must use one normalization denominator")
+            alignment = row.get("time_alignment") or "work_start"
+            if alignment not in ("work_start", "failure_aligned"):
+                raise ValueError("unknown time_alignment")
+            if time_alignment is None:
+                time_alignment = alignment
+            elif alignment != time_alignment:
+                raise ValueError("mixed trace time alignments")
             elapsed = float(row["elapsed_s"])
-            if not math.isfinite(elapsed) or elapsed < 0:
-                raise ValueError("elapsed_s must be finite and nonnegative")
+            if (not math.isfinite(elapsed)
+                    or (elapsed < 0 and alignment != "failure_aligned")):
+                raise ValueError("negative elapsed_s requires explicit failure_aligned coordinates")
             if event == "failure":
                 if system != "all" or events["failure"] is not None:
                     raise ValueError("one global failure event requires system=all")
@@ -102,6 +140,9 @@ def prepare(recovery_csv: Path, throughput_csv: Path, source_type="measured"):
                 if row["throughput_ops_per_s"]:
                     raise ValueError("a global event cannot carry a throughput sample")
                 continue
+            if event == "recovered" and not row["throughput_ops_per_s"]:
+                # Event-only annotations are not missing throughput samples.
+                continue
             key = system, elapsed
             if key in seen_samples:
                 raise ValueError(f"duplicate throughput sample: {key}")
@@ -114,6 +155,8 @@ def prepare(recovery_csv: Path, throughput_csv: Path, source_type="measured"):
                     raise ValueError("throughput_ops_per_s must be finite and nonnegative")
                 check_source(row, source_type)
                 value = raw / denominator
+                if not math.isfinite(value):
+                    raise ValueError("nonfinite normalized throughput")
             traces[system].append({"elapsed_s": elapsed,
                                    "throughput_ops_per_s": raw,
                                    "normalized_throughput": value,
@@ -127,11 +170,12 @@ def prepare(recovery_csv: Path, throughput_csv: Path, source_type="measured"):
             if recovered_at <= events["failure"]:
                 raise ValueError(f"{system} recovered before/at failure")
     return {"figure": "figure13", "source_type": source_type,
-            "recovery_input": str(recovery_csv.resolve()),
+            "recovery_input": recovery_name,
             "recovery_sha256": recovery_digest, "recovery_rows": len(recovery_rows),
-            "throughput_input": str(throughput_csv.resolve()),
+            "throughput_input": trace_name,
             "throughput_sha256": trace_digest, "throughput_rows": len(trace_rows),
             "normalization": NORMALIZATION,
+            "time_alignment": time_alignment,
             "reference_ops_per_s": reference_ops_per_s,
             "recovery": {"/".join(key): value for key, value in recovery.items()},
             "missing_recovery": [[scenario, system] for scenario in SCENARIOS
@@ -237,15 +281,33 @@ def draw(data):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--recovery-csv", required=True, type=Path)
-    parser.add_argument("--throughput-csv", required=True, type=Path)
+    parser.add_argument("--recovery-csv", type=Path)
+    parser.add_argument("--throughput-csv", type=Path)
+    parser.add_argument("--logs-root", type=Path, help="read Figure 13 result/sample logs directly")
+    parser.add_argument("--pattern", default="*.log", help="log filename glob in log mode")
+    parser.add_argument("--ratio", type=int, default=25, help="local-memory percentage in log mode")
+    parser.add_argument("--repeat", type=int, default=1, help="one repeat in log mode")
+    parser.add_argument("--trace-scenario", choices=SCENARIOS, default="1-node")
+    parser.add_argument("--failure-at-s", type=float, default=20,
+                        help="display coordinate for aligned failures; never injection time")
     parser.add_argument("--output-dir", type=Path,
                         default=AE_ROOT / "results/figures/figure13")
     parser.add_argument("--source-type", choices=sorted(SOURCE_TYPES), default="measured")
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     try:
-        data = prepare(args.recovery_csv, args.throughput_csv, args.source_type)
+        if args.logs_root is not None:
+            if args.recovery_csv is not None or args.throughput_csv is not None:
+                parser.error("use --logs-root or the two CSV inputs, not both")
+            if args.source_type != "measured":
+                raise ValueError("--logs-root accepts measured records only")
+            data = prepare_logs(
+                args.logs_root, pattern=args.pattern, ratio=args.ratio, repeat=args.repeat,
+                trace_scenario=args.trace_scenario, failure_at_s=args.failure_at_s)
+        else:
+            if args.recovery_csv is None or args.throughput_csv is None:
+                parser.error("supply --logs-root or both --recovery-csv and --throughput-csv")
+            data = prepare(args.recovery_csv, args.throughput_csv, args.source_type)
         if args.validate_only:
             print(f"validated {data['recovery_rows']} recovery and "
                   f"{data['throughput_rows']} throughput rows")
@@ -260,7 +322,7 @@ def main(argv=None):
         finally:
             get_pyplot().close(fig)
         return 0
-    except (OSError, UnicodeError, csv.Error, ValueError, RuntimeError) as exc:
+    except (OSError, UnicodeError, csv.Error, ValueError, RuntimeError, OverflowError) as exc:
         parser.exit(2, f"error: {exc}\n")
 
 

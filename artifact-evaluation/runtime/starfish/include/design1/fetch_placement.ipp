@@ -1,5 +1,7 @@
 #pragma once
 
+#include <mutex>
+
 namespace FarLib::cache {
 
 inline ::FarLib::allocator::RegionPlacement

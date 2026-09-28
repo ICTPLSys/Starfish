@@ -41,7 +41,7 @@ option(FARLIB_BUILD_TESTS "Build FarLib tests" OFF)
 option(FARLIB_BUILD_MG "Build the MG application" OFF)
 option(FARLIB_BUILD_DIAGNOSTICS "Build manual Hydra benchmarks and RDMA checks" OFF)
 option(FARLIB_BUILD_WORDCOUNT
-       "Build the optional recomputable/recipe Wordcount targets" OFF)
+       "Build the Wordcount application" OFF)
 
 # This macro changes ConcurrentArrayCache layout. Keep runtime and every
 # header consumer on the same numeric value, including standalone diagnostics.
@@ -123,6 +123,7 @@ if(FARLIB_BUILD_MG)
     add_subdirectory("${FARLIB_APPS_DIR}/mg" "${CMAKE_CURRENT_BINARY_DIR}/apps/mg")
 endif()
 if(FARLIB_BUILD_WORDCOUNT)
+    set(FARLIB_WORDCOUNT_STARFISH_RUNTIME OFF)
     if(NOT EXISTS "${FARLIB_APPS_DIR}/wordcount/CMakeLists.txt")
         message(FATAL_ERROR "Missing optional Wordcount application sources")
     endif()

@@ -1406,15 +1406,6 @@ void error_usage(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     Configure config;
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    for (int c = 24; c < 24 + 16; c++) {
-        CPU_SET(c, &mask);
-    }
-    if (sched_setaffinity(0, sizeof(mask), &mask) == -1) {
-        perror("sched failed!\n");
-        exit(EXIT_FAILURE);
-    }
 #ifdef STANDALONE
     constexpr size_t FAR_ARGC = 0;
     config.server_addr = "127.0.0.1";

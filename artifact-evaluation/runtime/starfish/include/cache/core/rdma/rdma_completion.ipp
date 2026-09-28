@@ -1,5 +1,6 @@
 #pragma once
 #include "cache/concurrent_cache.hpp"
+#include "design2/eviction_commit.hpp"
 
 namespace FarLib::cache {
 
@@ -60,7 +61,10 @@ inline bool release_normal_read_pin(uint64_t wr_id) {
     const auto identity = decode_normal_read_wr_id(wr_id, false);
     auto *block = identity.block;
     if (block == nullptr || !identity.tagged) return false;
-    while (block->rdma_read_pin_lock.test_and_set(std::memory_order_acquire)) {
+    if (block->rdma_read_pin_lock.test_and_set(std::memory_order_acquire)) {
+        while (block->rdma_read_pin_lock.test_and_set(
+            std::memory_order_acquire)) {
+        }
     }
     const uint16_t current_generation = block->rdma_read_generation.load(
         std::memory_order_relaxed);
@@ -205,7 +209,7 @@ retry:
                     entry.take_six_pending_evict();
                 if (old_remote != FarObjectEntry::RemoteAddrInvalid48) {
                     const bool remote_endpoint_dead =
-                        reuse_ec_recovery_endpoint_is_dead(old_remote);
+                        reuse_ec_recovery_endpoint_is_dead(old_remote, obj.size);
                     const bool keep = all_nonresident_backup_mode &&
                         !cleanup_state.dirty && !entry.is_resident_local() &&
                         !remote_endpoint_dead &&
@@ -271,7 +275,164 @@ inline void ConcurrentArrayCache::handle_rdma_write_complete(const ibv_wc &wc) {
         handle_ec_batch_write_complete(wc.wr_id);
         return;
     }
-    complete_evict_writeback(reinterpret_cast<void *>(wc.wr_id));
+    if (is_normal_write_wr_id(wc.wr_id)) {
+        complete_evict_writeback(normal_write_wr_id_local_addr(wc.wr_id));
+        return;
+    }
+    static std::atomic<uint64_t> invalid_write_wr_id_log{0};
+    if (invalid_write_wr_id_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+        std::cerr << "WARN: dropping untagged ordinary WRITE wr_id="
+                  << wc.wr_id << std::endl;
+    }
+}
+
+// A failed ordinary WRITE may arrive with opcode=0, so this path is selected
+// by the dedicated bit-61 token rather than by wc.opcode.  A recipe write is
+// never treated as durable: when its endpoint is known dead, consume exactly
+// the EVICTING write reference and leave a REMOTE recipe-only object whose
+// next READ will recompute it.  The dead remote slot is deliberately retained
+// in that state; the EC-batch allocator's liveness filter prevents it from
+// being handed to a fresh flat object.
+inline void ConcurrentArrayCache::handle_rdma_write_error(const ibv_wc &wc) {
+    if (!is_normal_write_wr_id(wc.wr_id)) return;
+    void *local_ptr = normal_write_wr_id_local_addr(wc.wr_id);
+    auto *heap = ::FarLib::allocator::global_heap.get_heap();
+    const uintptr_t heap_begin = reinterpret_cast<uintptr_t>(heap);
+    const uintptr_t data = reinterpret_cast<uintptr_t>(local_ptr);
+    const size_t heap_size = ::FarLib::allocator::global_heap.get_heap_size();
+    if (heap_begin == 0 || data < heap_begin ||
+        data - heap_begin < sizeof(::FarLib::allocator::BlockHead) ||
+        data - heap_begin >= heap_size) {
+        static std::atomic<uint64_t> bad_write_tokens{0};
+        if (bad_write_tokens.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::cerr << "WARN: dropping invalid ordinary WRITE wr_id="
+                      << wc.wr_id << " status=" << wc.status << std::endl;
+        }
+        return;
+    }
+    auto *block = static_cast<::FarLib::allocator::BlockHead *>(local_ptr) - 1;
+    auto obj = block->obj_meta_data.load(std::memory_order_acquire);
+    if (obj.is_null()) return;
+    auto &entry = get_entry_of(obj);
+    if (entry.local_addr() != local_ptr) return;
+
+retry:
+    auto old_state = entry.load_state();
+    // A write completion can race the eviction-interruption path.  That path
+    // deliberately publishes LOCAL/MARKED while retaining the write
+    // reference, so an error WC must consume the reference in those states as
+    // well as in EVICTING.  A zero-ref state cannot own this WC anymore.
+    if (old_state.state != EVICTING && old_state.state != LOCAL &&
+        old_state.state != MARKED) return;
+    if (old_state.ref_cnt == 0) return;
+    if (old_state.invalid) {
+        uthread::yield();
+        goto retry;
+    }
+    auto lock_state = old_state;
+    lock_state.invalid = 1;
+    if (!entry.cas_state_weak(old_state, lock_state)) goto retry;
+
+    const uint64_t old_remote = entry.remote_addr();
+    const bool recipe = entry.has_recompute_recipe();
+    const bool dead_remote =
+        old_remote != FarObjectEntry::RemoteAddrInvalid48 &&
+        reuse_ec_recovery_endpoint_is_dead(old_remote, obj.size);
+    auto next = lock_state;
+    next.dec_ref_cnt();
+    const bool last_write_reference = next.ref_cnt == 0;
+    if (recipe && old_state.state == EVICTING && dead_remote &&
+        last_write_reference) {
+        // Consume this WC's reference first, but keep the move lock held while
+        // the logical eviction bookkeeping is committed.  Taking the pending
+        // flag before this CAS would make a CAS retry double-count the event.
+        next.state = REMOTE;
+        next.dirty = 0;
+        if (!entry.cas_state_strong(lock_state, next)) goto retry;
+        const bool consumed = ::FarLib::design2::consume_six_pending_evict_once(
+            [&entry] { return entry.take_six_pending_evict(); },
+            [this, &entry, size = obj.size](bool dirty) {
+                six_commit_evict(entry, size, dirty);
+            },
+            true);
+        if (six_dirty_routing_enabled()) ASSERT(consumed);
+        auto published_state = next;
+        published_state.invalid = 0;
+        ASSERT(entry.cas_state_strong(next, published_state));
+        // Recipe-only durable state: no bytes were written, but the binding
+        // and dead remote identity remain available for a future recompute.
+        block->obj_meta_data.store(far_obj_t::null(),
+                                   std::memory_order_release);
+        ::FarLib::allocator::block_to_region(block)
+            ->pending_reclaims.fetch_add(1, std::memory_order_release);
+        recomputable_failed_writes_.fetch_add(1, std::memory_order_relaxed);
+        recomputable_virtual_evictions_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        return;
+    }
+
+    // A failed write cannot publish a durable remote copy.  While another
+    // write reference remains, keep the old remote slot untouched: a later
+    // success/error completion still owns DMA against that address.  The
+    // final failed completion below is the only point at which it is safe to
+    // invalidate and deallocate the slot.
+    next.state = LOCAL;
+    next.dirty = 1;
+    if (last_write_reference &&
+        (old_remote != FarObjectEntry::RemoteAddrInvalid48 ||
+         entry.has_remote_backup_reservation())) {
+        // First consume this WC's reference while keeping the move lock held;
+        // only then touch the remote-address/backup metadata.  A failed CAS
+        // after deallocation would otherwise leave a live state pointing at
+        // an allocator slot that has already been returned.
+        auto cleanup_state = next;
+        cleanup_state.invalid = 1;
+        if (!entry.cas_state_strong(lock_state, cleanup_state)) goto retry;
+        const bool consumed = ::FarLib::design2::discard_six_pending_evict_once(
+            [&entry] { return entry.take_six_pending_evict(); });
+        if (six_dirty_routing_enabled()) ASSERT(consumed);
+        if (entry.has_remote_backup_reservation()) {
+            entry.set_remote_backup_reservation(false);
+            release_remote_backup_budget(obj.size);
+            profile::count_remote_backup_invalidated(obj.size);
+        }
+        // The move-lock remains held while the plain remote-address fields are
+        // changed.  Publishing LOCAL with invalid=0 happens only after the
+        // allocator has stopped seeing the failed slot.
+        if (old_remote != FarObjectEntry::RemoteAddrInvalid48) {
+            entry.set_remote_invalid();
+            remote_allocator.deallocate(old_remote);
+        }
+        auto published_state = cleanup_state;
+        published_state.invalid = 0;
+        ASSERT(entry.cas_state_strong(cleanup_state, published_state));
+        if (recipe) {
+            recomputable_failed_writes_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (!last_write_reference) {
+        next.invalid = 0;
+        if (!entry.cas_state_strong(lock_state, next)) goto retry;
+        if (recipe) {
+            recomputable_failed_writes_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    // Final failure with no remote/backup slot still owns a D2 pending flag;
+    // consume it while the entry remains invalid before publishing LOCAL.
+    auto cleanup_state = next;
+    cleanup_state.invalid = 1;
+    if (!entry.cas_state_strong(lock_state, cleanup_state)) goto retry;
+    const bool consumed = ::FarLib::design2::discard_six_pending_evict_once(
+        [&entry] { return entry.take_six_pending_evict(); });
+    if (six_dirty_routing_enabled()) ASSERT(consumed);
+    auto published_state = cleanup_state;
+    published_state.invalid = 0;
+    ASSERT(entry.cas_state_strong(cleanup_state, published_state));
+    if (recipe) {
+        recomputable_failed_writes_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // EC (ft_method=sponge): the data server's final ACK for one commit.  It means
@@ -346,7 +507,7 @@ inline void ConcurrentArrayCache::check_sponge_ack_cq_ft() {
 }
 
 inline void ConcurrentArrayCache::handle_rdma_read_complete(
-    const ibv_wc &wc, bool release_read_pin) {
+    const ibv_wc &wc, bool release_read_pin, bool source_is_recompute) {
     const auto identity =
         detail::decode_normal_read_wr_id(wc.wr_id, !release_read_pin);
     void *local_ptr = identity.local_addr;
@@ -421,7 +582,8 @@ retry:
         }
 
         const bool remote_endpoint_dead =
-            reuse_ec_recovery_endpoint_is_dead(old_remote);
+            source_is_recompute ||
+            reuse_ec_recovery_endpoint_is_dead(old_remote, old_state.size);
         bool retain_backup = entry.has_remote_backup_reservation();
         const bool placement_allows_backup =
             local_placement_allows_remote_backup(entry);
@@ -466,24 +628,16 @@ retry:
             entry.set_remote_invalid();
         }
 
-        six_commit_fetch(entry, local_ptr, obj.size);
+        if (!source_is_recompute) {
+            six_commit_fetch(entry, local_ptr, obj.size);
+        }
         auto new_state = lock_state;
         new_state.invalid = 0;
         new_state.state = LOCAL;
         auto expected = lock_state;
         uint32_t finalize_retry_count = 0;
         while (true) {
-            request_interval_diag::Stamp local_before{};
-            if (request_interval_diag::completion_context.active) {
-                local_before = request_interval_diag::ordered_stamp();
-            }
             if (entry.cas_state_strong(expected, new_state)) {
-                request_interval_diag::Stamp local_after{};
-                if (request_interval_diag::completion_context.active) {
-                    local_after = request_interval_diag::ordered_stamp();
-                    request_interval_diag::local_published(
-                        wc.wr_id, local_before, local_after);
-                }
                 break;
             }
             const bool retryable =
@@ -507,10 +661,6 @@ retry:
             ++finalize_retry_count;
         }
 
-        // Sparse observer timestamp after the LOCAL state is published.  The
-        // requesting fibre may resume before the remote accounting below ends.
-        read_supply_timeline::record_lifecycle_local(wc.wr_id);
-
         if (retain_backup) {
             return;
         }
@@ -533,12 +683,18 @@ retry:
         auto new_state = old_state;
         new_state.state = LOCAL;
         if (!entry.cas_state_weak(old_state, new_state)) goto retry;
-        read_supply_timeline::record_lifecycle_local(wc.wr_id);
     }
 }
 
 inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
+    // One-sided incremental traffic has its own non-pointer namespace.
+    // Dispatch it before ordinary READ/WRITE handlers dereference wr_id.
+    if (rdma::ec_rmw::ClientTransport::is_wr_id(wc.wr_id)) [[unlikely]] {
+        if (!handle_ec_rmw_complete(wc)) ERROR("ec_rmw: unowned completion");
+        return;
+    }
     if (wc.status != IBV_WC_SUCCESS) {
+        if (handle_ec_incremental_complete(wc)) return;
         // EC (ft_method=ec_batch) read-side recovery: a failed completion is
         // how an endpoint that went away announces itself.  Remember it before
         // the CQE is dropped - the QP of that endpoint is in error and is never
@@ -552,16 +708,49 @@ inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
                 // The group succeeds only if at least four other durable
                 // segments remain; it must never strand its write reference.
                 handle_ec_batch_write_complete(wc.wr_id, false);
+                return;
             }
         }
-        // A failed ordinary READ still owns the allocator block until this
-        // error WC is consumed.  EC-tagged reads use staging storage and do
-        // not carry this pin.
-        // Error WCs from mlx5 are not consistent about preserving opcode
-        // (some flushed READs arrive with opcode=0).  The wr_id classifier in
-        // release_normal_read_pin() rejects EC tags/control storage, so use
-        // the pin itself as the ordinary-READ discriminator here.
-        (void)detail::release_normal_read_pin(wc.wr_id);
+        if (ec_recovery_is_read_wr_id(wc.wr_id)) return;
+        if (is_normal_write_wr_id(wc.wr_id)) {
+            handle_rdma_write_error(wc);
+            static std::atomic<int> write_err_wc_log{0};
+            if (write_err_wc_log.fetch_add(1, std::memory_order_relaxed) <
+                10) {
+                std::cerr << "ERROR: ordinary WRITE wc status=" << wc.status
+                          << " opcode=" << wc.opcode
+                          << " wr_id=" << wc.wr_id
+                          << " qp_num=" << wc.qp_num << std::endl;
+            }
+            return;
+        }
+        if (::FarLib::allocator::is_normal_read_wr_id(wc.wr_id)) {
+            const auto identity =
+                detail::decode_normal_read_wr_id(wc.wr_id, false);
+            if (identity.block != nullptr) {
+                const auto obj = identity.block->obj_meta_data.load(
+                    std::memory_order_acquire);
+                if (!obj.is_null()) {
+                    auto &entry = get_entry_of(obj);
+                    if (entry.has_recompute_recipe() &&
+                        entry.load_state(std::memory_order_acquire).state ==
+                            EntryState::FETCHING) {
+                        ::FarLib::allocator::begin_normal_read_recovery(
+                            identity.block);
+                    }
+                }
+            }
+            (void)detail::release_normal_read_pin(wc.wr_id);
+            static std::atomic<int> read_err_wc_log{0};
+            if (read_err_wc_log.fetch_add(1, std::memory_order_relaxed) <
+                10) {
+                std::cerr << "ERROR: ordinary READ wc status=" << wc.status
+                          << " opcode=" << wc.opcode
+                          << " wr_id=" << wc.wr_id
+                          << " qp_num=" << wc.qp_num << std::endl;
+            }
+            return;
+        }
         static std::atomic<int> err_wc_log{0};
         if (err_wc_log.fetch_add(1, std::memory_order_relaxed) < 10) {
             std::cerr << "ERROR: rdma wc status=" << wc.status
@@ -590,6 +779,7 @@ inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
             handle_rdma_read_complete(wc);
         }
     } else if (wc.opcode == IBV_WC_SEND) {
+        if (handle_ec_incremental_complete(wc)) return;
         // EC commit RPC: the SEND completion releases its client send slot.
         // Gated: with ft_method=none the condition is false and the WC is
         // ignored exactly as before.
@@ -599,6 +789,7 @@ inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
         }
         // Control QP operations - ignore
     } else if (wc.opcode == IBV_WC_RECV) {
+        if (handle_ec_incremental_complete(wc)) return;
         // EC commit RPC: the data server's final ACK releases the eviction.
         if (::FarLib::get_config().ft_enabled() &&
             handle_sponge_ack_complete(wc)) {

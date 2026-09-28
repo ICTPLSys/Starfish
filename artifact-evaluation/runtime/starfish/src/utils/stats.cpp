@@ -77,6 +77,8 @@ bool working = false;
 std::atomic_bool work_phase_active{false};
 uint64_t global_start_cycles = 0, global_cycles = 0;
 std::atomic_int32_t evac_active_worker_count{0};
+std::atomic<uint8_t> evac_phase_active_mask{0};
+std::atomic_bool evac_phase_metrics_collecting{false};
 
 void evac_thread_work_begin() {
     evac_active_worker_count.fetch_add(1, std::memory_order_relaxed);
@@ -91,6 +93,47 @@ int32_t get_evac_active_worker_count() {
 }
 
 namespace {
+
+std::mutex evac_phase_boundary_mutex;
+uint8_t evac_phase_boundary_mask = 0;
+uint64_t evac_phase_boundary_last_cycles = 0;
+EvacPhaseMetricsShard evac_phase_metrics_snapshot;
+bool evac_phase_metrics_snapshot_valid = false;
+
+EvacPhaseMetricsShard collect_evac_phase_metrics_live_unlocked() {
+    EvacPhaseMetricsShard result;
+    result.reset();
+    result.merge_from(global_profile_data.evac_phase_metrics);
+    for (auto &it : profile_data_map) {
+        result.merge_from(it.second->evac_phase_metrics);
+    }
+    result.derive_phase_cycles();
+    return result;
+}
+
+void advance_evac_phase_boundary_locked(uint64_t now) {
+    if (evac_phase_boundary_last_cycles == 0) {
+        evac_phase_boundary_last_cycles = now;
+        return;
+    }
+    if (now < evac_phase_boundary_last_cycles) {
+        now = evac_phase_boundary_last_cycles;
+    }
+    const uint64_t elapsed = now - evac_phase_boundary_last_cycles;
+    if (!evac_phase_metrics_collecting.load(std::memory_order_relaxed)) {
+        evac_phase_boundary_last_cycles = now;
+        return;
+    }
+    const auto coverage = evac_phase_coverage_from_mask(
+        evac_phase_boundary_mask);
+    if (coverage != EvacPhaseCoverage::Count) {
+        EvacPhaseMetricsShard::add_relaxed(
+            get_tlpd().evac_phase_metrics.coverage_cycles[
+                static_cast<size_t>(coverage)],
+            elapsed);
+    }
+    evac_phase_boundary_last_cycles = now;
+}
 
 struct AllocationWaitDiagnosticsState {
     std::mutex mutex;
@@ -208,6 +251,90 @@ uint32_t bucket_upper_bound(uint32_t bucket) {
 }
 
 }  // namespace
+
+bool evac_phase_metrics_enabled() noexcept {
+#if defined(FARLIB_ENABLE_EVAC_PHASE_METRICS) && \
+    (FARLIB_ENABLE_EVAC_PHASE_METRICS == 0)
+    return false;
+#else
+    static const bool enabled = [] {
+        const char *value = std::getenv("FARLIB_EVAC_PHASE_METRICS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+#endif
+}
+
+EvacPhaseScope evac_phase_enter(EvacPhase phase) noexcept {
+    EvacPhaseScope scope;
+    if (!evac_phase_metrics_enabled()) return scope;
+
+    const uint8_t bit = evac_phase_bit(phase);
+    {
+        std::lock_guard<std::mutex> lock(evac_phase_boundary_mutex);
+        const uint64_t now = get_cycles();
+        advance_evac_phase_boundary_locked(now);
+        evac_phase_boundary_mask |= bit;
+        evac_phase_active_mask.store(evac_phase_boundary_mask,
+                                     std::memory_order_release);
+        scope.phase = phase;
+        scope.bit = bit;
+        scope.start_cycles = now;
+        scope.active = true;
+    }
+    return scope;
+}
+
+void evac_phase_leave(EvacPhaseScope &scope) noexcept {
+    if (!scope.active) return;
+
+    const uint64_t now = get_cycles();
+    {
+        std::lock_guard<std::mutex> lock(evac_phase_boundary_mutex);
+        advance_evac_phase_boundary_locked(now);
+        evac_phase_boundary_mask &= static_cast<uint8_t>(~scope.bit);
+        evac_phase_active_mask.store(evac_phase_boundary_mask,
+                                     std::memory_order_release);
+    }
+    scope.active = false;
+}
+
+void reset_evac_phase_metrics_state() noexcept {
+    std::lock_guard<std::mutex> lock(evac_phase_boundary_mutex);
+    // Reset the collection window, not the live phase state.  Initialization
+    // can already have entered mark/evict before reset_all(); the old scope
+    // must still be able to leave without reintroducing pre-Work time.
+    evac_phase_boundary_last_cycles =
+        evac_phase_metrics_collecting.load(std::memory_order_relaxed)
+            ? get_cycles()
+            : 0;
+    evac_phase_metrics_snapshot.reset();
+    evac_phase_metrics_snapshot_valid = false;
+    evac_phase_active_mask.store(evac_phase_boundary_mask,
+                                 std::memory_order_release);
+}
+
+void begin_evac_phase_metrics_window() noexcept {
+    if (!evac_phase_metrics_enabled()) return;
+    std::lock_guard<std::mutex> lock(evac_phase_boundary_mutex);
+    evac_phase_metrics_snapshot_valid = false;
+    evac_phase_metrics_collecting.store(true, std::memory_order_release);
+    evac_phase_boundary_last_cycles = get_cycles();
+    evac_phase_active_mask.store(evac_phase_boundary_mask,
+                                 std::memory_order_release);
+}
+
+void end_evac_phase_metrics_window() noexcept {
+    if (!evac_phase_metrics_enabled()) return;
+    std::lock_guard<std::mutex> lock(evac_phase_boundary_mutex);
+    if (!evac_phase_metrics_collecting.load(std::memory_order_relaxed)) {
+        return;
+    }
+    advance_evac_phase_boundary_locked(get_cycles());
+    evac_phase_metrics_collecting.store(false, std::memory_order_release);
+    evac_phase_metrics_snapshot = collect_evac_phase_metrics_live_unlocked();
+    evac_phase_metrics_snapshot_valid = true;
+}
 
 void begin_allocation_wait_diagnostics(size_t application_fibre_count) {
     const bool enabled = allocation_wait_diag_env_enabled();
@@ -604,6 +731,7 @@ void ThreadLocalProfileData::unregister_thread() {
     global_profile_data.rdma_write_post_bytes += rdma_write_post_bytes;
     global_profile_data.dirty_evict_bytes += dirty_evict_bytes;
     global_profile_data.clean_evict_bytes += clean_evict_bytes;
+    global_profile_data.evac_phase_metrics.merge_from(evac_phase_metrics);
     global_profile_data.ref_read_cold_count += ref_read_cold_count;
     global_profile_data.ref_read_warm_count += ref_read_warm_count;
     global_profile_data.ref_read_hot_count += ref_read_hot_count;
@@ -689,6 +817,7 @@ void print_rdma_read_size_histogram() {
 
 void reset_all() {
     global_profile_data.reset();
+    reset_evac_phase_metrics_state();
     evac_active_worker_count.store(0, std::memory_order_relaxed);
     for (auto &it : profile_data_map) {
         it.second->reset();
@@ -1061,6 +1190,16 @@ DEFINE_COLLECT(resident_profile_demotion_cycles);
 DEFINE_COLLECT(resident_profile_region_placement_attempts);
 DEFINE_COLLECT(resident_profile_region_placement_cycles);
 
+EvacPhaseMetricsShard collect_evac_phase_metrics() {
+    {
+        std::lock_guard<std::mutex> lock(evac_phase_boundary_mutex);
+        if (evac_phase_metrics_snapshot_valid) {
+            return evac_phase_metrics_snapshot;
+        }
+    }
+    return collect_evac_phase_metrics_live_unlocked();
+}
+
 void print_profile_data() {
     constexpr bool PrintEnabled =
         Enabled || enabled::Evacuation || enabled::YieldCount;
@@ -1166,6 +1305,43 @@ void print_profile_data() {
     PRINT_IF("evac gc ph cycles", collect_evac_gc_phase_cycles(), enabled::Evacuation);
     PRINT_IF("evac flip ph cycles", collect_evac_flip_scope_cycles(), enabled::Evacuation);
     PRINT_IF("evac flush cycles", collect_evac_flush_cycles(), enabled::Evacuation);
+    if (evac_phase_metrics_enabled()) {
+        const auto metrics = collect_evac_phase_metrics();
+        std::cout << "evac_phase_metrics mark_cycles="
+                  << metrics.phase_cycles[static_cast<size_t>(EvacPhase::Mark)]
+                  << " evict_cycles="
+                  << metrics.phase_cycles[static_cast<size_t>(EvacPhase::Evict)]
+                  << std::endl;
+        std::cout << "evac_phase_metrics coverage_cycles mark_only="
+                  << metrics.coverage_cycles[
+                         static_cast<size_t>(EvacPhaseCoverage::MarkOnly)]
+                  << " evict_only="
+                  << metrics.coverage_cycles[
+                         static_cast<size_t>(EvacPhaseCoverage::EvictOnly)]
+                  << " overlap="
+                  << metrics.coverage_cycles[
+                         static_cast<size_t>(EvacPhaseCoverage::Overlap)]
+                  << std::endl;
+        constexpr const char *coverage_names[] = {
+            "mark_only", "evict_only", "overlap"};
+        constexpr const char *traffic_names[] = {"ordinary", "ec_batch"};
+        constexpr const char *direction_names[] = {"read", "write"};
+        for (size_t coverage = 0; coverage < 3; ++coverage) {
+            for (size_t traffic = 0; traffic < 2; ++traffic) {
+                for (size_t direction = 0; direction < 2; ++direction) {
+                    std::cout << "evac_phase_payload coverage="
+                              << coverage_names[coverage]
+                              << " traffic=" << traffic_names[traffic]
+                              << " direction=" << direction_names[direction]
+                              << " ops="
+                              << metrics.payload_ops[coverage][traffic][direction]
+                              << " bytes="
+                              << metrics.payload_bytes[coverage][traffic][direction]
+                              << std::endl;
+                }
+            }
+        }
+    }
     PRINT_IF("evac flush count", collect_evac_flush_count(), enabled::Evacuation);
     PRINT_IF("evac flush full", collect_evac_flush_full_count(), enabled::Evacuation);
     PRINT_IF("evac flush partial", collect_evac_flush_partial_count(),
