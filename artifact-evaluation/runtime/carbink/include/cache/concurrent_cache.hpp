@@ -1,4 +1,5 @@
 #pragma once
+#include "../../../common/benchmark_memory.hpp"
 #include "cache/accounting/backup_usage_shards.hpp"
 #include "cache/accounting/batched_backup_budget.hpp"
 #include <x86intrin.h>
@@ -3591,6 +3592,14 @@ public:
         return remote_allocator.allocate(size, behavior_group);
     }
 
+    // Cold-path EC group snapshot consumed by the memory sampler.  This is
+    // intentionally separate from RemoteGlobalHeap::get_used_bytes(), which
+    // is a logical allocator ledger and does not include six-segment groups.
+    std::vector<uint64_t> remote_memory_endpoint_bytes() const {
+        return remote_allocator.small_object_stripe_manager()
+            .live_group_bytes_by_endpoint();
+    }
+
     // Simple annotation contract: call within the allocation scope, before
     // publishing the handle and before its first remote allocation. No
     // concurrent application access/move/reset is allowed. Evacuation may race
@@ -4586,6 +4595,58 @@ public:
 
     void print_design1_diagnostics() const;
 
+private:
+    std::unique_ptr<::FarLib::benchmark_memory::Sampler> benchmark_memory_sampler_;
+    std::unique_ptr<::FarLib::runtime_metadata::Reporter> runtime_metadata_reporter_;
+
+    ::FarLib::runtime_metadata::Snapshot runtime_metadata_usage() {
+        auto snapshot = ::FarLib::allocator::global_heap.metadata_usage();
+        snapshot.add(::FarLib::allocator::remote::remote_global_heap.metadata_usage());
+        snapshot.add(remote_allocator.small_object_stripe_manager().metadata_usage());
+        snapshot.add(::FarLib::simple_region_heat::metadata_usage());
+        // Page.owner is ONE descriptor per packed span, not the excluded
+        // per-application-object FarObjectEntry. Count its storage only here.
+        std::lock_guard<std::mutex> lock(hydra_pages_mutex_);
+        snapshot.span_bytes += sizeof(hydra_lanes_) + sizeof(hydra_pages_mutex_) +
+                               sizeof(hydra_pages_) +
+                               hydra_pages_.capacity() * sizeof(hydra_pages_[0]);
+        snapshot.span_bytes += sizeof(hydra_runtime_packing_);
+        if (hydra_runtime_packing_)
+            snapshot.span_bytes += sizeof(*hydra_runtime_packing_);
+        snapshot.spans += hydra_pages_.size();
+        for (const auto &page : hydra_pages_) {
+            snapshot.span_bytes += sizeof(*page);
+            if (page->heat)
+                snapshot.span_bytes += hydra::kPageBytes / page->slot_bytes *
+                                       sizeof(hydra::SlotHeat);
+        }
+        snapshot.measurement_aux_bytes +=
+            sizeof(hydra_pages_created_) + sizeof(hydra_pages_released_) +
+            sizeof(hydra_objects_created_) + sizeof(hydra_objects_released_);
+        return snapshot;
+    }
+
+    void start_runtime_metadata_reporting() {
+        if (!::FarLib::runtime_metadata::enabled_from_environment()) return;
+        runtime_metadata_reporter_ =
+            std::make_unique<::FarLib::runtime_metadata::Reporter>(
+                "carbink", this, +[](void *context) {
+                    return static_cast<ConcurrentArrayCache *>(context)
+                        ->runtime_metadata_usage();
+                });
+    }
+
+    void start_benchmark_memory_sampling() {
+        if (!::FarLib::benchmark_memory::enabled_from_environment()) return;
+        benchmark_memory_sampler_ =
+            std::make_unique<::FarLib::benchmark_memory::Sampler>(
+                ::FarLib::get_config().server_count, "live_stripe_allocated_bytes",
+                "ec_stripe_allocator", [this] {
+                    return this->remote_memory_endpoint_bytes();
+                });
+        benchmark_memory_sampler_->start();
+    }
+
 public:
     ConcurrentArrayCache(void *local_buf, size_t local_buf_size,
                          size_t remote_buf_size, size_t evict_batch_size)
@@ -4937,9 +4998,14 @@ public:
             resident_profile_thread =
                 std::thread([this] { run_resident_profile_planner(); });
         }
+        start_benchmark_memory_sampling();
+        start_runtime_metadata_reporting();
     }
 
     ~ConcurrentArrayCache() {
+        // Print the saved final Work-boundary snapshot, never post-cleanup zero.
+        runtime_metadata_reporter_.reset();
+        if (benchmark_memory_sampler_) benchmark_memory_sampler_->stop();
         ::FarLib::simple_region_heat::end_work();
         ec_batch_diag_report("cache_dtor_begin");
         quiesce_background_evacuation();

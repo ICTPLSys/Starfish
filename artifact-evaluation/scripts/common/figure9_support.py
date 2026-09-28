@@ -10,27 +10,35 @@ import sys
 AE_ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_LABEL = {"nonft": "Non-FT", "starfish": "Starfish",
                 "hydra": "Hydra", "carbink": "Carbink"}
+FIGURE9_SYSTEM_LABEL = {
+    **SYSTEM_LABEL,
+    "nonft-backup-off": "Non-FT backup OFF",
+}
+FIGURE9_BASELINE_VARIANTS = frozenset(("nonft-backup-off",))
 APPLICATIONS = ("llama", "bfs", "mg", "wordcount", "kv-b", "kv-a", "kv-s", "nq")
-ADAPTERS = frozenset(("llama", "bfs"))
-SYSTEM_ADAPTERS = frozenset(("nonft", "starfish", "hydra"))
+ADAPTERS = frozenset(APPLICATIONS)
+SYSTEM_ADAPTERS = frozenset(("nonft", "starfish", "hydra", "carbink"))
 
 
 def support(app, system, *, recipe=None, root=AE_ROOT):
     if app not in APPLICATIONS:
         raise ValueError(f"unknown application {app!r}; choose {','.join(APPLICATIONS)}")
-    if system not in SYSTEM_LABEL:
-        raise ValueError(f"unknown system {system!r}; choose {','.join(SYSTEM_LABEL)}")
-    selected = Path(recipe) if recipe is not None else root / "configs" / app / f"{system}.config"
+    if system not in FIGURE9_SYSTEM_LABEL:
+        raise ValueError(f"unknown system {system!r}; choose {','.join(FIGURE9_SYSTEM_LABEL)}")
+    runtime_system = "nonft" if system == "nonft-backup-off" else system
+    selected = (Path(recipe) if recipe is not None
+                else root / "configs" / app / f"{runtime_system}.config")
     gaps = []
     if app not in ADAPTERS:
         gaps.append("workload/footprint/correctness/measurement adapter not integrated")
-    if system not in SYSTEM_ADAPTERS:
+    if runtime_system not in SYSTEM_ADAPTERS:
         gaps.append("runtime configuration/environment/evidence adapter not integrated")
-    if not (root / "runtime" / system / "CMakeLists.txt").is_file():
+    if not (root / "runtime" / runtime_system / "CMakeLists.txt").is_file():
         gaps.append("runtime source not integrated")
     if not selected.is_file():
         gaps.append(f"recipe missing: {selected}")
-    return {"app": app, "system": system, "script_supported": not gaps,
+    return {"app": app, "system": system, "runtime_system": runtime_system,
+            "baseline_variant": system, "script_supported": not gaps,
             "runtime_verified": False, "gaps": gaps}
 
 
@@ -54,11 +62,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-supported", action="store_true")
     parser.add_argument("--apps", default=",".join(APPLICATIONS))
-    parser.add_argument("--systems", default=",".join(SYSTEM_LABEL))
+    parser.add_argument("--systems", default=",".join(FIGURE9_SYSTEM_LABEL))
     args = parser.parse_args()
     try:
         apps = selections(args.apps, APPLICATIONS, "applications")
-        systems = selections(args.systems, SYSTEM_LABEL, "systems")
+        systems = selections(args.systems, FIGURE9_SYSTEM_LABEL, "systems")
         if args.list_supported:
             print("Script support only; binaries, site readiness and end-to-end correctness are NOT verified.")
             for app in apps:

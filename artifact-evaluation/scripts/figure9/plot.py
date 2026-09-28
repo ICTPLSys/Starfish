@@ -29,13 +29,21 @@ WORKLOADS = {
 DEFAULT_WORKLOADS = ("bfs", "llama", "mg", "wc", "kv_b", "kv_a", "kv_s", "nq")
 TITLES = {"bfs": "BFS", "llama": "LLM", "mg": "MG", "wc": "WC",
           "kv_b": "KV-B", "kv_a": "KV-A", "kv_s": "KV-S", "nq": "NQ"}
-BAR_SYSTEMS = {"nonft": "nonft", "non-ft": "nonft", "starfish": "starfish",
-               "carbink": "carbink", "hydra": "hydra"}
+BAR_SYSTEMS = {
+    "nonft": "nonft", "non-ft": "nonft",
+    "nonft-backup-off": "nonft-backup-off",
+    "non-ft (backup off)": "nonft-backup-off",
+    "nonft backup off": "nonft-backup-off",
+    "starfish": "starfish", "carbink": "carbink", "hydra": "hydra",
+}
 SYSTEMS = dict(BAR_SYSTEMS, native="native", **{"native linux all local": "native"})
 DEFAULT_SYSTEMS = ("hydra", "carbink", "starfish", "nonft")
 SOURCE_TYPES = {"run": "measured", "measured": "measured",
                 "paper_reference": "paper_reference", "synthetic": "synthetic"}
 DEFAULT_RATIOS = (13, 25, 50, 75, 100)
+TEARDOWN_EXIT_STATUSES = frozenset(("124", "-15", "-9"))
+CANONICAL_VARIANT = "canonicalruntime"
+OFF_VARIANT = "nonft-backup-off"
 
 
 def canonical(value, names, label):
@@ -45,6 +53,44 @@ def canonical(value, names, label):
         raise ValueError(f"unknown {label}: {value!r}") from exc
 
 
+def validate_variant_provenance(row, system):
+    """Keep a backup-OFF row from being silently merged with canonical Non-FT."""
+    variant = row.get("baseline_variant", "").strip().lower()
+    backup = row.get("backup_enabled", "").strip().lower()
+    if system == OFF_VARIANT:
+        if variant != OFF_VARIANT:
+            raise ValueError("backup-OFF system requires baseline_variant=nonft-backup-off")
+        if backup not in {"0", "false"}:
+            raise ValueError("backup-OFF system requires backup_enabled=false")
+        return
+    if variant == OFF_VARIANT:
+        raise ValueError("backup-OFF provenance must use the backup-OFF system label")
+    if variant:
+        accepted = {CANONICAL_VARIANT, system}
+        if variant not in accepted:
+            raise ValueError(f"baseline_variant={variant!r} disagrees with system={system!r}")
+    if backup:
+        if backup not in {"0", "1", "true", "false"}:
+            raise ValueError("backup_enabled must be a boolean value")
+        if system == "nonft" and backup in {"0", "false"}:
+            raise ValueError("Non-FT backup=false requires the backup-OFF system label")
+
+
+def run_metadata(row):
+    """Keep lifecycle and teardown warnings in the exported provenance JSON."""
+    return {
+        "run_id": row["run_id"],
+        "elapsed_s": row["elapsed_s"],
+        "source": row["source"],
+        "exit_status": row.get("exit_status", "0"),
+        "measurement_usable": row.get("measurement_usable", ""),
+        "execution_status": row.get("execution_status", ""),
+        "warning": row.get("warning", ""),
+        "baseline_variant": row.get("baseline_variant", ""),
+        "backup_enabled": row.get("backup_enabled", ""),
+    }
+
+
 def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
             ratios=DEFAULT_RATIOS, source_type="measured"):
     """Validate every row, select the requested matrix, and summarize repetitions."""
@@ -52,6 +98,9 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
         raise ValueError(f"unknown source type: {source_type}")
     workloads = [canonical(x, WORKLOADS, "workload") for x in workloads]
     systems = [canonical(x, BAR_SYSTEMS, "bar system") for x in systems]
+    if OFF_VARIANT in systems:
+        raise ValueError(
+            "Figure 9 does not plot the backup-OFF variant; use the four canonical systems")
     if not workloads or len(set(workloads)) != len(workloads):
         raise ValueError("workloads must be nonempty and unique")
     if not systems or len(set(systems)) != len(systems):
@@ -63,11 +112,13 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
     numbered_rows, digest = read_csv(path, REQUIRED)
     groups = defaultdict(list)
     blank_rows = []
+    ignored_backup_off_rows = []
     contexts = defaultdict(set)
     for line, row in numbered_rows:
         try:
             workload = canonical(row["workload"], WORKLOADS, "workload")
             system = canonical(row["system"], SYSTEMS, "system")
+            validate_variant_provenance(row, system)
             kind = (canonical(row["source_type"], SOURCE_TYPES, "source_type")
                     if row["source_type"] else None)
             if kind is not None and kind != source_type:
@@ -79,10 +130,14 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
             if system == "native" and ratio != 100:
                 raise ValueError("Native Linux All local must use ratio=100")
             if not row["elapsed_s"]:
-                blank_rows.append({
+                record = {
                     "workload": workload, "system": system, "ratio": ratio,
                     "csv_line": line, "source": row["source"],
-                })
+                }
+                if system == OFF_VARIANT:
+                    ignored_backup_off_rows.append(record)
+                else:
+                    blank_rows.append(record)
                 continue
             if kind is None:
                 raise ValueError("source_type is required when elapsed_s has a value")
@@ -91,12 +146,34 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
                 raise ValueError("elapsed_s must be finite and greater than zero")
             if not row["source"]:
                 raise ValueError("source must identify the raw result or reference")
-            if "exit_status" in row and row["exit_status"] != "0":
-                raise ValueError("exit_status must be 0; failed/incomplete runs cannot be plotted")
-            if "correctness" in row and row["correctness"].lower() != "pass":
+            exit_status = row.get("exit_status", "0")
+            correctness = row.get("correctness", "")
+            teardown_measurement = (
+                exit_status in TEARDOWN_EXIT_STATUSES
+                and row.get("measurement_usable") == "1"
+                and row.get("execution_status") == "teardown_failed"
+                and correctness.lower() == "pass"
+            )
+            if exit_status != "0" and not teardown_measurement:
+                raise ValueError(
+                    "nonzero exit_status requires measurement_usable=1, "
+                    "execution_status=teardown_failed, correctness=pass, "
+                    "and exit_status in 124,-15,-9"
+                )
+            if correctness and correctness.lower() != "pass":
                 raise ValueError("correctness must be pass")
             record = dict(row, workload=workload, system=system, ratio=ratio,
-                          elapsed_s=elapsed, source_type=kind, run_id=row.get("run_id", ""))
+                          elapsed_s=elapsed, source_type=kind, run_id=row.get("run_id", ""),
+                          exit_status=exit_status, correctness=correctness,
+                          measurement_usable=row.get("measurement_usable", ""),
+                          execution_status=row.get("execution_status", ""),
+                          warning=row.get("warning", ""))
+            if system == OFF_VARIANT:
+                ignored_backup_off_rows.append({
+                    "workload": workload, "system": system, "ratio": ratio,
+                    "csv_line": line, "source": row["source"],
+                })
+                continue
             groups[workload, system, ratio].append(record)
         except ValueError as exc:
             raise ValueError(f"CSV line {line}: {exc}") from exc
@@ -125,8 +202,7 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
             "mean_s": statistics.mean(native_values) if native_values else None,
             "stddev_s": statistics.stdev(native_values) if len(native_values) > 1 else None,
             "n": len(native),
-            "runs": [{"run_id": row["run_id"], "elapsed_s": row["elapsed_s"],
-                      "source": row["source"]} for row in native],
+            "runs": [run_metadata(row) for row in native],
         }
         for s in systems:
             for r in ratios:
@@ -143,8 +219,7 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
                     "mean_s": statistics.mean(values) if values else None,
                     "stddev_s": statistics.stdev(values) if len(values) > 1 else None,
                     "n": len(values),
-                    "runs": [{"run_id": row["run_id"], "elapsed_s": row["elapsed_s"],
-                              "source": row["source"]} for row in records],
+                    "runs": [run_metadata(row) for row in records],
                 })
     for (workload, field), values in contexts.items():
         if len(values) > 1:
@@ -159,6 +234,7 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
         "workloads": workloads, "systems": systems, "ratios": ratios,
         "input_rows": len(numbered_rows),
         "blank_rows": blank_rows,
+        "ignored_backup_off_rows": ignored_backup_off_rows,
         "unselected_conditions": [list(key) for key in sorted(
             set(groups) | {(row["workload"], row["system"], row["ratio"])
                            for row in blank_rows})
@@ -178,6 +254,9 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
 
 def draw(data):
     """Keep the paper's geometry, colors, hatches and guides; replace its arrays with CSV."""
+    if OFF_VARIANT in data["systems"]:
+        raise ValueError(
+            "Figure 9 does not plot the backup-OFF variant; use the four canonical systems")
     plt = get_pyplot()
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -185,16 +264,19 @@ def draw(data):
     columns = min(4, len(data["workloads"]))
     rows = math.ceil(len(data["workloads"]) / columns)
     fig, axes = plt.subplots(rows, columns,
-                             figsize=(17.2 if columns == 4 else 4.3 * columns,
+                             figsize=(14.4 if columns == 4 else 4.3 * columns,
                                       6.8 if rows == 2 else 3.7),
                              sharex=(rows == 2), sharey=False, squeeze=False)
     indexed = {(p["workload"], p["system"], p["ratio"]): p for p in data["points"]}
     x = np.arange(len(data["ratios"]))
-    width = min(0.22, 0.88 / len(data["systems"]))
+    width = 0.22
     offsets = (np.arange(len(data["systems"])) - (len(data["systems"]) - 1) / 2) * width
     guide_lines = {"llama": (50, 100), "mg": (50, 100)}
-    panel_titles = {"bfs": "BFS", "llama": "LLM", "mg": "MG", "wc": "WC",
-                    "kv_b": "KV-B", "kv_a": "KV-A", "kv_s": "KV-S", "nq": "NQ"}
+    panel_titles = {"bfs": r"$\mathbf{BFS}$", "llama": r"$\mathbf{LLM}$",
+                    "mg": r"$\mathbf{MG}$", "wc": r"$\mathbf{WC}$",
+                    "kv_b": r"$\mathbf{KVS}$ YCSB-B",
+                    "kv_a": r"$\mathbf{KVS}$ YCSB-A",
+                    "kv_s": r"$\mathbf{KVS}$ Synthetic", "nq": r"$\mathbf{NQ}$"}
     for idx, workload in enumerate(data["workloads"]):
         ax = axes.flat[idx]
         ax.set_box_aspect(0.62)
@@ -227,9 +309,9 @@ def draw(data):
             finite_values.append(native)
             ax.axhline(native, color="#c73535", linestyle=(0, (4, 2)),
                        linewidth=1.55, alpha=0.95, zorder=3)
-        panel_letter = chr(97 + DEFAULT_WORKLOADS.index(workload))
-        ax.set_title(f"({panel_letter}) {panel_titles[workload]}",
-                     fontsize=20, fontweight="bold", pad=3)
+        panel_letter = chr(97 + idx)
+        ax.set_title(rf"$\mathbf{{({panel_letter})}}$ {panel_titles[workload]}",
+                     fontsize=20, fontweight="normal", pad=3)
         ax.set_xticks(x)
         ax.set_xticklabels([f"{ratio}%" for ratio in data["ratios"]])
         if finite_values:
@@ -244,11 +326,13 @@ def draw(data):
                            alpha=0.8, zorder=0)
         else:
             ax.set_yticks([])  # An empty panel must not imply a 0-to-1 s measurement.
-        ax.tick_params(axis="x", labelsize=16.5, direction="in", length=4, pad=4.0)
+        ax.tick_params(axis="x", labelsize=18, direction="in", length=4, pad=4.0)
         ax.tick_params(axis="y", labelsize=18, direction="in", length=0, pad=2.0)
-        for spine in ax.spines.values():
+        for name, spine in ax.spines.items():
             spine.set_visible(True)
             spine.set_linewidth(1.4)
+            if name in ("top", "right"):
+                spine.set_color("#7a7a7a")
     for ax in list(axes.flat)[len(data["workloads"]):]:
         ax.set_visible(False)
     handles = [Patch(facecolor=SYSTEM_STYLES[s]["facecolor"],
@@ -260,9 +344,9 @@ def draw(data):
     fig.legend(handles=handles, loc="upper center", ncol=len(handles),
                frameon=False, bbox_to_anchor=(0.5, 0.995), fontsize=18)
     fig.supylabel("Elapsed Time (s)", fontsize=25, x=0.005)
-    fig.supxlabel("Local memory ratio (%)", fontsize=25, y=0.025)
-    fig.subplots_adjust(left=0.07, right=0.995, bottom=0.14, top=0.885,
-                        wspace=0.23, hspace=0.07)
+    fig.supxlabel("Local memory ratio (%)", fontsize=25, y=0.055)
+    fig.subplots_adjust(left=0.07, right=0.995, bottom=0.105, top=0.885,
+                        wspace=0.12, hspace=0.01)
     return fig
 
 

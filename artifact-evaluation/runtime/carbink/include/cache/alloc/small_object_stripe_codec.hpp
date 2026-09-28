@@ -49,6 +49,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "../../../../common/runtime_ec_cpu.hpp"
+
 namespace FarLib::cache {
 
 // Geometry of the ported code; small_object_stripe.hpp static_asserts that this
@@ -268,6 +270,8 @@ inline void small_object_stripe_xor_bytes_with_lut8(const uint8_t *src,
 // coef == 1 fast path (G1 sponge_rpc.hpp:901-910 memcpy/XOR), word at a time.
 inline void small_object_stripe_xor_bytes(const uint8_t *src, size_t byte_count,
                                           uint8_t *dst) {
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Xor);
     size_t i = 0;
     for (; i + sizeof(uint64_t) <= byte_count; i += sizeof(uint64_t)) {
         uint64_t in_word = 0;
@@ -289,6 +293,8 @@ inline void small_object_stripe_combine_bytes(const uint8_t *const *srcs,
                                               size_t source_count,
                                               uint8_t *dst,
                                               size_t byte_count) {
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Decode);
     bool assigned = false;
     for (size_t k = 0; k < source_count; k++) {
         const uint8_t coef = coefs[k];
@@ -338,6 +344,8 @@ inline bool small_object_stripe_encode_parity_delta(uint8_t data_shard_idx,
         parity0_delta == nullptr || parity1_delta == nullptr) {
         return false;
     }
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Update);
     const auto &lut = small_object_stripe_shard_parity_lut(data_shard_idx);
     if (lut.coef[0] == 1 && lut.coef[1] == 1) {
         std::memcpy(parity0_delta, data_delta, byte_count);
@@ -379,6 +387,8 @@ inline bool small_object_stripe_encode_shards(
         }
     }
 
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Encode);
     for (size_t p = 0; p < kStripeCodecParityShards; p++) {
         uint8_t *dst = static_cast<uint8_t *>(parity_shards[p]) + shard_offset;
         bool assigned = false;

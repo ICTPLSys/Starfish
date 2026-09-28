@@ -7,21 +7,24 @@ import subprocess
 import tarfile
 
 
-def pack_source(runtime, archive):
+def pack_source(runtime, archive, *, system=None):
+    if system == "carbink":
+        runtime = runtime / "legacy/carbink_server"
     with tarfile.open(archive, "w:gz") as bundle:
         for relative in ("include", "src/rdma/server.cpp", "src/rdma/exchange_msg.cpp"):
             bundle.add(runtime / relative, arcname=relative)
 
 
-def build_command(directory):
+def build_command(directory, *, system=None):
     root = shlex.quote(directory)
+    extra_libraries = " -lisal" if system == "carbink" else ""
     return (f"cd {root}; mkdir source; tar -xzf server-source.tar.gz -C source; "
             "command -v g++ >/dev/null || "
             "{ echo 'install g++ and libibverbs-dev on the memory host' >&2; exit 2; }; "
             "g++ -std=gnu++2a -O3 -DNDEBUG "
             "-DFARLIB_BACKUP_ACCOUNTING_CACHELINE_ISOLATION=1 -pthread "
             "-Isource/include source/src/rdma/server.cpp "
-            "source/src/rdma/exchange_msg.cpp -libverbs -o server.native "
+            "source/src/rdma/exchange_msg.cpp -libverbs" + extra_libraries + " -o server.native "
             "> build.log 2>&1 || { cat build.log >&2; exit 2; }; "
             "mv server.native server")
 
@@ -52,7 +55,8 @@ def check_script(binary, library_path=None):
             'printf "%s\\n" "$deps" >&2; exit 2; fi')
 
 
-def stage(host, directory, binary, private, *, ssh, scp, source_archive=None):
+def stage(host, directory, binary, private, *, ssh, scp, source_archive=None,
+          system=None):
     # The caller has just created this unique run directory. Never replace a
     # pre-existing executable, including one from another incomplete run.
     destination = directory + "/server"
@@ -71,7 +75,10 @@ def stage(host, directory, binary, private, *, ssh, scp, source_archive=None):
         # Compile the same two-source server target natively; no runtime
         # algorithm or operating-system library is replaced.
         scp(str(source_archive), host + ":" + directory + "/server-source.tar.gz")
-        ssh(host, build_command(directory))
+        if system == "carbink":
+            ssh(host, build_command(directory, system=system), timeout=300)
+        else:
+            ssh(host, build_command(directory, system=system))
         ssh(host, check_script(destination, directory))
         rebuilt = True
     return {"binary": destination, "rebuilt_on_memory_host": rebuilt}

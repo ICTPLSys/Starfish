@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 COMMON = Path(__file__).resolve().parents[1]
@@ -45,7 +46,10 @@ class Design2Profile(unittest.TestCase):
     def test_nonft_does_not_inherit_design2_profile(self):
         inherited = dict(DESIGN2_ENV, PATH="/usr/bin", LD_LIBRARY_PATH="/custom/lib")
         env = client_process_environment("llama", SITE, "nonft", inherited)
-        self.assertFalse(set(DESIGN2_ENV) & set(env))
+        self.assertEqual(set(DESIGN2_ENV) & set(env),
+                         {"FARLIB_LEGACY_SCAN_CURSORS",
+                          "FARLIB_PLANNER_BUDGET_EARLY_EXIT",
+                          "FARLIB_RESIDENT_PROFILE_REQUIRE_WORK_PHASE"})
         self.assertEqual(env["PATH"], "/usr/bin")
         self.assertEqual(env["LD_LIBRARY_PATH"], "/custom/lib")
         self.assertEqual(inherited["FARLIB_SIMPLE_LOCAL_RESIDENT"], "1")
@@ -87,17 +91,40 @@ class Design2Profile(unittest.TestCase):
                 self.assertEqual(config["enable_region_resident_placement"], "1")
                 self.assertEqual(config["remote_backup_mode"], "object_profiled")
 
-    def test_nonft_recipe_stays_backup_off(self):
-        config = values(render(AE / "configs/llama/nonft.config", system="nonft",
-                               ratio=25, footprint_bytes=10_000_000,
-                               server_addr="192.0.2.20", server_port=1998,
-                               ib_device="mlx5_0"))
-        self.assertEqual(config["ft_method"], "none")
-        self.assertEqual(config["enable_selective_backup"], "0")
-        self.assertEqual(config["remote_backup_budget_bytes"], "0")
-        self.assertEqual(config["local_resident_budget_bytes"], "2000000")
-        self.assertEqual(config["enable_region_resident_placement"], "1")
-        self.assertEqual(config["region_placement_bind_groups"], "0")
+    def test_nonft_keeps_backup_and_resident_without_ec(self):
+        for app in ("llama", "mg", "bfs"):
+            for ratio in (25, 50, 75):
+                config = values(render(AE / "configs" / app / "nonft.config",
+                                       system="nonft", ratio=ratio,
+                                       footprint_bytes=10_000_000,
+                                       server_addr="192.0.2.20", server_port=1998,
+                                       ib_device="mlx5_0"))
+                local = 10_000_000 * ratio // 100
+                resident = (local * 8 + 5) // 10 if ratio <= 50 else local - 1_000_000
+                self.assertEqual(config["ft_method"], "none")
+                self.assertEqual(config["enable_selective_backup"], "1")
+                self.assertEqual(config["remote_backup_mode"], "object_profiled")
+                self.assertEqual(config["remote_backup_budget_bytes"], "1000000")
+                self.assertEqual(int(config["local_resident_budget_bytes"]), resident)
+                self.assertEqual(config["enable_region_resident_placement"], "1")
+                self.assertEqual(config.get("region_placement_bind_groups", "0"), "0")
+
+    def test_backup_defaults_follow_system(self):
+        for system in ("nonft", "starfish", "hydra", "carbink"):
+            template = AE / "configs/llama" / (system + ".config")
+            config = values(render(template, system=system, ratio=25,
+                                   footprint_bytes=10_000_000,
+                                   server_addr="192.0.2.20", server_port=1998,
+                                   ib_device="mlx5_0"))
+            enabled = system in {"nonft", "starfish"}
+            self.assertEqual(config["enable_selective_backup"],
+                             "1" if enabled else "0")
+            self.assertEqual(config["remote_backup_budget_bytes"],
+                             "1000000" if enabled else "0")
+            if not enabled:
+                self.assertEqual(config["remote_backup_budget_pct"], "0")
+            self.assertEqual(config["ft_method"],
+                             {"starfish": "ec_batch", "nonft": "none"}.get(system, system))
 
     def test_ec_recipe_requires_explicit_endpoints_for_legacy_override(self):
         template = AE / "configs" / "wordcount" / "recomputable_ec.config"
@@ -111,13 +138,18 @@ class Design2Profile(unittest.TestCase):
         self.assertEqual(config["server_ports"], ",".join(str(1998 + i) for i in range(6)))
         with self.assertRaises(ValueError):
             render(template, system="starfish", ratio=25,
-                   footprint_bytes=10_000_000, server_addr="192.0.2.20",
-                   server_port=1998, ib_device="mlx5_0")
+                   footprint_bytes=10_000_000, ib_device="mlx5_0")
 
     def test_ec_template_endpoints_are_preserved_without_override(self):
-        template = AE / "configs" / "wordcount" / "recomputable_ec.config"
-        config = values(render(template, system="starfish", ratio=25,
-                               footprint_bytes=10_000_000, ib_device="mlx5_0"))
+        # Legacy explicit external recipes still retain their endpoint lists;
+        # shipped application recipes now intentionally have no deployment.
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "external.config"
+            template.write_text("server_count 6\nserver_addrs " +
+                                ",".join(["192.0.2.20"] * 6) +
+                                "\nserver_ports 1400,1401,1402,1403,1404,1405\n")
+            config = values(render(template, system="starfish", ratio=25,
+                                   footprint_bytes=10_000_000, ib_device="mlx5_0"))
         self.assertEqual(config["server_count"], "6")
         self.assertEqual(config["server_ports"], "1400,1401,1402,1403,1404,1405")
 
@@ -151,6 +183,23 @@ class Design2Profile(unittest.TestCase):
 
     def test_dynamic_target_is_not_mistaken_for_actual_supply(self):
         self.assertEqual(validate_design2(ledger().replace("target=1", "target=2"))["local_regions"], 6)
+
+    def test_bfs_profiles_are_validated_independently(self):
+        log = "\n".join(
+            f"gapbs_bfs_iteration_begin iteration={i}\n" + ledger()
+            + f"\ngapbs_bfs_phase_stats phase=work iteration={i}"
+            for i in range(3))
+        evidence = validate_design2(log, expected_bfs_repetitions=3)
+        self.assertEqual(evidence["work_profiles"], 3)
+        self.assertEqual(len(evidence["per_work_profile"]), 3)
+        with self.assertRaises(ValueError):
+            validate_design2(log, expected_bfs_repetitions=2)
+        truncated = log.rsplit("simple_region_budget.six_final", 1)
+        incomplete = truncated[0] + truncated[1].split("\n", 1)[1]
+        with self.assertRaises(ValueError):
+            validate_design2(incomplete, expected_bfs_repetitions=3)
+        with self.assertRaises(ValueError):
+            validate_design2(log + "\n" + ledger(), expected_bfs_repetitions=3)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ SYSTEM_STYLES = {
     "carbink": dict(label="Carbink", facecolor="#b86b43", hatch="\\"),
     "starfish": dict(label="Starfish", facecolor="#4c78a8", hatch="|"),
     "nonft": dict(label="Non-FT", facecolor="#7aa37a", hatch=""),
+    "nonft-backup-off": dict(label="Non-FT (backup off)",
+                              facecolor="#7aa37a", hatch="//"),
 }
 
 
@@ -36,7 +38,7 @@ def read_csv(path: Path, required: set[str]):
     return rows, hashlib.sha256(payload).hexdigest()
 
 
-def get_pyplot():
+def get_pyplot(*, paper_font=None):
     """Headless rendering for SSH sessions; no display or LaTeX required."""
     try:
         import matplotlib
@@ -46,8 +48,20 @@ def get_pyplot():
         ) from exc
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    if paper_font is not None:
+        from matplotlib import font_manager
+        font_dir = Path(os.environ.get(
+            "STARFISH_PAPER_FONT_DIR", Path.home() / ".local/share/fonts/starfish-paper"))
+        for path in sorted(font_dir.glob("*.ttf")):
+            font_manager.fontManager.addfont(str(path))
+        try:
+            font_manager.findfont(paper_font, fallback_to_default=False)
+        except ValueError as exc:
+            raise RuntimeError(f"{paper_font} is required to preserve the paper font; "
+                               "set STARFISH_PAPER_FONT_DIR to its font directory") from exc
     plt.rcParams.update({
-        "font.family": "DejaVu Sans",
+        "font.family": paper_font or "DejaVu Sans",
+        "mathtext.fontset": "stix" if paper_font == "Times New Roman" else "dejavusans",
         "font.size": 18,
         "axes.titlesize": 25,
         "axes.labelsize": 21,

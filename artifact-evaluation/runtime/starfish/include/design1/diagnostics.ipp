@@ -6,10 +6,10 @@ inline void ConcurrentArrayCache::print_design1_diagnostics() const {
     if (batched_backup_budget) {
         batched_backup_budget->reclaim_idle();
         const auto c = batched_backup_budget->snapshot();
+        print_nonresident_backup_snapshot("after_cleanup");
         ASSERT(c.actual_bytes == 0 && c.issued_bytes == 0 && c.cached_bytes == 0);
         ASSERT(retained_backup_bytes.load() == 0 && peak_retained_backup_bytes.load() == 0);
         std::cout << "remote backup peak kind: issued_upper_bound" << std::endl;
-        print_nonresident_backup_snapshot("after_cleanup");
     }
     std::cout << "remote backup budget bytes: " << retained_backup_budget_bytes
               << std::endl;

@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <fstream>
 
+#include "latency_mode.hpp"
 #include "cache/cache.hpp"
 #include "utils/control.hpp"
 #include "utils/debug.hpp"
@@ -193,12 +194,18 @@ std::vector<UniqueFarPtr<AdjacencyList>> adjacency_lists;
 bool readGraph(const std::string& filename,
                std::vector<std::vector<uint64_t>>& adjList,
                uint64_t& numVertices,
-               const GraphLoadAffinity &load_affinity) {
+               const GraphLoadAffinity &load_affinity,
+               std::vector<nq_latency::OracleQuery>* latency_oracle = nullptr) {
 
     uint64_t start_time = read_tsc();
     auto progress_start = std::chrono::steady_clock::now();
     if (!readGraph_parallel(filename, adjList, numVertices, load_affinity)) {
         return false;
+    }
+    if (latency_oracle) {
+        if (numVertices != 65608366 || adjList.size() != 65608367)
+            throw std::invalid_argument("NQ latency requires the full Friendster graph");
+        *latency_oracle = nq_latency::make_oracle(adjList, numVertices);
     }
     uint64_t end_time = read_tsc();
     std::cout << "readGraph_parallel time: " << end_time - start_time << " cycles" << std::endl;
@@ -328,6 +335,9 @@ bool resident_state_check_enabled() {
 
 void print_resident_state(const char *phase, bool quiesced = false) {
     if (!resident_state_check_enabled()) return;
+#ifdef FARLIB_NQ_NONFT_COMPAT
+    throw std::runtime_error("NHOP_RESIDENT_STATE_CHECK requires the Starfish runtime");
+#else
     const auto s = Cache::get_default()->simple_resident_state_snapshot();
     const bool budgets_ok = s.backup_used_bytes <= s.backup_budget_bytes &&
                            s.backup_peak_bytes <= s.backup_budget_bytes &&
@@ -352,13 +362,34 @@ void print_resident_state(const char *phase, bool quiesced = false) {
               << " mapping_ok=" << mapping_ok << std::endl;
     if (quiesced && (!budgets_ok || !mapping_ok))
         throw std::runtime_error("NQ Resident/group state invariant failed");
+#endif
 }
 
 int main(int argc, char *argv[]) {
+    if (argc == 2 && std::string(argv[1]) == "--describe-latency-mode") {
+        std::fputs("nq_latency_capability schema=1 arrival=poisson_per_fibre "
+                   "include_queue_wait=1 hist_sample_period=1 "
+                   "queue_deadline=drop_before_execution\n", stdout);
+        return 0;
+    }
     if (argc != 3) {
         std::cerr << "Usage: " << argv[0] << " <config_path> <graph_path>" << std::endl;
         return -EINVAL;
     }
+    std::optional<nq_latency::Options> latency_options;
+    try {
+        latency_options = nq_latency::options_from_env();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "\nnq_latency_error reason=configuration detail=%s\n",
+                     error.what());
+        return 2;
+    }
+#ifdef FARLIB_NQ_NONFT_COMPAT
+    if (resident_state_check_enabled()) {
+        std::cerr << "NHOP_RESIDENT_STATE_CHECK requires the Starfish runtime" << std::endl;
+        return 2;
+    }
+#endif
 
     const GraphLoadAffinity graph_load_affinity;
     std::string config_path = argv[1];
@@ -371,10 +402,28 @@ int main(int argc, char *argv[]) {
 
     profile::reset_all();
     std::vector<std::vector<uint64_t>> adjList;
+    std::vector<nq_latency::OracleQuery> latency_oracle;
     uint64_t numVertices;
     auto phase_before = collect_phase_stats();
     auto phase_start = std::chrono::steady_clock::now();
-    readGraph(graph_path, adjList, numVertices, graph_load_affinity);
+    if (latency_options) {
+        bool loaded = false;
+        try {
+            loaded = readGraph(graph_path, adjList, numVertices, graph_load_affinity,
+                               &latency_oracle);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "\nnq_latency_error reason=graph_load detail=%s\n",
+                         error.what());
+        }
+        if (!loaded) {
+            Cache::quiesce_default();
+            adjacency_lists.clear();
+            runtime_destroy();
+            return 2;
+        }
+    } else {
+        readGraph(graph_path, adjList, numVertices, graph_load_affinity);
+    }
     auto phase_stop = std::chrono::steady_clock::now();
     print_phase_stats(
         "load_build",
@@ -400,6 +449,48 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "Check data integrity done" << std::endl;
     print_resident_state("work_begin");
+
+    if (latency_options) {
+        const auto query = [](uint64_t vertex) {
+            RootDereferenceScope scope;
+            return benchmark_lite(vertex, scope);
+        };
+        const auto parallel = [](size_t count, auto& worker) {
+            uthread::fork_join(count, worker);
+        };
+        bool measured = false, verified = false;
+        profile::reset_all();
+        perf_profile([&] {
+            profile::start_work();
+            profile::thread_start_work();
+            try {
+                if (config.max_thread_cnt * get_uthread_factor() != nq_latency::Fibres)
+                    throw std::invalid_argument("NQ latency requires 48 query fibres");
+                measured = nq_latency::run(*latency_options, numVertices,
+                    adjacency_lists.size(), uthread::get_worker_count(), query,
+                    parallel, [] { uthread::yield(); });
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "\nnq_latency_error reason=measurement detail=%s\n",
+                             error.what());
+            }
+            profile::thread_end_work();
+            profile::end_work();
+        }).print();
+        try {
+            verified = nq_latency::post_verify(latency_oracle, query);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "\nnq_latency_error reason=post_verify detail=%s\n",
+                         error.what());
+        }
+        profile::print_profile_data();
+        allocator::remote::remote_global_heap.print_used_memory();
+        Cache::quiesce_default();
+        print_resident_state("work_end", true);
+        adjacency_lists.clear();
+        print_resident_state("after_cleanup", true);
+        runtime_destroy();
+        return measured && verified ? 0 : 2;
+    }
 
     #ifdef DEBUGGING
     RootDereferenceScope scope;

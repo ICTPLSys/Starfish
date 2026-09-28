@@ -42,12 +42,13 @@ inline void ConcurrentArrayCache::carbink_start_workers() {
     carbink_scanner_ = background_cluster_
         ? uthread::create_on<true>(*background_cluster_, scan, this, "carbink scanner")
         : uthread::create<true>(scan, this, "carbink scanner");
-    std::cout << "carbink.compaction workers=" << carbink_worker_count_
-              << " scanner=1 batch_max_spans=8 queue_capacity=1024"
-              << " scan_low_watermark=512 logical_client_base="
-              << ::FarLib::get_config().compaction_client_base()
-              << " os_workers=" << ::FarLib::get_config().runtime_worker_count()
-              << " rdma_clients=" << ::FarLib::get_config().runtime_client_count() << '\n';
+    std::fprintf(stderr,
+                 "\ncarbink.compaction workers=%zu scanner=1 batch_max_spans=8 queue_capacity=1024"
+                 " scan_low_watermark=512 logical_client_base=%zu os_workers=%zu rdma_clients=%zu\n",
+                 static_cast<size_t>(carbink_worker_count_),
+                 static_cast<size_t>(::FarLib::get_config().compaction_client_base()),
+                 static_cast<size_t>(::FarLib::get_config().runtime_worker_count()),
+                 static_cast<size_t>(::FarLib::get_config().runtime_client_count()));
 }
 
 inline void ConcurrentArrayCache::carbink_stop_workers() {

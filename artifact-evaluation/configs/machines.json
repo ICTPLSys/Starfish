@@ -5,7 +5,17 @@
   "servers": [
     {"ip": "10.208.130.22", "hostname": "cpuserver22", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 1, "link_layer": "InfiniBand", "link_gbps": 100},
     {"ip": "10.208.130.54", "hostname": "memserver54", "cpu": "Xeon Silver 4316", "physical_cores_per_numa": 20, "ib_device": "mlx5_0", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100},
-    {"ip": "10.208.130.56", "hostname": "cpuserver56", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100, "fibre_workers": 24, "fibre_cpu_set": "0-17,24-29", "background_cpu_base": 18, "allow_cross_numa_app": true},
+    {"ip": "10.208.130.56", "hostname": "cpuserver56", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100, "fibre_workers": 24, "fibre_cpu_set": "0-17,24-29", "background_cpu_base": 18, "allow_cross_numa_app": true,
+      "placement_by_system": {
+        "carbink": {"fibre_cpu_set": "0-12,24-34", "background_cpu_base": 13}
+      },
+      "placement_by_case": {
+        "bfs/carbink": {"fibre_cpu_set": "0-10,24-36", "background_cpu_base": 11},
+        "nq/starfish": {"fibre_cpu_set": "0-14,24-32", "background_cpu_base": 15},
+        "bfs/hydra": {"fibre_cpu_set": "0-15,24-31", "background_cpu_base": 16},
+        "llama/hydra": {"fibre_cpu_set": "0-15,24-31", "background_cpu_base": 16}
+      }
+    },
     {"ip": "10.208.130.58", "hostname": "cpuserver58", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100},
     {"ip": "10.208.130.74", "hostname": "cpuserver74", "cpu": "Xeon Gold 6342", "physical_cores_per_numa": 24, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100},
     {"ip": "10.208.130.76", "hostname": "memserver76", "cpu": "Xeon Silver 4316", "physical_cores_per_numa": 20, "ib_device": "mlx5_1", "ib_port": 1, "numa_node": 0, "link_layer": "InfiniBand", "link_gbps": 100},

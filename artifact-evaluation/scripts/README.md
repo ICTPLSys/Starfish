@@ -16,6 +16,7 @@ experiment commands and result files are described in
 | Check LLaMA 25% with Non-FT, Starfish and recovery | `bash scripts/run_fast_check.sh` |
 | Build MG explicitly | `bash scripts/common/build.sh --system nonft --targets server,mg --jobs 4` |
 | Plan a Figure 9 batch | `bash scripts/figure9/run.sh --dry-run --apps llama,bfs --systems nonft` |
+| Plan a Figure 12 batch | `bash scripts/figure12/run.sh --dry-run` |
 | Plot a CSV | `bash scripts/plot.sh figure9 --input data/figure9.csv` |
 
 Select the runtime with `build.sh --system` and set the server IPs in a site
@@ -41,7 +42,6 @@ bash scripts/plot.sh figure11 --input data/figure11.csv
 bash scripts/plot.sh figure12 --input data/figure12.csv
 bash scripts/plot.sh figure13 --recovery-csv data/figure13-recovery.csv \
   --throughput-csv data/figure13-throughput.csv
-bash scripts/plot.sh appendix access --data-dir data/benchmark_suites
 ```
 
 Measured output defaults to `results/figures/<figure>/`. Pass
@@ -55,11 +55,11 @@ non-measured preview; those outputs use separate names.
   `results/figures/figure9/figure9.{png,pdf,json}`.
 - [Figure 10](figure10/README.md): KV-B and NQ tail-latency CSV.
 - [Figure 11](figure11/README.md): traffic, remote CPU, and remote-memory CSV.
-- [Figure 12](figure12/README.md): compute-node overhead CSV.
+- [Figure 12](figure12/README.md): compute-node EC reference-cycle counts and
+  final Work metadata snapshot. Use its instrumented runner; ordinary
+  Figure 9 logs without these records cannot supply both metrics.
 - [Figure 13](figure13/README.md): recovery summary plus observed throughput
   trace CSVs.
-- [Appendix](appendix/README.md): access-amplification and object-size CDF
-  CSVs.
 
 Each figure-specific guide describes its input columns, units, plotting
 options and output paths.

@@ -269,8 +269,11 @@ class Controller {
         return label(new_index);
     }
 public:
-    explicit Controller(const char *name, Mode m, bool resident_bands = false)
-        : name_(name), mode_(m), local_resident_mode_(resident_bands) {}
+    explicit Controller(const char *name, Mode m, bool resident_bands = false,
+                        std::atomic<Controller *> *publication = nullptr)
+        : name_(name), mode_(m), local_resident_mode_(resident_bands) {
+        if (publication) publication->store(this, std::memory_order_release);
+    }
     bool local_resident_mode() const { return local_resident_mode_; }
     void configure(size_t region_bytes) {
         if (region_bytes == 0) throw std::invalid_argument("zero budget Region size");
@@ -716,9 +719,24 @@ public:
         }
     }
 };
+// Metadata reporting must not instantiate a disabled function-local static.
+inline std::atomic<Controller *> local_instance{nullptr};
+inline std::atomic<Controller *> remote_instance{nullptr};
 inline Controller &local() {
-    static Controller c("local", mode(), local_resident_enabled());
+    static Controller c("local", mode(), local_resident_enabled(), &local_instance);
     return c;
 }
-inline Controller &remote() { static Controller c("remote", mode(), false); return c; }
+inline Controller &remote() {
+    static Controller c("remote", mode(), false, &remote_instance);
+    return c;
+}
+inline uint64_t existing_metadata_bytes() noexcept {
+    uint64_t bytes = 0;
+    if (local_instance.load(std::memory_order_acquire)) bytes += sizeof(Controller);
+    if (remote_instance.load(std::memory_order_acquire)) bytes += sizeof(Controller);
+    return bytes;
+}
+inline constexpr uint64_t metadata_observer_bytes() noexcept {
+    return sizeof(local_instance) + sizeof(remote_instance);
+}
 } // namespace FarLib::simple_region_budget

@@ -42,6 +42,8 @@ option(FARLIB_BUILD_MG "Build the MG application" OFF)
 option(FARLIB_BUILD_DIAGNOSTICS "Build manual Hydra benchmarks and RDMA checks" OFF)
 option(FARLIB_BUILD_WORDCOUNT
        "Build the Wordcount application" OFF)
+option(FARLIB_BUILD_KVS "Build the aligned 512-byte KV throughput benchmark" OFF)
+option(FARLIB_BUILD_NQ "Build the Friendster n-hop graph benchmark" OFF)
 
 # This macro changes ConcurrentArrayCache layout. Keep runtime and every
 # header consumer on the same numeric value, including standalone diagnostics.
@@ -124,6 +126,13 @@ set(FARLIB_LLAMA_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/benchmark/llama")
 set(FARLIB_BFS_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/benchmark/microbenchmarks")
 add_subdirectory("${FARLIB_APPS_DIR}/llama" "${CMAKE_CURRENT_BINARY_DIR}/apps/llama")
 add_subdirectory("${FARLIB_APPS_DIR}/bfs" "${CMAKE_CURRENT_BINARY_DIR}/apps/bfs")
+if(FARLIB_BUILD_KVS)
+    add_subdirectory("${FARLIB_APPS_DIR}/kvs" "${CMAKE_CURRENT_BINARY_DIR}/apps/kvs")
+endif()
+if(FARLIB_BUILD_NQ)
+    set(FARLIB_NQ_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/benchmark/microbenchmarks")
+    add_subdirectory("${FARLIB_APPS_DIR}/nq" "${CMAKE_CURRENT_BINARY_DIR}/apps/nq")
+endif()
 if(FARLIB_BUILD_MG)
     set(FARLIB_MG_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/benchmark/mg")
     add_subdirectory("${FARLIB_APPS_DIR}/mg" "${CMAKE_CURRENT_BINARY_DIR}/apps/mg")

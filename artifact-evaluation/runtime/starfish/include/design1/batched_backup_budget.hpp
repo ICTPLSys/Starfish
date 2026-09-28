@@ -129,10 +129,12 @@ private:
 public:
     explicit BatchedBackupBudget(uint64_t limit, uint64_t quantum = 256 * 1024)
         : state(std::make_shared<State>(limit, quantum)) {}
-    bool acquire(Handle &handle, uint64_t bytes) {
+    bool acquire(Handle &handle, uint64_t bytes,
+                 bool reclaim_idle_on_failure = true) {
         if (bytes > state->limit) return false;
         auto &a = local(handle);
-        for (unsigned attempt = 0; attempt != 2; ++attempt) {
+        const unsigned attempts = reclaim_idle_on_failure ? 2 : 1;
+        for (unsigned attempt = 0; attempt != attempts; ++attempt) {
             a.lock();
             if (a.credit >= bytes || state->grant(a, bytes - a.credit)) {
                 a.credit -= bytes;
@@ -141,9 +143,11 @@ public:
                 a.unlock();
                 return true;
             }
-            if (attempt == 0) ++a.scans;
+            if (attempt == 0 && reclaim_idle_on_failure) ++a.scans;
             a.unlock();
-            if (attempt == 0) state->reclaim_idle();
+            // Opportunistic admission can leave bounded credits with other
+            // owners; a full budget must not turn every rejection into a scan.
+            if (attempt == 0 && reclaim_idle_on_failure) state->reclaim_idle();
         }
         return false;
     }

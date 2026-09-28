@@ -141,6 +141,10 @@ retry:
     }
     auto entry = &get_entry_of(obj);
     auto old_state = entry->load_state();
+    // Pending-Resident unmarking must also respect the placement move lock.
+    if (old_state.invalid) [[unlikely]] {
+        return BUSY;
+    }
     if (::FarLib::allocator::block_to_region(block)
             ->profile_pending_resident()) {
         if (old_state.state == MARKED) {
@@ -172,10 +176,6 @@ retry:
     switch (new_state.state) {
     case MARKED: {
         if (::FarLib::get_config().exclusive_cache) {
-            if (old_state.invalid) [[unlikely]] {
-                return BUSY;
-            }
-
             const auto &ft_config = ::FarLib::get_config();
             // Acquire move-lock (invalid bit) to serialize remote_addr mutation and
             // to prevent "interrupt eviction" once remote allocation begins.
@@ -193,6 +193,14 @@ retry:
             const auto behavior_group = remote_behavior_group(
                 *entry, reinterpret_cast<uintptr_t>(block));
             uint64_t remote_addr = entry->remote_addr();
+            // Capture failed backing placement before invalidating a clean
+            // backup below. A completed degraded source may already have had
+            // its old address retired, but retains the closed READ-epoch bit.
+            const bool repair_eligible = ft_config.ft_rmw_read_failure_fallback &&
+                ec_batch_candidate &&
+                (remote_allocator.small_object_stripe_manager().data_address_needs_replacement(remote_addr) ||
+                 (::FarLib::allocator::normal_read_recovery_active(block) &&
+                  remote_allocator.small_object_stripe_manager().recovery_replacement_enabled()));
 
             // Revalidate the clean backup while holding the same move-lock used
             // for every remote-address mutation.  A recovered object can still
@@ -296,7 +304,19 @@ retry:
             }
             const bool direct_source = ec_batch_candidate && buffer_set.direct_builder &&
                 !ec_batch_uses_split(obj.size) && obj.size <= 4096 &&
-                ::FarLib::allocator::try_borrow_ec_write_source(block);
+                ::FarLib::allocator::try_borrow_ec_write_source(
+                    block, ft_config.ft_rmw_read_failure_fallback);
+            if (ft_config.ft_rmw_read_failure_fallback && ec_batch_candidate &&
+                buffer_set.direct_builder && !ec_batch_uses_split(obj.size) &&
+                obj.size <= 4096 && !direct_source) {
+                // An active recovery owner/READ still pins this local source.
+                // Retain MARKED and retry later; never admit an unowned source
+                // to the phased zero-copy writer.
+                auto unlocked = lock_state;
+                unlocked.invalid = 0;
+                ASSERT(entry->cas_state_strong(lock_state, unlocked));
+                return BUSY;
+            }
             auto evict_state = lock_state;
             evict_state.invalid = 0;
             evict_state.dirty = 0;
@@ -316,6 +336,7 @@ retry:
             // entry already owns its write reference before the group that
             // contains it can be posted.
             buffer_set.staging_original_remote_addr = remote_addr;
+            buffer_set.staging_repair_eligible = repair_eligible;
             const bool ec_batch_grouped =
                 ec_batch_candidate &&
                 stage_ec_batch_object(buffer_set, block->get_object_ptr(), obj.size, entry,

@@ -54,6 +54,9 @@ std::string format_scientific(int64_t value) {
     return ss.str();
 }
 
+// Protect registry structure and each registered TLS object's lifetime through
+// snapshots and exit-time merging. Per-thread counter increments remain local.
+std::mutex profile_data_map_mutex;
 std::unordered_map<std::thread::id, ThreadLocalProfileData *> profile_data_map;
 thread_local ThreadLocalProfileData tlpd;
 // Only exit-time merge and post-work snapshot take this mutex, never READs.
@@ -415,13 +418,12 @@ void print_allocation_wait_diagnostics() {
 }
 
 void ThreadLocalProfileData::register_thread() {
-    static std::mutex mtx;
-    mtx.lock();
+    std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex);
     profile_data_map[std::this_thread::get_id()] = this;
-    mtx.unlock();
 }
 
 void ThreadLocalProfileData::unregister_thread() {
+    std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex);
     global_profile_data.work_cycles += work_cycles;
     global_profile_data.allocate_cycles += allocate_cycles;
     global_profile_data.post_fetch_cycles += post_fetch_cycles;
@@ -647,8 +649,8 @@ void ThreadLocalProfileData::unregister_thread() {
     profile_data_map.erase(std::this_thread::get_id());
 }
 
-// Requires the existing profile-registry quiescence contract. NQ invokes this
-// after its query fork_join and progress-thread join, before runtime teardown.
+// Histogram-writing workers must be quiescent. NQ invokes this after its query
+// fork_join and progress-thread join; the registry lock protects TLS lifetimes.
 // Use heap storage: an 8192-counter snapshot must not consume a Fibre's 64KiB stack.
 void print_rdma_read_size_histogram() {
     if (!read_size_profile::enabled()) return;
@@ -658,6 +660,8 @@ void print_rdma_read_size_histogram() {
     }
     auto snapshot = std::make_unique<read_size_profile::Histogram>();
     {
+        // Keep the same registry -> histogram order as unregister_thread().
+        std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex);
         std::lock_guard<std::mutex> lock(read_size_histogram_mutex);
         snapshot->merge(*global_profile_data.rdma_read_size_histogram);
         for (const auto &it : profile_data_map) {
@@ -688,10 +692,13 @@ void print_rdma_read_size_histogram() {
 }
 
 void reset_all() {
-    global_profile_data.reset();
-    evac_active_worker_count.store(0, std::memory_order_relaxed);
-    for (auto &it : profile_data_map) {
-        it.second->reset();
+    {
+        std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex);
+        global_profile_data.reset();
+        evac_active_worker_count.store(0, std::memory_order_relaxed);
+        for (auto &it : profile_data_map) {
+            it.second->reset();
+        }
     }
     {
         std::lock_guard<std::mutex> lock(frequency_histogram_mutex);
@@ -881,6 +888,7 @@ void print_full_population_frequency_history() {
 
 #define DEFINE_COLLECT(FIELD)                    \
     int64_t collect_##FIELD() {                  \
+        std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex); \
         int64_t sum = global_profile_data.FIELD; \
         for (auto &it : profile_data_map) {      \
             sum += it.second->FIELD;             \
@@ -890,6 +898,7 @@ void print_full_population_frequency_history() {
 
 #define DEFINE_COLLECT_EACH(FIELD)                    \
     int64_t collect_##FIELD() {                  \
+        std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex); \
         std::cout << std::setw(16) << #FIELD << std::setw(16) << global_profile_data.FIELD << std::endl; \
         for (auto &it : profile_data_map) {      \
             std::cout << std::setw(16) << #FIELD << std::setw(16) << "Thread ID " << it.first << ": " << it.second->FIELD << std::endl; \
@@ -1288,6 +1297,7 @@ void print_profile_data() {
     PRINT_IF("evac pop success", collect_evac_evict_pop_success(), enabled::Evacuation);
 #endif
     if constexpr (enabled::Evacuation) {
+        std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex);
         int64_t wr_active_min = INT64_MAX, wr_active_max = 0;
         int64_t round_active_min = INT64_MAX, round_active_max = 0;
         int64_t wr_active_threads = 0, round_active_threads = 0;
@@ -1395,6 +1405,7 @@ void print_rdma_trace() {
     if constexpr (TraceRDMA) {
         static std::atomic_flag printing = false;
         if (printing.test_and_set()) return;
+        std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex);
         for (auto &it : profile_data_map) {
             auto tid = it.first;
             auto data = it.second;
@@ -1422,6 +1433,7 @@ void print_alloc_trace() {
     if constexpr (TraceAlloc) {
         static std::atomic_flag printing = false;
         if (printing.test_and_set()) return;
+        std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex);
         for (auto &it : profile_data_map) {
             auto tid = it.first;
             auto data = it.second;
@@ -1441,6 +1453,7 @@ void print_mem_usage_trace() {
     if constexpr (TraceMemoryUsage) {
         static std::atomic_flag printing = false;
         if (printing.test_and_set()) return;
+        std::lock_guard<std::mutex> registry_lock(profile_data_map_mutex);
         for (auto &it : profile_data_map) {
             auto tid = it.first;
             auto data = it.second;

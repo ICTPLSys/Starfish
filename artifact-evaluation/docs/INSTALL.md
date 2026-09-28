@@ -30,8 +30,10 @@ Use a Linux x86-64 host with:
 
 A live memory server is not required for a build. A run additionally needs a
 separate memory server, RDMA connectivity, compute-side HugePages, the site
-configuration, and the declared workload inputs. WireGuard is an access path;
-it is not the RDMA data path.
+configuration, and the declared workload inputs. Reviewers access the supplied
+compute server using the SSH jump command in the [README](../../README.md);
+no reviewer-side VPN setup is required. This access path is separate from the
+RDMA data path.
 
 ## 1. Inspect and prepare dependencies
 

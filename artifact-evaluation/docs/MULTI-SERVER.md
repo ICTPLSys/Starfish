@@ -19,6 +19,9 @@ The file contains:
 {
   "name": "eight-server",
   "compute_ip": "10.208.130.56",
+  "memory_endpoint_indices_by_system": {
+    "carbink": [0, 1, 2, 3, 4, 5]
+  },
   "memory_endpoints": [
     {"ip": "10.208.130.22"},
     {"ip": "10.208.130.54"},
@@ -36,6 +39,16 @@ physical server; the fast check uses six active EC endpoints and endpoint 6
 (server 84) as standby. The recovery case terminates only the owned service
 process on endpoint 0 (server 22), not the machine or unrelated processes.
 Arrange access to all machines before running.
+
+This is also the default used when either data-registration command creates
+a new data/site.json; an existing site is preserved. The full inventory has
+seven distinct memory hosts. The current steady-state Carbink protocol selects
+indices 0–5 (six hosts), leaving server84 reserved; this does not enable
+Carbink recovery. Selection indices refer to inventory positions; the selected
+runtime endpoints are numbered consecutively in selection order.
+
+Machine56's per-system/application CPU defaults keep 24 application workers
+and each recipe's original background workers. See [configuration layout](../configs/README.md).
 
 For a two-machine check, use this instead:
 

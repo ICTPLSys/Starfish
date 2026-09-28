@@ -159,7 +159,7 @@ def main() -> int:
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.dry_run and not args.site.exists() and args.site == ROOT / "data/site.json":
-        args.site = ROOT / "scripts/common/site.example.json"
+        args.site = ROOT / "scripts/common/site.eight-server.example.json"
     try:
         return execute(args)
     except (OSError, RuntimeError, ValueError) as exc:

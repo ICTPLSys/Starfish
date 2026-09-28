@@ -1773,22 +1773,26 @@ inline void ConcurrentArrayCache::gc_phase(
 
 inline void ConcurrentArrayCache::flip_scope_state(uint32_t epoch_to_release) {
         log_cache_progress("flip_scope_begin", kAnyAllocBin, epoch_to_release);
-        auto old_state =
-            mutator_states.global_state.load(std::memory_order::relaxed);
+        const int old_state = scope_counter_shards_enabled
+            ? scope_counters.flip()
+            : static_cast<int>(mutator_states.global_state.load(std::memory_order::relaxed));
         auto new_state = old_state == InScopeV0 ? InScopeV1 : InScopeV0;
         // Do not pre-wait on new_state. Under heavy contention this can livelock
         // and block progress; the required safety barrier is draining old_state
         // after publishing the new global state.
-        mutator_states.global_state.store(new_state);
+        if (!scope_counter_shards_enabled) mutator_states.global_state.store(new_state);
+        const auto old_count = [&]() -> int64_t {
+            return scope_counter_shards_enabled
+                ? static_cast<int64_t>(scope_counters.old_count(old_state))
+                : static_cast<int64_t>(mutator_states.count[old_state].load(std::memory_order::acquire));
+        };
         scope_diag::begin_flip(epoch_to_release, old_state);
-        int64_t old_entry_count =
-            (int64_t)mutator_states.count[old_state].load(std::memory_order::acquire);
+        int64_t old_entry_count = old_count();
         if (old_entry_count > 0) {
             profile::count_evac_flip_wait_old_blocked_flip(old_entry_count);
         }
         while (true) {
-            int64_t observed_old =
-                (int64_t)mutator_states.count[old_state].load(std::memory_order::acquire);
+            int64_t observed_old = old_count();
             scope_diag::snapshot(epoch_to_release, observed_old);
             if (observed_old == 0) break;
             static thread_local uint64_t flip_wait_loop = 0;

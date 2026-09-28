@@ -7,6 +7,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "config.hpp"
 #include "utils/debug.hpp"
@@ -295,6 +298,21 @@ struct QueuePair {
             .rnr_retry = config.qp_rnr_retry,
         };
         CHECK_ERR(ibv_modify_qp(queue_pair, &qp_attr, attr_mask));
+        // Startup-only, opt-in evidence for failure experiments. Never change
+        // timeout/retry policy while measuring a recovery curve.
+        const char *diagnostics=std::getenv("FARLIB_RDMA_QP_DIAGNOSTICS");
+        if (diagnostics && std::strcmp(diagnostics,"1")==0) {
+            ibv_qp_attr actual{};
+            ibv_qp_init_attr initial{};
+            CHECK_ERR(ibv_query_qp(queue_pair,&actual,
+                IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|
+                IBV_QP_MIN_RNR_TIMER,&initial));
+            std::fprintf(stderr,
+                "rdma_qp_diagnostic qpn=%u requested_timeout=%u actual_timeout=%u requested_retry=%u actual_retry=%u actual_rnr_retry=%u actual_min_rnr_timer=%u\n",
+                queue_pair->qp_num,unsigned(config.qp_timeout),unsigned(actual.timeout),
+                unsigned(config.qp_retry_cnt),unsigned(actual.retry_cnt),
+                unsigned(actual.rnr_retry),unsigned(actual.min_rnr_timer));
+        }
     }
 };
 

@@ -2,6 +2,7 @@
 #include "cache/concurrent_cache.hpp"
 #include "cache/alloc/small_object_stripe_codec.hpp"
 #include "utils/ec_rmw_timing.hpp"
+#include "cache/alloc/ec_rmw_fallback_policy.hpp"
 
 namespace FarLib::cache {
 void prepare_ec_rmw_timing(size_t owners) {
@@ -82,6 +83,11 @@ bool ConcurrentArrayCache::try_publish_ec_rmw_address(
 bool ConcurrentArrayCache::stage_ec_rmw_object(
     EvictBufferSet &buffers, void *source, size_t size, FarObjectEntry *entry,
     uint32_t behavior) {
+    // Consume the per-object handoff exactly once; persistent buffers must
+    // not carry eligibility into another object or non-exclusive path.
+    const bool repair_eligible = ::FarLib::get_config().exclusive_cache &&
+                                 buffers.staging_repair_eligible;
+    buffers.staging_repair_eligible = false;
     if (!ec_rmw_workers_ || !buffers.direct_builder || !source || !entry ||
         ec_batch_uses_split(size) || size == 0 || size > rdma::ec_rmw::kMaxBytes ||
         !::FarLib::allocator::ec_write_source_borrowed(
@@ -98,6 +104,14 @@ bool ConcurrentArrayCache::stage_ec_rmw_object(
         // Genuine bounded-bank backpressure progresses all batches/owner CQs.
         flush_ec_rmw_objects(buffers, rdma::thread_info.thread_id);
         batch = worker.find_fill_batch();
+        // After a fault, all producer banks may wait for replacement capacity.
+        // Do not pin every eviction OS worker in a tight retry loop while the
+        // repair fibres sharing this cluster need to finish reconstruction.
+        if (ec_rmw_runtime::allow_background_bank_yield(
+                ::FarLib::get_config().ft_background_rebuild,
+                ec_recovery_dead_endpoints_.load(std::memory_order_acquire) != 0,
+                batch != nullptr))
+            uthread::yield();
     }
     profile::evict_breakdown::Scope enqueue_scope(
         buffers.breakdown, profile::evict_breakdown::Stage::RmwPrepare);
@@ -111,6 +125,7 @@ bool ConcurrentArrayCache::stage_ec_rmw_object(
     t.source = source;
     t.block = static_cast<::FarLib::allocator::BlockHead *>(source) - 1;
     t.original_remote = original;
+    t.repair_eligible = repair_eligible;
     t.size = uint32_t(size);
     t.behavior_group = behavior;
     ++worker.attempted;
@@ -185,8 +200,15 @@ void ConcurrentArrayCache::flush_ec_rmw_objects(EvictBufferSet &buffers, size_t 
             }
         };
         auto fallback = [&](Transaction &t, bool abort) {
-            if (::FarLib::ec_benchmark_phase::enabled())
+            const bool fault_fallback = abort &&
+                ec_rmw_runtime::allow_read_failure_fallback(
+                    config.ft_rmw_read_failure_fallback,
+                    config.ft_incremental_one_sided, t.read_error,
+                    t.read_terminal, t.writes_decided);
+            if (::FarLib::ec_benchmark_phase::enabled() && !fault_fallback)
                 ERROR("ec_benchmark_phase: fresh fallback prohibited after first Work; failed READ requires recovery");
+            if (abort && (t.read_terminal != All || t.read_error == 0))
+                ERROR("ec_rmw: failure fallback requires terminal failed READs");
             if (timing) timing->object[size_t(&t - batch.transactions.data())].fallback = true;
             if (t.writes_decided) ERROR("ec_rmw: abort after write decision");
             if (t.has_reservation()) {
@@ -198,12 +220,71 @@ void ConcurrentArrayCache::flush_ec_rmw_objects(EvictBufferSet &buffers, size_t 
             // Transfer the same borrowed source/ref to the immutable writer.
             // In one-sided mode the immutable writer also resolves the entry
             // from the borrowed source at publication, not a cached pointer.
-            if (!stage_ec_direct_object(buffers, t.source, t.size, nullptr, t.behavior_group))
+            if (!stage_ec_direct_object(buffers, t.source, t.size, nullptr,
+                                        t.behavior_group, fault_fallback, fault_fallback))
                 ERROR("ec_rmw: immutable fallback rejected borrowed source");
             retire_old(t);
             ++worker.fallback;
             if (abort) ++worker.aborted;
+            if (fault_fallback) {
+                ++worker.replacement_objects;
+                // Rare error-path evidence, once per logical owner. The existing
+                // worker-local counters retain the complete fallback total.
+                if (worker.aborted == 1)
+                    std::cout << "INFO: ec_rmw read_failure_fallback owner=" << owner
+                              << " read_error_mask=" << unsigned(t.read_error)
+                              << " source_bytes=" << t.size
+                              << " reads_drained=1 write_decision=0" << std::endl;
+            }
             t.clear();
+        };
+        bool grew_backup = false;
+        auto grow_backup = [&](Transaction &t) {
+            if (!manager.backup_growth_enabled()) return false;
+            if (t.has_reservation() || t.read_posted || t.write_posted)
+                ERROR("ec_rmw: growth requires an unreserved transaction");
+            if (!stage_ec_direct_object(buffers, t.source, t.size, nullptr,
+                                        t.behavior_group, true))
+                return false;
+            retire_old(t);
+            ++worker.growth_objects;
+            worker.growth_payload_bytes += t.size;
+            t.clear();
+            grew_backup = true;
+            return true;
+        };
+        auto replace_failed_capacity = [&](Transaction &t) {
+            const bool source_eligible = t.repair_eligible ||
+                manager.data_address_needs_replacement(t.original_remote);
+            const bool background_rebuild = ::FarLib::get_config().ft_background_rebuild &&
+                background_rebuild_state_.fully_rebuilt.load(std::memory_order_acquire);
+            if (!ec_rmw_runtime::allow_capacity_replacement(
+                    manager.recovery_replacement_enabled(), source_eligible,
+                    background_rebuild))
+                return false;
+            if (t.has_reservation() || t.read_posted || t.write_posted ||
+                t.writes_decided)
+                ERROR("ec_rmw: replacement requires unreserved, unposted source");
+            if (!stage_ec_direct_object(buffers, t.source, t.size, nullptr,
+                                        t.behavior_group, true, true))
+                ERROR("ec_rmw: repair_credit_or_capacity_exhausted");
+            if (!source_eligible && background_rebuild) {
+                static std::atomic<bool> reported{false};
+                if (!reported.load(std::memory_order_relaxed) &&
+                    !reported.exchange(true, std::memory_order_relaxed))
+                    std::cout << "INFO: ec_rmw background_capacity_liveness"
+                              << " source_eligible=0 bounded_failed_stripe_credit=1"
+                              << " no_posted_io=1" << std::endl;
+            }
+            retire_old(t);
+            ++worker.fallback;
+            ++worker.replacement_objects;
+            if (++worker.capacity_replacement_objects == 1)
+                std::cout << "INFO: ec_rmw recovery_replacement owner=" << owner
+                          << " source_bytes=" << t.size
+                          << " no_posted_io=1" << std::endl;
+            t.clear();
+            return true;
         };
         const bool bulk_reuse = ::FarLib::ec_benchmark_phase::enabled();
         if (timing) timing->bulk_allocator = bulk_reuse;
@@ -327,6 +408,8 @@ void ConcurrentArrayCache::flush_ec_rmw_objects(EvictBufferSet &buffers, size_t 
                         t.data_shard = t.reservation.data_shard;
                         if (timing && timing->object[indices[n]].busy_begin)
                             timing->object[indices[n]].busy_end = prepared_at;
+                    } else if (!busy && (grow_backup(t) || replace_failed_capacity(t))) {
+                        continue;
                     } else if (timing && busy) {
                         ++timing->busy_attempts;
                         auto &p = timing->object[indices[n]];
@@ -334,6 +417,15 @@ void ConcurrentArrayCache::flush_ec_rmw_objects(EvictBufferSet &buffers, size_t 
                     }
                 }
             }
+        }
+        if (grew_backup) {
+            const auto status = buffers.direct_builder->flush();
+            if (status != ec_batch::EcBatchStatus::kOk)
+                ERROR("ec_rmw: cannot seal backup growth groups");
+            auto *growth_client = rdma::get_client(client_idx);
+            if (!growth_client) ERROR("ec_rmw: missing growth client");
+            (void)post_ec_direct_pending(buffers, client_idx,
+                                         growth_client->get_qp_idx());
         }
         // Sole reservation/tag step, in batch preparation. Busy entries do
         // not block other transactions in the batch from completing writes.
@@ -560,6 +652,7 @@ void ConcurrentArrayCache::flush_ec_rmw_objects(EvictBufferSet &buffers, size_t 
                     if (read) {
                         t.read_posted |= bit;
                         ++worker.read_posts; worker.read_bytes += bytes;
+                        profile::work_traffic::count_rmw_read(bytes);
                         profile::count_evac_phase_rdma_read(profile::EvacRdmaTraffic::EcBatch, bytes);
                     } else {
                         t.write_posted |= bit;

@@ -145,8 +145,6 @@ repetition aggregation and plot options.
 | Figure 11: fault-tolerance resource cost | `bash scripts/plot.sh figure11 --input data/figure11.csv` | [Figure 11](../scripts/figure11/README.md) |
 | Figure 12: compute-node overhead | `bash scripts/plot.sh figure12 --input data/figure12.csv` | [Figure 12](../scripts/figure12/README.md) |
 | Figure 13: recovery | `bash scripts/plot.sh figure13 --recovery-csv data/figure13-recovery.csv --throughput-csv data/figure13-throughput.csv` | [Figure 13](../scripts/figure13/README.md) |
-| Appendix: access amplification | `bash scripts/plot.sh appendix access --data-dir data/benchmark_suites` | [Appendix](../scripts/appendix/README.md) |
-| Appendix: object-size CDF | `bash scripts/plot.sh appendix cdf --data-dir data/benchmark_suites` | [Appendix](../scripts/appendix/README.md) |
 
 Each linked guide describes the input columns, units and output files.
 Figure outputs are stored under `results/figures/`; preserve the input CSV

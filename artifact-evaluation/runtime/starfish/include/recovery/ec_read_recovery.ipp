@@ -142,6 +142,13 @@ inline void ConcurrentArrayCache::note_ec_recovery_error_wc(const ibv_wc &wc) {
             remote_allocator.small_object_stripe_manager().mark_endpoint_dead(
                 static_cast<size_t>(endpoint_idx));
             ec_recovery_dead_endpoints_.fetch_add(1, std::memory_order_relaxed);
+            if (::FarLib::get_config().ft_background_rebuild) {
+                int none = -1;
+                background_rebuild_failed_endpoint_.compare_exchange_strong(
+                    none, endpoint_idx, std::memory_order_acq_rel);
+                uthread::notify_all(&background_rebuild_cond_,
+                                    &background_rebuild_mutex_);
+            }
             std::cout << "INFO: ec_recovery endpoint_dead endpoint="
                       << endpoint_idx << " qp_num=" << wc.qp_num
                       << " wc_status=" << wc.status << " wr_id=" << wc.wr_id
@@ -259,6 +266,20 @@ inline bool ConcurrentArrayCache::ec_recovery_group_view(
          view.group.segments[0].addr != remote_addr)) {
         return false;  // split identity is always the data-0 anchor
     }
+    bool own_rebuilt = false;
+    if (config.ft_background_rebuild) {
+        // Logical identities were checked above. Only the physical I/O view
+        // changes; object pointers and allocator reverse bindings stay fixed.
+        for (size_t s = 0; s < ec_read_recovery::kEcReadSegmentCount; ++s) {
+            auto &seg = view.group.segments[s];
+            const auto physical = stripe_manager.resolve_rebuilt_addr(
+                view.group.id.stripe_id, static_cast<uint8_t>(s), seg.addr);
+            if (physical == seg.addr) continue;
+            seg.addr = physical;
+            seg.endpoint_idx = config.map_remote_addr(physical).first;
+            if (s == own_shard) own_rebuilt = true;
+        }
+    }
     uint32_t endpoints[ec_read_recovery::kEcReadSegmentCount];
     for (size_t segment = 0; segment < ec_read_recovery::kEcReadSegmentCount;
          segment++) {
@@ -279,6 +300,11 @@ inline bool ConcurrentArrayCache::ec_recovery_group_view(
         });
     view.plan = ec_read_recovery::make_ec_read_plan(
         view.alive_mask, split_object ? static_cast<uint8_t>(0) : own_shard);
+    if (own_rebuilt && !split_object && view.plan.own_shard_alive) {
+        // Reuse the existing old-READ drain and single-owner publication,
+        // but fetch only the rebuilt data from standby, without decoding.
+        view.plan.read_mask = static_cast<uint8_t>(1u << own_shard);
+    }
     view.split_object = split_object;
     view.fragment_bytes = fragment_bytes;
     view.object_bytes = byte_count;
@@ -287,7 +313,7 @@ inline bool ConcurrentArrayCache::ec_recovery_group_view(
     // reconstructed into its logical payload even when data-0 is healthy, so
     // its four-read plan is valid for every recoverable survivor set.
     view.valid = view.plan.usable &&
-                 (split_object || view.plan.own_shard_missing);
+                 (split_object || view.plan.own_shard_missing || own_rebuilt);
     *view_out = view;
     return view.valid;
 }
@@ -513,8 +539,10 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
     bool all_posted = true;
     constexpr uint8_t kAllSegments = static_cast<uint8_t>(
         (1u << ec_read_recovery::kEcReadSegmentCount) - 1u);
+    const bool repaired_read = !view.split_object &&
+        view.plan.read_mask == static_cast<uint8_t>(1u << view.own_shard_idx);
     const bool degraded_round =
-        !view.split_object || view.alive_mask != kAllSegments;
+        !repaired_read && (!view.split_object || view.alive_mask != kAllSegments);
     {
         EcRecoveryProfile::ScopedTimer timer(
             ec_recovery_profile(), EcRecoveryProfile::Stage::kSegmentPostMark);
@@ -575,7 +603,9 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
         // remains the authoritative count for this path.
         profile_post_attempt.set_outcome(
             degraded_round ? Outcome::kPosted : Outcome::kUnknown);
-        if (!view.split_object) {
+        if (repaired_read) {
+            background_rebuild_redirected_reads_.fetch_add(1, std::memory_order_relaxed);
+        } else if (!view.split_object) {
             ec_recovery_report_degraded_read(entry, view);
         }
     }
@@ -660,6 +690,8 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
     const uint32_t byte_count = token->byte_count;
     const uint8_t alive_mask = token->alive_mask;
     const uint8_t own_shard = token->own_shard_idx;
+    const bool repaired_read = !split_object &&
+        alive_mask == static_cast<uint8_t>(1u << own_shard);
     const uint64_t target = token->target_local_addr;
     const ec_batch::EcStagingGroupSlot scratch = token->scratch;
     void *dst = reinterpret_cast<void *>(static_cast<uintptr_t>(target));
@@ -744,7 +776,7 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
         // Runtime self-check of the rebuilt shard, after the safe publication
         // point; observation only, the bytes below are handed over whether it
         // passes or fails.
-        if (!split_object) ec_recovery_verify_rebuild(*token);
+        if (!split_object && !repaired_read) ec_recovery_verify_rebuild(*token);
     }
     // Return the scratch segment first; the token still pins the target, so no
     // second read of this object can start in between.
@@ -777,7 +809,7 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
             owner_entry->load_state(std::memory_order_acquire);
         const bool published = published_state.state == EntryState::LOCAL &&
                                owner_entry->local_addr() == dst;
-        if (published && (!split_object || split_degraded)) {
+        if (published && !repaired_read && (!split_object || split_degraded)) {
             ec_recovery_rebuilds_.fetch_add(1, std::memory_order_relaxed);
             ec_recovery_profile().note_winner(event.profile_acquire_ns,
                                               byte_count);
@@ -792,7 +824,7 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
         // A healthy split read is a normal four-fragment fetch, not a fault
         // recovery event. Keep it out of the recovery window and recovered-
         // object counters; only a missing physical endpoint is degraded.
-        if (published && (!split_object || split_degraded)) {
+        if (published && !repaired_read && (!split_object || split_degraded)) {
             ec_recovery_profile().note_recovered_object(object_bytes);
         }
     }

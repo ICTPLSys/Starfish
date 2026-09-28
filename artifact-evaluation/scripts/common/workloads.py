@@ -8,19 +8,42 @@ import re
 
 
 # Application footprints used to render ratio-dependent capacity budgets.
-FOOTPRINT_BYTES = {"llama": 26_954_711_068, "bfs": 17_483_494_400}
+FOOTPRINT_BYTES = {"llama": 26_954_711_068, "bfs": 17_483_494_400,
+                   "mg": 28_520_742_912, "wordcount": 40 * 1024**3,
+                   "nq": 32 * 1024**3,
+                   **{app: 16 * 1024**3 for app in ("kv-b", "kv-a", "kv-s")}}
+GENERATED_INPUTS = frozenset(("mg", "kv-b", "kv-a", "kv-s"))
 BINARY_RELATIVE = {
     "llama": Path("benchmark/llama/run_chat_far"),
     "bfs": Path("benchmark/microbenchmarks/gapbs_bfs_chunked"),
+    "mg": Path("benchmark/mg/mg"),
+    "wordcount": Path("benchmark/mapreduce/wordcount_far"),
+    "nq": Path("benchmark/microbenchmarks/nhop_graph"),
+    **{app: Path("benchmark/kvs/kvs_throughput") for app in ("kv-b", "kv-a", "kv-s")},
 }
-WORKLOAD_LABEL = {"llama": "LLM", "bfs": "BFS"}
-SYSTEM_LABEL = {"nonft": "Non-FT", "starfish": "Starfish", "hydra": "Hydra"}
+WORKLOAD_LABEL = {"llama": "LLM", "bfs": "BFS", "mg": "MG",
+                  "wordcount": "WC", "nq": "NQ",
+                  "kv-b": "KV-B", "kv-a": "KV-A", "kv-s": "KV-S"}
+SYSTEM_LABEL = {"nonft": "Non-FT", "starfish": "Starfish", "hydra": "Hydra",
+                "carbink": "Carbink"}
 NUMBER = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 
 # These variables control the application/runtime placement or workload
 # profile.  They must come from the recorded site profile rather than from a
 # caller's shell, where a stale experiment can silently override the run.
-CONTROLLED_ENV_PREFIXES = ("FARLIB_", "Fibre", "GAPBS_")
+CONTROLLED_ENV_PREFIXES = ("FARLIB_", "Fibre", "GAPBS_", "MG_", "NHOP_", "WORDCOUNT_")
+
+NONFT_ENV = {
+    "FARLIB_FIBRE_HEAP": "1",
+    "FARLIB_ALLOC_SCOPE_CHECKPOINT": "1",
+    "FARLIB_ASYNC_FULL_RETURNS": "1",
+    "FARLIB_THREAD_HEAP_FULL_RETURN_BATCH": "1",
+    "FARLIB_REGION_LIST_YIELD_LOCK": "1",
+    "FARLIB_REMOTE_USAGE_SHARDS": "1",
+    "FARLIB_PLANNER_BUDGET_EARLY_EXIT": "1",
+    "FARLIB_RESIDENT_PROFILE_REQUIRE_WORK_PHASE": "1",
+    "FARLIB_LEGACY_SCAN_CURSORS": "1",
+}
 
 # The healthy Design 2 profile uses measured remote heat and maps local bands
 # to actual Resident/Streaming placement. It is not the legacy fixed-six mode.
@@ -54,6 +77,15 @@ DESIGN2_ENV = {
 # builds: fixed 64-page reclaim/write batches, local polling, and registered
 # zero-copy parity preparation.
 HYDRA_ENV = {
+    "FARLIB_FIBRE_HEAP": "1",
+    "FARLIB_ALLOC_SCOPE_CHECKPOINT": "1",
+    "FARLIB_ASYNC_FULL_RETURNS": "1",
+    "FARLIB_THREAD_HEAP_FULL_RETURN_BATCH": "1",
+    "FARLIB_REGION_LIST_YIELD_LOCK": "1",
+    "FARLIB_REMOTE_USAGE_SHARDS": "1",
+    "FARLIB_LEGACY_SCAN_CURSORS": "1",
+    "FARLIB_SCOPE_COUNTER_SHARDS": "1",
+    "FARLIB_LOCK_WAIT_SCOPE_YIELD": "1",
     "FARLIB_HYDRA_LOCAL_POLL": "1",
     "FARLIB_HYDRA_RECLAIM_BATCH": "64",
     "FARLIB_HYDRA_RECLAIM_NOTIFY": "0",
@@ -62,9 +94,20 @@ HYDRA_ENV = {
     "FARLIB_HYDRA_WRITE_BATCH": "64",
 }
 
+CARBINK_ENV = {
+    "FARLIB_OPT_READY_QUEUE": "0",
+    "FARLIB_OPT_SERIALIZE_MARK_EVICT": "0",
+    "FARLIB_OPT_FULL_PRIME_MARK": "1",
+    "FARLIB_LEGACY_SCAN_CURSORS": "1",
+    "FARLIB_CARBINK_COMPACTION_SCAN": "1",
+    "FARLIB_CARBINK_PARITY_FENCE": "1",
+    "FARLIB_HYDRA_LOCAL_POLL": "1",
+}
 
-def client_command(app: str, binary: Path, config: Path, input_path: Path,
-                   ae_root: Path, tokenizer: Path | None = None
+
+def client_command(app: str, binary: Path, config: Path, input_path: Path | None,
+                   ae_root: Path, tokenizer: Path | None = None,
+                   local_bytes: int | None = None
                    ) -> tuple[list[str], Path | None]:
     if app == "llama":
         if tokenizer is None:
@@ -75,11 +118,21 @@ def client_command(app: str, binary: Path, config: Path, input_path: Path,
         )
     if app == "bfs":
         return [str(binary), str(config), str(input_path)], None
+    if app == "mg":
+        return [str(binary), str(config)], None
+    if app == "wordcount":
+        return [str(binary), str(config), str(input_path), "24", "8053063696", "10"], None
+    if app == "nq":
+        return [str(binary), str(config), str(input_path)], None
+    if app in ("kv-b", "kv-a", "kv-s"):
+        if local_bytes is None or local_bytes <= 0:
+            raise ValueError("KV requires its rendered local-memory capacity")
+        return [str(binary), str(config), format(local_bytes / 1024**3, ".17g")], None
     raise ValueError(f"unsupported application: {app}")
 
 
 def client_environment(app: str, site: dict, system: str = "nonft") -> dict[str, str]:
-    if system not in ("nonft", "starfish", "hydra"):
+    if system not in ("nonft", "starfish", "hydra", "carbink"):
         raise ValueError(f"unsupported system: {system}")
     env = {
         "FibreWorkerCount": str(site.get("fibre_workers", 24)),
@@ -98,21 +151,150 @@ def client_environment(app: str, site: dict, system: str = "nonft") -> dict[str,
     if site.get("background_cpu_base") is not None:
         env["FARLIB_BACKGROUND_CPU_BASE"] = str(site["background_cpu_base"])
     if app == "bfs":
+        repetitions = site.get("bfs_repetitions", 1)
+        if (isinstance(repetitions, bool) or not isinstance(repetitions, int)
+                or repetitions < 1):
+            raise ValueError("BFS repetitions must be a positive integer")
         env.update({
             "GAPBS_GRAPH_GENERATOR": "file",
             "GAPBS_BFS_SOURCE": "1",
             "GAPBS_BFS_WORKERS": str(site.get("bfs_workers", 48)),
-            "GAPBS_BFS_REPETITIONS": "1",
+            "GAPBS_BFS_REPETITIONS": str(site.get("bfs_repetitions", 1)),
             "GAPBS_BFS_VERIFY": "1",
             "GAPBS_BFS_OPTIMIZE": "1",
             "GAPBS_CHUNK_PREFETCH_DISTANCE": "1",
+            "GAPBS_BFS_PHASE_REPLAN": "0",
+            "GAPBS_BFS_ALPHA": "15",
+            "GAPBS_BFS_BETA": "18",
+            "HOTNESS_MAX": "3",
+        })
+    elif app == "mg":
+        env.update({
+            "MG_DESIGN1_PHASE_REPLAN": "1",
+            "FARLIB_RESIDENT_PROFILE_PHASE_TRIGGERED": "1",
+            "FARLIB_FIBRE_HEAP": "1",
+            "FARLIB_ALLOC_SCOPE_CHECKPOINT": "1",
+        })
+    elif app == "wordcount":
+        env.update({
+            "FARLIB_WORDCOUNT_GLOBAL_MAP_SHIFT": "25",
+            "FARLIB_WORDCOUNT_LOCAL_MAP_SHIFT": "21",
+            "FARLIB_WORDCOUNT_KEEP_LOCAL_FAR_MAPS": "1",
+            "FARLIB_WORDCOUNT_MERGE_WORKERS": "24",
+            "FARLIB_WORDCOUNT_REDUCE_READERS": "24",
+            "FARLIB_WORDCOUNT_UTHREADS": "48",
+        })
+    elif app == "nq":
+        env.update({"NHOP_RANDOM_NUM": "1600", "NHOP_UTHREAD_FACTOR": "2",
+                    "NHOP_PRINT_SIZE_DISTRIBUTION": "0", "NHOP_WORK_PROGRESS": "1"})
+    elif app in ("kv-b", "kv-a", "kv-s"):
+        env.update({
+            "FARLIB_KVS_INITIAL_DATA_COUNT": "33554432",
+            "FARLIB_KVS_RANDOM_SEED": "20260917",
+            "FARLIB_KVS_FIXED_REQUEST_COUNT": "1",
+            "FARLIB_KVS_DRAIN_ALL_REQUESTS": "1",
+            "FARLIB_KVS_DRAIN_TIMEOUT_MS": "60000",
+            "FARLIB_KVS_MAX_RUNTIME_MS": "3600000",
+            "FARLIB_KVS_MAX_SERVE_COUNT": "1000000000",
+            "FARLIB_KVS_PUT_RATIO": {"kv-b": "0.05", "kv-a": "0.5", "kv-s": "0.95"}[app],
+            "FARLIB_KVS_REMOVE_RATIO": "0",
+            "FARLIB_KVS_ZIPFIAN_CONSTANT": "0.99",
+            "FARLIB_KVS_MUTATING_VALUES": "1",
+            "FARLIB_KVS_POST_VERIFY_SAMPLES": "4096",
+            "FARLIB_KVS_RUN_ASYNC": "0",
+            "FARLIB_KVS_SERVER_MODE": "sync",
+            "FARLIB_KVS_EXECUTION_MODE": "direct",
+            "FARLIB_KVS_DIRECT_FIBRES": "48",
+            "FARLIB_KVS_DIRECT_MISS_YIELD": "1",
+            "FARLIB_KVS_DEBUG_LOCKED_GET": "1",
+            "FARLIB_KVS_VALIDATE_GET": "0",
+            "FARLIB_KVS_HIST_SAMPLE_PERIOD": "1024",
+            "FARLIB_HASHMAP_DEREF_STATS": "0",
         })
     elif app != "llama":
         raise ValueError(f"unsupported application: {app}")
-    if system == "starfish":
+    if system == "nonft":
+        # The concurrent legacy pipeline requires phase-specific scan eligibility.
+        env.update(NONFT_ENV)
+        if app in ("kv-b", "kv-a", "kv-s"):
+            env.update({"FARLIB_SCOPE_COUNTER_SHARDS": "1",
+                        "FARLIB_LOCK_WAIT_SCOPE_YIELD": "1"})
+    elif system == "starfish":
         env.update(DESIGN2_ENV)
+        if app in ("mg", "wordcount", "nq", "kv-b", "kv-a", "kv-s"):
+            env.update({
+                "FARLIB_FIBRE_HEAP": "1",
+                "FARLIB_ALLOC_SCOPE_CHECKPOINT": "1",
+                "FARLIB_ASYNC_FULL_RETURNS": "1",
+                "FARLIB_THREAD_HEAP_FULL_RETURN_BATCH": "1",
+                "FARLIB_REGION_LIST_YIELD_LOCK": "1",
+                "FARLIB_REMOTE_USAGE_SHARDS": "1",
+                "FARLIB_LOCK_WAIT_SCOPE_YIELD": "1",
+            })
+        if app in ("kv-b", "kv-a", "kv-s"):
+            env["FARLIB_EC_BENCHMARK_PHASED"] = "1"
     elif system == "hydra":
         env.update(HYDRA_ENV)
+        if app == "mg":
+            env.update(MG_DESIGN1_PHASE_REPLAN="0",
+                       FARLIB_RESIDENT_PROFILE_PHASE_TRIGGERED="0")
+        elif app == "wordcount":
+            env.update(FARLIB_WORDCOUNT_RECOMPUTABLE="0",
+                       FARLIB_WORDCOUNT_RECIPES="0")
+        elif app in ("kv-b", "kv-a", "kv-s"):
+            env["FARLIB_HYDRA_RUNTIME_HOT_PACKING"] = "1"
+    elif system == "carbink":
+        env.update(CARBINK_ENV)
+        if app == "mg":
+            env.update(FARLIB_FIBRE_HEAP="0", FARLIB_ASYNC_FULL_RETURNS="0",
+                       MG_DESIGN1_PHASE_REPLAN="0",
+                       FARLIB_RESIDENT_PROFILE_PHASE_TRIGGERED="0")
+        elif app in ("wordcount", "nq", "kv-b", "kv-a", "kv-s"):
+            env.update({
+                "FARLIB_FIBRE_HEAP": "1",
+                "FARLIB_ALLOC_SCOPE_CHECKPOINT": "1",
+                "FARLIB_ASYNC_FULL_RETURNS": "1",
+                "FARLIB_THREAD_HEAP_FULL_RETURN_BATCH": "1",
+                "FARLIB_REGION_LIST_YIELD_LOCK": "1",
+                "FARLIB_REMOTE_USAGE_SHARDS": "1",
+                "FARLIB_SCOPE_COUNTER_SHARDS": "1",
+                "FARLIB_LOCK_WAIT_SCOPE_YIELD": "1",
+            })
+        if app == "wordcount":
+            env.update(FARLIB_WORDCOUNT_RECOMPUTABLE="0",
+                       FARLIB_WORDCOUNT_RECIPES="0")
+    metadata = site.get("runtime_metadata", False)
+    if not isinstance(metadata, bool):
+        raise ValueError("runtime_metadata must be a boolean")
+    if metadata:
+        if system not in ("starfish", "carbink"):
+            raise ValueError("runtime_metadata currently supports Starfish and Carbink")
+        env["FARLIB_RUNTIME_METADATA"] = "1"
+    ec_cpu = site.get("runtime_ec_cpu", False)
+    if not isinstance(ec_cpu, bool):
+        raise ValueError("runtime_ec_cpu must be a boolean")
+    if ec_cpu:
+        if system not in ("starfish", "carbink"):
+            raise ValueError("runtime_ec_cpu currently supports Starfish and Carbink")
+        env["FARLIB_RUNTIME_EC_CPU"] = "1"
+    # One runtime timer applies to every benchmark, independent of request
+    # counts and Work-phase boundaries. Reject the incompatible legacy opt-in.
+    if site.get("kv_memory_samples", False):
+        raise ValueError(
+            "kv_memory_samples was replaced by remote_memory_samples "
+            "and remote_memory_observer_cpu (benchmark time sampling)")
+    memory_samples = site.get("remote_memory_samples", False)
+    if not isinstance(memory_samples, bool):
+        raise ValueError("remote_memory_samples must be a boolean")
+    if memory_samples:
+        observer_cpu = site.get("remote_memory_observer_cpu")
+        if (isinstance(observer_cpu, bool) or
+                not isinstance(observer_cpu, (int, str)) or
+                not re.fullmatch(r"[0-9]+", str(observer_cpu))):
+            raise ValueError(
+                "remote_memory_observer_cpu must be a non-negative integer CPU index")
+        env["FARLIB_REMOTE_MEMORY_SAMPLES"] = "1"
+        env["FARLIB_REMOTE_MEMORY_OBSERVER_CPU"] = str(int(observer_cpu))
     return env
 
 
@@ -128,7 +310,7 @@ def client_process_environment(app: str, site: dict, system: str,
     return env
 
 
-def validate_design2(log: str) -> dict:
+def validate_design2(log: str, *, expected_bfs_repetitions: int | None = None) -> dict:
     """Require runtime evidence of the selected grouping mode, not only flags."""
     required = (
         r"^simple_hotcold\.config\b[^\n]*\benabled=1\b[^\n]*\bmode=local_resident\b",
@@ -137,8 +319,38 @@ def validate_design2(log: str) -> dict:
     )
     if any(not re.search(pattern, log, re.MULTILINE) for pattern in required):
         raise ValueError("Design 2 resident-local six-group profile was not active")
-    # The AE runner executes one Work profile (one BFS traversal). Do not
-    # splice an incomplete final snapshot together with an earlier interval.
+    if expected_bfs_repetitions is not None:
+        if (isinstance(expected_bfs_repetitions, bool)
+                or not isinstance(expected_bfs_repetitions, int)
+                or expected_bfs_repetitions < 1):
+            raise ValueError("Design 2 BFS repetitions must be positive")
+        starts = list(re.finditer(
+            r"^gapbs_bfs_iteration_begin\b[^\n]*$", log, re.MULTILINE))
+        ends = list(re.finditer(
+            r"^gapbs_bfs_phase_stats\b[^\n]*\bphase=work\b[^\n]*$", log, re.MULTILINE))
+        expected = [str(i) for i in range(expected_bfs_repetitions)]
+        if ([_fields(m.group(0)).get("iteration") for m in starts] != expected
+                or [_fields(m.group(0)).get("iteration") for m in ends] != expected):
+            raise ValueError("Design 2 BFS Work boundaries differ from requested repetitions")
+        spans = []
+        for i, (start, end) in enumerate(zip(starts, ends)):
+            if not start.end() < end.start():
+                raise ValueError("Design 2 BFS Work boundaries are out of order")
+            if i and starts[i].start() <= ends[i - 1].end():
+                raise ValueError("Design 2 BFS Work profiles overlap")
+            spans.append((start.end(), end.start()))
+        ledger_lines = list(re.finditer(
+            r"^simple_region_budget\.six_final\b[^\n]*$", log, re.MULTILINE))
+        if any(not any(lo <= m.start() < hi for lo, hi in spans)
+               for m in ledger_lines):
+            raise ValueError("Design 2 group ledger falls outside a BFS Work profile")
+        configs = "\n".join(re.search(pattern, log, re.MULTILINE).group(0)
+                            for pattern in required)
+        profiles = [validate_design2(configs + "\n" + log[lo:hi]) for lo, hi in spans]
+        return {**profiles[-1], "work_profiles": len(profiles),
+                "per_work_profile": profiles,
+                "evidence_scope": "active_profile_and_complete_per_iteration_supply_ledgers"}
+    # Validate one complete snapshot, never splice it with another interval.
     latest: dict[tuple[str, int, int], int] = {}
     for match in re.finditer(r"^simple_region_budget\.six_final\b[^\n]*$", log, re.MULTILINE):
         fields = _fields(match.group(0))
@@ -274,8 +486,11 @@ def validate_hydra(log: str, *, endpoint_count: int,
         if parity_bytes != owners * 256 * 1024:
             raise ValueError("Hydra parity-buffer bytes differ from owner geometry")
 
+    # Concurrent allocator startup can interrupt this multi-insertion line.
+    evacuator_log = re.sub(
+        r"allocator\.fibre_thread_heap_enabled=[01][ \t]*\r?\n", "", log)
     evacuator = _one(
-        log,
+        evacuator_log,
         r"\bruntime\.exclusive_owned_batch=(\d+)\b[^\n]*"
         r"\bmark_workers=(\d+)\b[^\n]*\bevict_workers=(\d+)\b[^\n]*$",
         "Hydra evacuator workers",
@@ -332,7 +547,6 @@ def validate_hydra(log: str, *, endpoint_count: int,
         "evidence_scope": "hydra_runtime_policy_layout_workers_and_cleanup",
     }
 
-
 def _positive(value: str, label: str) -> float:
     number = float(value)
     if not math.isfinite(number) or number <= 0:
@@ -356,6 +570,25 @@ def _count(fields: dict[str, str], name: str) -> int:
     if value < 0:
         raise ValueError(f"{name} must not be negative")
     return value
+
+
+def validate_nonft_kv(log: str, *, expected_workers: int) -> dict:
+    # Only an enabled runtime prints the shutdown scope inventory. This also
+    # tolerates startup messages interleaved with the background worker log.
+    end = _one(log, r"^kvs_scope_shards_end registered=(\d+) v0=(\d+) v1=(\d+)\s*$",
+               "Non-FT KV scope cleanup")
+    registered, v0, v1 = map(int, end.groups())
+    if registered != expected_workers or v0 != 0 or v1 != 0:
+        raise ValueError("Non-FT KV scope inventory or cleanup differs")
+    _one(log, r"\bkvs_lock_wait_scope_yield enabled="
+         r"(?:1(?=\s|$)|runtime\.exclusive_owned_batch=1\n"
+         r"1 mark_workers=\d+ evict_workers=\d+)",
+         "Non-FT KV lock-wait scope handoff")
+    if re.search(r"\bkvs_scope_shards\b[^\n]*\bsupported=0\b", log):
+        raise ValueError("Non-FT KV binary lacks scope-counter sharding")
+    return {"status": "passed", "scope_counter_shards": True,
+            "lock_wait_scope_yield": True, "registered_shards": registered,
+            "scope_v0": v0, "scope_v1": v1}
 
 
 def _parse_mg(log: str) -> dict:
@@ -466,7 +699,8 @@ def _parse_nq(log: str) -> dict:
     }
 
 
-def _parse_kv(app: str, log: str, expected_requests: int) -> dict:
+def _parse_kv(app: str, log: str, expected_requests: int,
+              expected_post_samples: int | None = None, *, require_cleanup: bool = True) -> dict:
     ratios = {"kv-b": 0.05, "kv-a": 0.5, "kv-s": 0.95}
     config = _one(log, r"^kvs_direct_config\b[^\n]*$", "KV direct configuration")
     start = _one(log, r"^kvs_phase name=direct event=request_start\b[^\n]*$",
@@ -476,10 +710,13 @@ def _parse_kv(app: str, log: str, expected_requests: int) -> dict:
     drained = _one(log, r"^kvs_phase name=direct event=request_drain_end\b[^\n]*$",
                    "KV drain end")
     receipt = _one(log, r"^kvs_receipt name=direct\b[^\n]*$", "KV receipt")
-    cleanup = _one(log, r"^exact used bytes:\s*0\s*$", "KV cleanup")
+    cleanup = (_one(log, r"^exact used bytes:\s*0\s*$", "KV cleanup")
+               if require_cleanup else None)
+    if not require_cleanup and expected_post_samples is None:
+        raise ValueError("measurement-only KV parsing requires an explicit postcheck count")
     if not config.start() < start.start() < generated.start() < drained.start() < receipt.start():
         raise ValueError("KV request/receipt markers are out of order")
-    if cleanup.start() <= receipt.start():
+    if cleanup is not None and cleanup.start() <= receipt.start():
         raise ValueError("KV cleanup precedes the request receipt")
     setup, begin, create, finish, counts = map(
         lambda m: _fields(m.group(0)), (config, start, generated, drained, receipt))
@@ -523,9 +760,23 @@ def _parse_kv(app: str, log: str, expected_requests: int) -> dict:
         if _count(evidence, "checked") == 0 or _count(evidence, "failures") != 0:
             raise ValueError("KV sampled value check failed")
     validation = re.findall(r"^kvs_validation_config\b[^\n]*$", log, re.MULTILINE)
-    if len(validation) > 1 or (validation and
-            _count(_fields(validation[0]), "post_samples") > 0 and not verify):
+    if len(validation) > 1:
+        raise ValueError("KV has multiple validation configurations")
+    declared = _fields(validation[0]) if validation else {}
+    # Current binaries report only get_content/real_put here; older logs may
+    # also declare post_samples. The launcher supplies the required count.
+    if "post_samples" in declared and _count(declared, "post_samples") > 0 and not verify:
         raise ValueError("KV declared post-verification has no result")
+    if expected_post_samples is not None:
+        if (isinstance(expected_post_samples, bool)
+                or not isinstance(expected_post_samples, int)
+                or expected_post_samples <= 0):
+            raise ValueError("expected_post_samples must be a positive integer")
+        if not verify or _count(_fields(verify[0]), "checked") != expected_post_samples:
+            raise ValueError("KV post-verification count differs from the launcher")
+        if (not receipt.start() < log.index(verify[0])
+                or (cleanup is not None and log.index(verify[0]) >= cleanup.start())):
+            raise ValueError("KV post-verification is outside the completed request/cleanup interval")
     return {
         "elapsed_s": (end_ns - begin_ns) / 1_000_000_000,
         "measurement_phase": "kv_fixed_count_direct_requests",
@@ -539,7 +790,10 @@ def _parse_kv(app: str, log: str, expected_requests: int) -> dict:
 
 
 def parse_result(app: str, log: str, *, expected_requests: int = 1_000_000_000,
-                 expected_checksum: str | None = None) -> dict:
+                 expected_checksum: str | None = None,
+                 expected_bfs_repetitions: int = 1,
+                 expected_post_samples: int | None = None,
+                 require_cleanup: bool = True) -> dict:
     """Extract one checked work phase; KV defaults to the paper's 1B requests.
 
     For historical non-paper KV logs, pass their actual expected_requests
@@ -550,12 +804,13 @@ def parse_result(app: str, log: str, *, expected_requests: int = 1_000_000_000,
     try:
         if app == "mg":
             return _parse_mg(log)
-        if app == "wc":
+        if app in ("wc", "wordcount"):
             return _parse_wc(log, expected_checksum)
         if app == "nq":
             return _parse_nq(log)
         if app in ("kv-b", "kv-a", "kv-s"):
-            return _parse_kv(app, log, expected_requests)
+            return _parse_kv(app, log, expected_requests, expected_post_samples,
+                             require_cleanup=require_cleanup)
     except KeyError as exc:
         raise ValueError(f"{app} log lacks required field {exc}") from exc
     if app == "llama":
@@ -574,21 +829,62 @@ def parse_result(app: str, log: str, *, expected_requests: int = 1_000_000_000,
             "correctness_evidence": "Assistant response and positive achieved tok/s",
         }
     if app == "bfs":
+        if (isinstance(expected_bfs_repetitions, bool)
+                or not isinstance(expected_bfs_repetitions, int)
+                or expected_bfs_repetitions < 1):
+            raise ValueError("BFS repetitions must be a positive integer")
         results = re.findall(r"^gapbs_bfs_result\b[^\n]*$", log, re.MULTILINE)
         verifies = re.findall(r"^gapbs_bfs_verify\b[^\n]*$", log, re.MULTILINE)
-        if len(results) != 1 or len(verifies) != 1:
-            raise ValueError("BFS requires exactly one measured result and verification")
-        result = dict(re.findall(r"(\w+)=([^\s]+)", results[0]))
-        verify = dict(re.findall(r"(\w+)=([^\s]+)", verifies[0]))
-        if (result.get("iteration") != "0" or verify.get("status") != "pass"
-                or result.get("visited") != verify.get("visited")
-                or int(result.get("visited", "0")) <= 0):
+        if len(results) != expected_bfs_repetitions or len(verifies) != 1:
+            raise ValueError("BFS requires the expected measured repetitions and final verification")
+        rows = [_fields(line) for line in results]
+        verify = _fields(verifies[0])
+        if any(not {"iteration", "visited", "elapsed_s"} <= row.keys() for row in rows):
+            raise ValueError("BFS measured result lacks required fields")
+        if [row.get("iteration") for row in rows] != [
+                str(i) for i in range(expected_bfs_repetitions)]:
+            raise ValueError("BFS iteration identifiers are incomplete or duplicated")
+        if (verify.get("status") != "pass"
+                or any(row.get("visited") != verify.get("visited") for row in rows)
+                or any(_count(row, "visited") <= 0 for row in rows)
+                or any(verify.get(key, "0") != "0"
+                       for key in ("parent_errors", "edge_depth_errors"))):
             raise ValueError("BFS verification failed or did not match the measured run")
+        if expected_bfs_repetitions > 1:
+            if (verify.get("scope") != "after_measured_repetitions"
+                    or verify.get("closed") != "1"):
+                raise ValueError("BFS requires final full-tree verification")
+            for key in ("vertices", "edges", "source", "levels", "max_depth"):
+                if rows[0].get(key) is None or any(
+                        row.get(key) != rows[0][key] for row in rows):
+                    raise ValueError("BFS repetitions differ in workload or traversal summary")
+            if verify.get("max_depth") != rows[-1]["max_depth"]:
+                raise ValueError("BFS verification depth differs from the measured run")
+        seconds = [_positive(row["elapsed_s"], "BFS work elapsed_s") for row in rows]
+        phase_lines = re.findall(r"^gapbs_bfs_phase_stats\b[^\n]*$", log, re.MULTILINE)
+        phases = [_fields(line) for line in phase_lines if _fields(line).get("phase") == "work"]
+        method = "application steady_clock elapsed_s"
+        if phases:
+            if any(not {"iteration", "ops", "ops_s"} <= row.keys() for row in phases):
+                raise ValueError("BFS work-phase marker lacks required fields")
+            if ([row.get("iteration") for row in phases]
+                    != [str(i) for i in range(expected_bfs_repetitions)]):
+                raise ValueError("BFS work-phase markers differ from measured iterations")
+            for result, phase in zip(rows, phases):
+                if result.get("edges") is not None and phase.get("ops") != result["edges"]:
+                    raise ValueError("BFS work-phase edge count differs from the measured graph")
+            seconds = [_positive(row["ops"], "BFS work operations") /
+                       _positive(row["ops_s"], "BFS work operations per second")
+                       for row in phases]
+            method = "application work operations divided by operations per second"
         return {
-            "elapsed_s": _positive(result["elapsed_s"], "BFS work elapsed_s"),
-            "measurement_phase": "bfs_work_iteration_0",
-            "measurement_method": "application steady_clock elapsed_s",
-            "correctness_scope": "BFS tree verification",
+            "elapsed_s": sum(seconds) / expected_bfs_repetitions,
+            "measurement_phase": ("bfs_work_iteration_0" if expected_bfs_repetitions == 1
+                                  else f"bfs_work_mean_{expected_bfs_repetitions}_iterations"),
+            "measurement_method": method,
+            "correctness_scope": "final BFS tree verification and all traversal summaries",
             "correctness_evidence": verifies[0],
+            "iteration_elapsed_s": seconds,
+            "measured_repetitions": expected_bfs_repetitions,
         }
     raise ValueError(f"unsupported application: {app}")

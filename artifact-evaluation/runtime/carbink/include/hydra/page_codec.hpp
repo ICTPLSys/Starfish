@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "../../../common/runtime_ec_cpu.hpp"
+
 #include <erasure_code.h>
 
 namespace FarLib::hydra {
@@ -76,6 +78,8 @@ inline bool page_codec_encode_4plus2(
     auto *tables = const_cast<unsigned char *>(
         detail::page_codec_tables().bytes.data());
     const int length = static_cast<int>(byte_count);
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Encode);
     if (byte_count < 64) {
         // Use ISA-L's own baseline for short fragments, below the SIMD
         // kernels' minimum lengths. Normal 8KiB pages have 2048B fragments.

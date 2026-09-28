@@ -1475,7 +1475,21 @@ inline RegionReclassifyResult GlobalHeap::try_reclassify_hotness_region(
             expected.invalid = 1;
             auto restored = it->original_state;
             restored.invalid = 0;
-            ASSERT(it->entry->cas_state_strong(expected, restored));
+            const bool unlocked = it->entry->cas_state_strong(expected, restored);
+            if (!unlocked) {
+                std::cerr << "resident_unlock_conflict"
+                          << " entry=" << it->entry
+                          << " original_state=" << unsigned(it->original_state.state)
+                          << " observed_state=" << unsigned(expected.state)
+                          << " invalid=" << unsigned(expected.invalid)
+                          << " dirty=" << unsigned(it->original_state.dirty)
+                          << ":" << unsigned(expected.dirty)
+                          << " hotness=" << unsigned(it->original_state.hotness)
+                          << ":" << unsigned(expected.hotness)
+                          << " refs=" << unsigned(it->original_state.ref_cnt)
+                          << ":" << unsigned(expected.ref_cnt) << std::endl;
+            }
+            ASSERT(unlocked);
         }
         locked_entries.clear();
     };
@@ -1688,7 +1702,21 @@ inline RegionExchangeResult GlobalHeap::try_exchange_hotness_regions(
             expected.invalid = 1;
             auto restored = it->original_state;
             restored.invalid = 0;
-            ASSERT(it->entry->cas_state_strong(expected, restored));
+            const bool unlocked = it->entry->cas_state_strong(expected, restored);
+            if (!unlocked) {
+                std::cerr << "resident_unlock_conflict"
+                          << " entry=" << it->entry
+                          << " original_state=" << unsigned(it->original_state.state)
+                          << " observed_state=" << unsigned(expected.state)
+                          << " invalid=" << unsigned(expected.invalid)
+                          << " dirty=" << unsigned(it->original_state.dirty)
+                          << ":" << unsigned(expected.dirty)
+                          << " hotness=" << unsigned(it->original_state.hotness)
+                          << ":" << unsigned(expected.hotness)
+                          << " refs=" << unsigned(it->original_state.ref_cnt)
+                          << ":" << unsigned(expected.ref_cnt) << std::endl;
+            }
+            ASSERT(unlocked);
         }
         locked_entries.clear();
     };

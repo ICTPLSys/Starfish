@@ -1,164 +1,203 @@
 #!/usr/bin/env python3
-"""Collect Figure 12 log records for Carbink and Starfish.
-
-Select one memory ratio and repeat; do not average repeated runs. Every
-included workload needs a matched Carbink record with positive mean EC CPU.
-CPU is normalized as (this CPU seconds / this elapsed seconds) divided by
-(Carbink CPU seconds / Carbink elapsed seconds), NOT cumulative CPU seconds.
-Metadata is 100 * metadata_peak_bytes / app_memory_bytes, not a Carbink ratio
-and not a fraction of local cache capacity. --show-log-format prints the
-complete producer contract. No runtime instrumentation or benchmarking occurs.
-"""
+"""Collect Figure 12 raw compute EC cycles and final-Work metadata from AE runs."""
 from __future__ import annotations
-
 import argparse
 import csv
-import math
+import json
 from pathlib import Path
 import sys
 
 sys.dont_write_bytecode = True
-if __package__:
-    from . import log_contract
-else:
-    import log_contract
-CONTEXT_FIELDS = log_contract.CONTEXT_FIELDS
-SYSTEMS = log_contract.SYSTEMS
-WORKLOADS = log_contract.WORKLOADS
-parse_line = log_contract.parse_line
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from figure12 import collect_metadata as metadata
+from figure12 import log_contract as contract
 
-AE_ROOT = Path(__file__).resolve().parents[2]
-FIELDS = (
-    "workload", "system", "metric", "value", "unit", "source_type", "source",
-    "exit_status", "correctness", "run_id", "baseline_run_id", "ratio",
-    "app_workers", "repeat", "environment", "workload_id", "measurement_phase",
-    "app_memory_bytes", "local_ec_cpu_seconds", "elapsed_s",
-    "baseline_local_ec_cpu_seconds", "baseline_elapsed_s",
-    "raw_value", "normalizer", "scale", "raw_unit", "normalizer_unit",
-)
+FIELDS = (*metadata.FIELDS, "repeat", "cycle_clock", "ec_work_intervals", "ec_scopes",
+          "measurement_usable", "execution_status", "measurement_warning")
 
 
-def collect_rows(logs_root, *, pattern="*.log", ratio=25, repeat=1):
-    root = Path(logs_root).resolve()
-    if not root.is_dir():
-        raise ValueError(f"log directory not found: {root}")
-    if not 1 <= ratio <= 100 or repeat < 1:
-        raise ValueError("ratio must be 1..100 and repeat must be positive")
-    records = {}
-    seen_runs = set()
-    files = sorted({path.resolve() for path in root.rglob(pattern) if path.is_file()})
-    for path in files:
-        with path.open(encoding="utf-8", errors="replace") as stream:
-            for number, line in enumerate(stream, 1):
-                try:
-                    record = parse_line(line)
-                    if record is None:
-                        continue
-                    if record["ratio"] != ratio or record["repeat"] != repeat:
-                        continue
-                    if record["exit_status"] != 0 or record["correctness"] != "pass":
-                        raise ValueError("failed or unverified runs cannot enter Figure 12")
-                    run = record["run_id"]
-                    if run in seen_runs:
-                        raise ValueError(f"duplicate final record for run_id={run}")
-                    seen_runs.add(run)
-                    key = record["workload"], record["system"]
-                    if key in records:
-                        raise ValueError(
-                            f"multiple selected runs for {key}; select one repeat/log directory")
-                    record["_source"] = f"{path}:{number}"
-                    records[key] = record
-                except ValueError as exc:
-                    raise ValueError(f"{path}:{number}: {exc}") from exc
+def read_ec_cpu(context):
+    plan, log = context["plan"], context["log"]
+    if plan.get("client_env", {}).get("FARLIB_RUNTIME_EC_CPU") != "1":
+        raise ValueError("manifest must record FARLIB_RUNTIME_EC_CPU=1; old logs "
+                         "cannot reconstruct raw EC cycles")
+    records = []
+    with log.open(encoding="utf-8", errors="replace") as stream:
+        for number, line in enumerate(stream, 1):
+            if not line.lstrip().startswith(contract.EC_PREFIX + " "):
+                continue
+            record = contract.parse_line(line)
+            if record["system"] != plan["system"]:
+                raise ValueError("EC runtime/manifest system mismatch")
+            if record["boundary_sequence"] != len(records) + 1:
+                raise ValueError("EC Work sequences must be contiguous, starting at 1")
+            record["_source"] = f"{log.resolve()}:{number}"
+            records.append(record)
     if not records:
-        raise ValueError(
-            f"no figure12_result records for ratio={ratio}, repeat={repeat} under {root}")
+        raise ValueError(f"{log}: missing runtime_ec_cpu completed-Work records")
+    return {
+        "workload": contract.WORKLOADS[plan["app"]],
+        "system": contract.SYSTEMS[plan["system"]],
+        "metric": "local_ec_cpu_cycles", "unit": "cycles",
+        "value": sum(record["cycles"] for record in records),
+        "source_type": "measured",
+        "source": ";".join(record["_source"] for record in records),
+        "measurement_phase": "all_completed_work", "cycle_clock": "tsc",
+        "ec_work_intervals": len(records),
+        "ec_scopes": sum(record["scopes"] for record in records),
+        "boundary_sequence": len(records), "scope": "compute_ec",
+    }
 
+
+def read_run(directory, *, ratio=25, repeat=1, metrics="all", indexed=False):
+    context = metadata.load_run_context(directory, ratio=ratio, allow_teardown=True)
+    if context is None:
+        raise ValueError(f"{directory}: selected run ratio/runtime does not match Figure 12")
+    plan = context["plan"]
+    selected = contract.METRIC_SELECTIONS[metrics]
     rows = []
-    for app in WORKLOADS:
-        selected = [records[app, system] for system in SYSTEMS
-                    if (app, system) in records]
-        if not selected:
-            continue
-        baseline = records.get((app, "carbink"))
-        if baseline is None:
-            raise ValueError(f"{app}: missing selected Carbink baseline")
-        baseline_cores = baseline["local_ec_cpu_seconds"] / baseline["elapsed_s"]
-        if not math.isfinite(baseline_cores) or baseline_cores <= 0:
-            raise ValueError(f"{app}: Carbink mean EC CPU must be finite and positive")
-        for record in selected:
-            mismatched = [key for key in CONTEXT_FIELDS if record[key] != baseline[key]]
-            if mismatched:
-                raise ValueError(
-                    f"{app}/{record['system']}: context differs from Carbink: "
-                    + ", ".join(mismatched))
-            cores = record["local_ec_cpu_seconds"] / record["elapsed_s"]
-            if not math.isfinite(cores):
-                raise ValueError(f"{app}/{record['system']}: nonfinite mean EC CPU")
-            metrics = (
-                ("local_ec_cpu_norm", cores, baseline_cores, 1, "x", "cores"),
-                ("metadata_space_pct", record["metadata_peak_bytes"],
-                 record["app_memory_bytes"], 100, "% app memory", "bytes"),
-            )
-            for metric, raw, normalizer, scale, unit, raw_unit in metrics:
-                value = (raw / normalizer) * scale
-                if not math.isfinite(value) or value < 0:
-                    raise ValueError(f"{app}/{record['system']}: invalid {metric}")
-                cpu = metric == "local_ec_cpu_norm"
-                rows.append({
-                    "workload": WORKLOADS[app], "system": SYSTEMS[record["system"]],
-                    "metric": metric, "value": format(value, ".12g"), "unit": unit,
-                    "source_type": "measured",
-                    "source": (record["_source"] + "; carbink=" + baseline["_source"]
-                               if cpu else record["_source"]),
-                    "exit_status": "0", "correctness": "pass",
-                    "run_id": record["run_id"],
-                    "baseline_run_id": baseline["run_id"] if cpu else "",
-                    "ratio": ratio, "app_workers": record["app_workers"],
-                    "repeat": repeat, "environment": record["environment"],
-                    "workload_id": record["workload_id"], "measurement_phase": record["phase"],
-                    "app_memory_bytes": record["app_memory_bytes"],
-                    "local_ec_cpu_seconds": record["local_ec_cpu_seconds"],
-                    "elapsed_s": record["elapsed_s"],
-                    "baseline_local_ec_cpu_seconds": baseline["local_ec_cpu_seconds"] if cpu else "",
-                    "baseline_elapsed_s": baseline["elapsed_s"] if cpu else "",
-                    "raw_value": raw, "normalizer": normalizer, "scale": scale,
-                    "raw_unit": raw_unit, "normalizer_unit": raw_unit,
-                })
+    if "local_ec_cpu_cycles" in selected:
+        rows.append(read_ec_cpu(context))
+    if "metadata_space_pct" in selected:
+        rows.append(metadata.read_metadata(context))
+    if len(rows) == 2 and rows[0]["boundary_sequence"] != rows[1]["boundary_sequence"]:
+        raise ValueError("EC and metadata disagree on the final completed Work boundary")
+    for row in rows:
+        row.update(
+            exit_status=context["analysis"]["exit_status"], correctness="pass",
+            run_id=plan["run_id"], environment=plan["site"], ratio=ratio,
+            repeat=repeat if indexed else "unindexed",
+            app_memory_bytes=context["footprint"],
+            client_sha256=context["manifest"]["client_sha256"],
+            manifest_source=str(context["manifest_path"].resolve()),
+            measurement_usable=1, execution_status=context["execution_status"],
+            measurement_warning=context["measurement_warning"])
     return rows
 
 
-def write_csv(rows, output):
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("x", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+def discover_run_dirs(root, *, repeat=1):
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError("logs root must exist")
+    index = root / "batch-plan.json"
+    if index.is_file():
+        plan = json.loads(index.read_text())
+        if not isinstance(plan, list):
+            raise ValueError("batch-plan.json must be a case list")
+        directories, seen = [], set()
+        for case in plan:
+            if not isinstance(case, dict):
+                raise ValueError("batch plan cases must be objects")
+            if case.get("repeat") != repeat:
+                continue
+            run_id = case["run_id"]
+            if (not isinstance(run_id, str) or not run_id or
+                    Path(run_id).name != run_id or run_id in (".", "..") or
+                    "/" in run_id or "\\" in run_id or run_id in seen):
+                raise ValueError("invalid or duplicate batch run_id")
+            seen.add(run_id)
+            # The index is relocatable. Do not follow stale absolute run_dir
+            # values into an unrelated checkout or another experiment.
+            directory = root / "runs" / run_id
+            if not directory.is_dir():
+                raise ValueError(f"batch case missing: {directory}")
+            manifest = json.loads((directory / "manifest.json").read_text())
+            actual = manifest["plan"]
+            if any(actual.get(key) != case.get(key)
+                   for key in ("run_id", "app", "system")):
+                raise ValueError(f"{directory}: batch/manifest context mismatch")
+            directories.append(directory)
+        if not directories:
+            raise ValueError(f"batch has no cases for repeat {repeat}")
+        return directories
+    if repeat != 1:
+        raise ValueError("--repeat requires batch-plan.json; use explicit --run-dir "
+                         "for older runs, never infer repeats from directory suffixes")
+    # Discover manifests, not only successful analyses: unfinished cases must
+    # fail validation rather than silently disappear.
+    return [path.parent for path in sorted(root.rglob("manifest.json"))]
 
 
-def main():
+def collect_rows(root, *, ratio=25, repeat=1, metrics="all"):
+    return collect_run_dirs(discover_run_dirs(root, repeat=repeat), ratio=ratio,
+                            repeat=repeat, metrics=metrics,
+                            indexed=(Path(root) / "batch-plan.json").is_file())
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--logs-root", type=Path)
-    parser.add_argument("--pattern", default="*.log")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--logs-root", type=Path)
+    selection.add_argument("--run-dir", type=Path, action="append",
+                           help="Exact verified runs; use to select retries explicitly.")
+    parser.add_argument("--metrics", "--metric", choices=contract.METRIC_SELECTIONS,
+                        default="all")
     parser.add_argument("--ratio", type=int, default=25)
     parser.add_argument("--repeat", type=int, default=1)
-    parser.add_argument("--output", type=Path, default=AE_ROOT / "data/figure12.csv")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--summary", type=Path)
     parser.add_argument("--show-log-format", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.show_log_format:
-        print(log_contract.__doc__)
+        print(contract.__doc__)
         return 0
-    if args.logs_root is None:
-        parser.error("--logs-root is required unless --show-log-format is selected")
+    if not args.output or not (args.logs_root or args.run_dir):
+        parser.error("--output and --logs-root or --run-dir are required")
     try:
-        rows = collect_rows(args.logs_root, pattern=args.pattern,
-                            ratio=args.ratio, repeat=args.repeat)
-        write_csv(rows, args.output)
-        print(f"wrote {len(rows)} measured metric rows to {args.output}")
+        if args.output.exists() or (args.summary and args.summary.exists()):
+            raise ValueError("output already exists; select a fresh path")
+        if args.summary and args.summary.resolve() == args.output.resolve():
+            raise ValueError("CSV output and JSON summary must be different paths")
+        options = dict(ratio=args.ratio, repeat=args.repeat, metrics=args.metrics)
+        rows = (collect_run_dirs(args.run_dir, **options) if args.run_dir else
+                collect_rows(args.logs_root, **options))
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with args.output.open("x", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        warnings = sorted({row["measurement_warning"] for row in rows
+                           if row["measurement_warning"]})
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            with args.summary.open("x") as stream:
+                json.dump({"schema_version": 3, "figure": "figure12",
+                           "metrics": args.metrics, "repeat": rows[0]["repeat"],
+                           "cycle_clock": "tsc", "metadata_numerator": "accounted_bytes",
+                           "warnings": warnings, "rows": rows}, stream, indent=2)
+                stream.write("\n")
+        for warning in warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+        print(f"wrote {len(rows)} measured Figure 12 rows to {args.output}")
         return 0
-    except (OSError, ValueError, OverflowError) as exc:
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
+
+
+def collect_run_dirs(directories, *, ratio=25, repeat=1, metrics="all", indexed=False):
+    if not 1 <= ratio <= 100 or repeat < 1:
+        raise ValueError("ratio must be 1..100 and repeat must be positive")
+    if metrics not in contract.METRIC_SELECTIONS:
+        raise ValueError(f"unknown metric selection: {metrics}")
+    if not indexed and repeat != 1:
+        raise ValueError("--repeat requires batch-plan.json; explicit run directories "
+                         "are recorded as unindexed, not relabelled as repetitions")
+    rows, seen, footprints = [], set(), {}
+    for directory in directories:
+        for row in read_run(directory, ratio=ratio, repeat=repeat, metrics=metrics,
+                            indexed=indexed):
+            key = row["workload"], row["system"], row["metric"]
+            if key in seen:
+                raise ValueError(f"multiple runs for {key}; select exact --run-dir paths "
+                                 "or a batch --repeat; retries are not repetitions")
+            seen.add(key)
+            old = footprints.setdefault(row["workload"], row["app_memory_bytes"])
+            if old != row["app_memory_bytes"]:
+                raise ValueError("matched runtimes disagree on application footprint")
+            rows.append(row)
+    if not rows:
+        raise ValueError("no selected verified Figure 12 measurements found")
+    return rows
 
 
 if __name__ == "__main__":

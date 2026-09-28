@@ -53,6 +53,8 @@
 #include <cstring>
 #include <limits>
 
+#include "../../../../common/runtime_ec_cpu.hpp"
+
 #if __has_include(<isa-l/erasure_code.h>)
 #include <isa-l/erasure_code.h>
 #else
@@ -278,6 +280,8 @@ inline void small_object_stripe_xor_bytes_with_lut8(const uint8_t *src,
 // coef == 1 fast path (G1 sponge_rpc.hpp:901-910 memcpy/XOR), word at a time.
 inline void small_object_stripe_xor_bytes(const uint8_t *src, size_t byte_count,
                                           uint8_t *dst) {
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Xor);
     size_t i = 0;
     for (; i + sizeof(uint64_t) <= byte_count; i += sizeof(uint64_t)) {
         uint64_t in_word = 0;
@@ -299,6 +303,8 @@ inline void small_object_stripe_combine_bytes(const uint8_t *const *srcs,
                                               size_t source_count,
                                               uint8_t *dst,
                                               size_t byte_count) {
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Decode);
     bool assigned = false;
     for (size_t k = 0; k < source_count; k++) {
         const uint8_t coef = coefs[k];
@@ -388,6 +394,8 @@ inline bool small_object_stripe_encode_parity_delta(uint8_t data_shard_idx,
         return false;
     }
     if (byte_count == 0) return true;
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Update);
     const auto &tables = detail::small_object_stripe_isal_tables();
     uint8_t *source[] = {const_cast<uint8_t *>(data_delta)};
     uint8_t *parity[] = {parity0_delta, parity1_delta};
@@ -408,6 +416,8 @@ inline bool small_object_stripe_update_parity(uint8_t data_shard_idx,
         parity0 == nullptr || parity1 == nullptr ||
         byte_count > static_cast<size_t>(INT_MAX)) return false;
     if (byte_count == 0) return true;
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Update);
     const auto &tables = detail::small_object_stripe_isal_tables();
     uint8_t *parity[] = {parity0, parity1};
     ec_encode_data_update(static_cast<int>(byte_count), kStripeCodecDataShards,
@@ -444,6 +454,8 @@ inline bool small_object_stripe_encode_shards(
     }
 
     if (byte_count == 0) return true;
+    profile::runtime_ec_cpu::Scope ec_scope(
+        profile::runtime_ec_cpu::Operation::Encode);
     uint8_t *data[kStripeCodecDataShards];
     uint8_t *parity[kStripeCodecParityShards];
     for (size_t j = 0; j < kStripeCodecDataShards; ++j) {

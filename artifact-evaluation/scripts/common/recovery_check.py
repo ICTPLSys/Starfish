@@ -1,6 +1,7 @@
 """Bounded client execution and evidence checks for the recovery fast check."""
 
 from pathlib import Path
+import os
 import re
 import subprocess
 import time
@@ -32,11 +33,25 @@ def validate_request(app, system, endpoint, endpoint_count, method, standby):
                          "standby 6, and a failed endpoint in 0..5")
 
 
-def run_client(command, *, stdin, stdout, env, timeout, capture, inject, evidence):
+def run_client(command, *, stdin, stdout, env, timeout, capture, inject, evidence,
+               execution_state=None, benchmark_start_env=False):
     """A captured answer byte, not initialization or a prompt, arms injection."""
     deadline = time.monotonic() + timeout
+    child_env = None if env is None else dict(env)
+    benchmark_start_ns = None
+    if (benchmark_start_env
+            or (child_env is not None
+                and child_env.get("FARLIB_REMOTE_MEMORY_SAMPLES") == "1")):
+        if child_env is None:
+            child_env = os.environ.copy()
+        benchmark_start_ns = time.monotonic_ns()
+        child_env["FARLIB_BENCHMARK_START_MONOTONIC_NS"] = str(benchmark_start_ns)
     process = subprocess.Popen(command, stdin=stdin, stdout=stdout,
-                               stderr=subprocess.STDOUT, env=env)
+                               stderr=subprocess.STDOUT, env=child_env)
+    if execution_state is not None:
+        execution_state.update(pid=process.pid, reaped=False)
+        if benchmark_start_ns is not None:
+            execution_state["benchmark_start_monotonic_ns"] = benchmark_start_ns
     try:
         while process.poll() is None:
             if time.monotonic() >= deadline:
@@ -54,15 +69,20 @@ def run_client(command, *, stdin, stdout, env, timeout, capture, inject, evidenc
     finally:
         # Exceptions and Ctrl-C must not leave the workload using services that
         # the owning runner is about to stop.
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
-        else:
-            process.wait()
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            else:
+                process.wait()
+        finally:
+            if execution_state is not None:
+                status = process.poll()
+                execution_state.update(exit_status=status, reaped=status is not None)
 
 
 def compare_chat(capture, reference):

@@ -379,6 +379,12 @@ inline void ConcurrentArrayCache::release_cache(far_obj_t obj, bool dirty) {
 
 inline void ConcurrentArrayCache::enter_scope() {
     assert(uthread::get_tls()->scope_state == OutOfScope);
+    if (scope_counter_shards_enabled) {
+        const int token = scope_counters.enter();
+        uthread::get_tls()->scope_state = token;
+        scope_diag::on_enter(fibre_self(), ShardedScopeCounters::state(token));
+        return;
+    }
     auto state = mutator_states.global_state.load(std::memory_order::relaxed);
     uthread::get_tls()->scope_state = state;
     mutator_states.count[state].fetch_add(1, std::memory_order::relaxed);
@@ -389,6 +395,11 @@ inline void ConcurrentArrayCache::exit_scope() {
     auto prev_state = uthread::get_tls()->scope_state;
     assert(prev_state != OutOfScope);
     uthread::get_tls()->scope_state = OutOfScope;
+    if (scope_counter_shards_enabled) {
+        scope_counters.leave(prev_state);
+        scope_diag::on_exit(fibre_self(), ShardedScopeCounters::state(prev_state));
+        return;
+    }
     mutator_states.count[prev_state].fetch_sub(1, std::memory_order::relaxed);
     scope_diag::on_exit(fibre_self(), prev_state);
 }
@@ -398,6 +409,20 @@ inline bool ConcurrentArrayCache::evacuator_waiting() { return false; }
 inline void ConcurrentArrayCache::update_scope(DereferenceScope &scope) {
     auto &state = uthread::get_tls()->scope_state;
     assert(state != OutOfScope);
+    if (scope_counter_shards_enabled) {
+        const int old_state = ShardedScopeCounters::state(state);
+        if (scope_counters.current_state() != old_state) {
+            const int old_token = state;
+            scope_diag::before_update(fibre_self(), old_state, scope_counters.current_state());
+            scope.recursive_pin();
+            const int new_token = scope_counters.enter_on(ShardedScopeCounters::shard(old_token));
+            state = new_token;
+            scope_counters.leave(old_token);
+            scope.recursive_unpin();
+            scope_diag::after_update(fibre_self(), old_state, ShardedScopeCounters::state(new_token));
+        }
+        return;
+    }
     auto new_state = mutator_states.global_state.load(std::memory_order::relaxed);
     if (new_state != state) {
         auto old_state = state;

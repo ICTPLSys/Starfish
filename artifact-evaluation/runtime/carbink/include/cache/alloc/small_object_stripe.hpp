@@ -46,6 +46,7 @@
 #include <mutex>
 #include <vector>
 
+#include "../../../../common/runtime_metadata.hpp"
 #include "cache/alloc/region_remote_allocator.hpp"
 #include "cache/alloc/small_object_stripe_codec.hpp"
 
@@ -423,7 +424,7 @@ private:
     // of the single-object pool so the two paths cannot hand out the same
     // slot offset.
     std::array<SizeClassPool, ::FarLib::allocator::RegionBinCount> group_pools_;
-    std::mutex stripes_mutex_;
+    mutable std::mutex stripes_mutex_;
     std::atomic<uint64_t> next_endpoint_{0};
     // Endpoint liveness lives in RemoteGlobalHeap and is shared with ordinary
     // flat allocation.  A dead endpoint never changes the addresses already
@@ -1033,6 +1034,125 @@ public:
 
     bool enabled() const { return shard_table_.enabled(); }
 
+    ::FarLib::runtime_metadata::Snapshot metadata_usage() {
+        using Snapshot = ::FarLib::runtime_metadata::Snapshot;
+        Snapshot snapshot{};
+
+        snapshot.region_bytes += sizeof(shard_table_);
+        std::lock_guard<std::mutex> stripes_lock(stripes_mutex_);
+        // Includes inline pool/mapping headers and compiler padding once.
+        snapshot.mapping_bytes += sizeof(*this) - sizeof(shard_table_);
+        snapshot.mapping_bytes +=
+            static_cast<uint64_t>(stripe_storage_.capacity()) *
+            sizeof(std::unique_ptr<Stripe>);
+        if (stripe_index_ != nullptr) {
+            snapshot.mapping_bytes +=
+                static_cast<uint64_t>(stripe_capacity_) *
+                sizeof(std::atomic<Stripe *>);
+        }
+        if (shard_bindings_ != nullptr) {
+            snapshot.mapping_bytes +=
+                static_cast<uint64_t>(shard_binding_count_) *
+                sizeof(std::atomic<uint64_t>);
+        }
+
+        const auto add_pool_backing = [&](auto &pool_array) {
+            for (auto &pool : pool_array) {
+                std::lock_guard<std::mutex> lock(pool.mutex);
+                snapshot.mapping_bytes +=
+                    static_cast<uint64_t>(pool.stripes_with_space.capacity()) *
+                    sizeof(uint64_t);
+            }
+        };
+        add_pool_backing(pools_);
+        add_pool_backing(group_pools_);
+
+        const auto add_bitmap_backing = [](const Bitmap &bitmap) {
+            return static_cast<uint64_t>(bitmap.words.capacity()) *
+                   sizeof(uint64_t);
+        };
+        for (const auto &holder : stripe_storage_) {
+            if (holder == nullptr) continue;
+            const Stripe &stripe = *holder;
+            std::lock_guard<std::mutex> stripe_lock(stripe.mutex);
+            ++snapshot.stripes;
+            snapshot.stripe_bytes += sizeof(Stripe);
+
+            for (const auto &bitmap : stripe.free_bits)
+                snapshot.stripe_bytes += add_bitmap_backing(bitmap);
+            for (const auto &bitmap : stripe.dead_bits)
+                snapshot.stripe_bytes += add_bitmap_backing(bitmap);
+
+            snapshot.group_bytes +=
+                static_cast<uint64_t>(stripe.group_state_words.capacity()) *
+                sizeof(uint64_t);
+            snapshot.group_bytes +=
+                static_cast<uint64_t>(stripe.group_live_mask.capacity()) *
+                sizeof(uint8_t);
+            snapshot.group_bytes +=
+                static_cast<uint64_t>(stripe.group_live_objects.capacity()) *
+                sizeof(uint8_t);
+            snapshot.group_bytes +=
+                static_cast<uint64_t>(stripe.group_ready_after_write.capacity()) *
+                sizeof(uint8_t);
+            snapshot.group_bytes +=
+                static_cast<uint64_t>(stripe.group_generation.capacity()) *
+                sizeof(uint64_t);
+            snapshot.group_bytes +=
+                static_cast<uint64_t>(stripe.group_is_split.capacity()) *
+                sizeof(uint8_t);
+            snapshot.group_bytes +=
+                static_cast<uint64_t>(stripe.group_compaction_claimed.capacity()) *
+                sizeof(uint8_t);
+
+            snapshot.mapping_bytes +=
+                static_cast<uint64_t>(stripe.group_owners.capacity()) *
+                sizeof(std::array<uintptr_t, kDataShards>);
+            snapshot.group_slots +=
+                static_cast<uint64_t>(stripe.group_live_mask.capacity());
+        }
+        return snapshot;
+    }
+
+    // Cold-path snapshot of the physical EC group ownership.  A group keeps
+    // all six slot segments reserved from allocation while it is in progress
+    // or sealed.  A dead group remains reserved only while a compaction claim
+    // protects it; an unclaimed dead group is reusable and therefore omitted.
+    // The caller samples this at phase boundaries, so taking the stripe and
+    // stripe-list mutexes here does not add a hot-path counter or lock.
+    std::vector<uint64_t> live_group_bytes_by_endpoint() const {
+        const int configured_endpoint_count =
+            ::FarLib::get_config().server_count;
+        const size_t endpoint_count =
+            configured_endpoint_count > 0
+                ? static_cast<size_t>(configured_endpoint_count)
+                : 0;
+        std::vector<uint64_t> bytes(endpoint_count, 0);
+        if (!enabled() || endpoint_count == 0) return bytes;
+
+        std::lock_guard<std::mutex> stripes_lock(stripes_mutex_);
+        for (const auto &stripe_holder : stripe_storage_) {
+            if (stripe_holder == nullptr) continue;
+            const Stripe &stripe = *stripe_holder;
+            std::lock_guard<std::mutex> stripe_lock(stripe.mutex);
+            if (stripe.group_state_words.empty()) continue;
+            for (uint32_t slot = 0; slot < stripe.slots_per_shard; ++slot) {
+                const uint8_t state = group_state_locked(stripe, slot);
+                const bool reserved =
+                    state == kSlotGroupInProgress ||
+                    state == kSlotGroupSealed ||
+                    (state == kSlotGroupDead &&
+                     group_compaction_claimed_locked(stripe, slot));
+                if (!reserved) continue;
+                for (uint8_t shard = 0; shard < kShardCount; ++shard) {
+                    const uint32_t endpoint = stripe.shard_endpoint[shard];
+                    if (endpoint >= bytes.size()) continue;
+                    bytes[endpoint] += stripe.slot_size;
+                }
+            }
+        }
+        return bytes;
+    }
     const SmallObjectStripeShardTable &shard_table() const {
         return shard_table_;
     }

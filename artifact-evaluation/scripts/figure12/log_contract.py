@@ -1,104 +1,79 @@
-"""Final log record consumed by the Figure 12 collector.
+"""Figure 12 current raw-runtime contract (successful AE run directories).
 
-Emit ONE key=value line per completed, healthy run:
+Two independent opt-ins are recorded in manifest.plan.client_env:
+  FARLIB_RUNTIME_EC_CPU=1
+  FARLIB_RUNTIME_METADATA=1
 
-figure12_result schema_version=1 workload=kv-b system=starfish run_id=kvb-starfish-r1 environment=pair-a workload_id=kvb-512b-zipf099-1b ratio=25 app_workers=24 repeat=1 phase=work elapsed_s=60 local_ec_cpu_seconds=12 metadata_peak_bytes=20000000 app_memory_bytes=1000000000 exit_status=0 correctness=pass source_type=measured
+The compute client emits one EC record for every complete profile Work:
+  runtime_ec_cpu schema_version=1 system=starfish phase=work scope=compute_ec clock=tsc boundary_sequence=1 cycles=123 scopes=1
+cycles is a raw measured TSC/reference-cycle count for EC computation scopes,
+not CPU seconds, PMU core cycles, whole-worker time, RDMA wait, or a ratio to
+Carbink. The collector sums contiguous Work records and preserves the clock.
+The sample number documents the syntax; it is not an experiment result.
 
-Example numbers describe the interface, not benchmark measurements.
-Emit the final record only after workload verification and successful exit.
-Only Carbink and Starfish are compared. Run_id must be unique in selected logs.
-Workload_id identifies identical data, scale, requests and workload settings
-across systems; environment identifies matched experimental hardware/site.
+The client also emits exactly one existing runtime_metadata schema_version=1
+record at exit, saved from the last completed Work before application cleanup.
+Its accounted_bytes = metadata_bytes (core) + measurement_aux_bytes.
+Figure 12 includes the auxiliary structures: 100 * accounted_bytes / the
+manifest's full application footprint, not local-cache bytes, a peak, or RSS.
+CSV metadata_bytes is that inclusive total; core_metadata_bytes preserves the
+raw core-only field. Do not add CSV metadata_bytes and accounted_bytes.
 
-All values refer to the same complete Work interval, excluding initialization,
-warmup and cleanup. local_ec_cpu_seconds sums compute-node CPU execution time
-spent performing EC computation across workers (including coding/XOR work).
-Do not count RDMA waits, scheduling/suspension or whole-worker elapsed time
-as EC computation. elapsed_s is this run's Work wall-clock duration.
-CPU normalization is:
-  (local_ec_cpu_seconds / elapsed_s) /
-  (Carbink.local_ec_cpu_seconds / Carbink.elapsed_s)
-Thus different run durations are not mistaken for CPU-use differences.
-
-metadata_peak_bytes is the peak simultaneous compute-side runtime metadata
-allocation during Work: object references, region/allocation/group tracking,
-backup/recompute mappings and related FT bookkeeping, each counted once.
-Exclude application payload and EC data/parity buffers; do not substitute RSS
-or sum unrelated per-category peaks.
-app_memory_bytes is the application's full logical payload footprint at its
-100-percent-memory setting, not its local cache, process RSS or remote parity.
-Matched systems must report the same footprint. The displayed percentage is
-100 * metadata_peak_bytes / app_memory_bytes (2.0 means 2 percent).
-
-These are this collector's explicit reporting conventions. The script does
-not instrument applications or claim the measurements already exist.
-Missing fields are errors, not zero. Numeric zero must be measured.
+Missing instrumentation is an error, not a zero measurement. A recorded zero
+is valid. Legacy figure12_result CPU-seconds/metadata-peak records and
+local_ec_cpu_norm CSV values cannot be converted to this revised contract.
 """
 from __future__ import annotations
-
-import math
 import shlex
 
-PREFIX = "figure12_result"
+EC_PREFIX = "runtime_ec_cpu"
 WORKLOADS = {
-    "bfs": "BFS", "llama": "LLM", "mg": "MG", "wc": "WC",
+    "bfs": "BFS", "llama": "LLM", "mg": "MG", "wordcount": "WC",
     "kv-b": "KV-B", "kv-a": "KV-A", "kv-s": "KV-S", "nq": "NQ",
 }
 SYSTEMS = {"carbink": "Carbink", "starfish": "Starfish"}
-ALIASES = {"llm": "llama", "wordcount": "wc",
-           "kv_b": "kv-b", "kv_a": "kv-a", "kv_s": "kv-s"}
-TEXT_FIELDS = ("workload", "system", "run_id", "environment", "workload_id",
-               "phase", "correctness", "source_type")
-INT_FIELDS = ("schema_version", "ratio", "app_workers", "repeat", "metadata_peak_bytes",
-              "app_memory_bytes", "exit_status")
-FLOAT_FIELDS = ("elapsed_s", "local_ec_cpu_seconds")
-REQUIRED = frozenset(TEXT_FIELDS + INT_FIELDS + FLOAT_FIELDS)
-CONTEXT_FIELDS = ("environment", "workload_id", "ratio", "app_workers",
-                  "repeat", "phase", "app_memory_bytes")
+METRIC_UNITS = {"local_ec_cpu_cycles": "cycles",
+                "metadata_space_pct": "% app memory"}
+METRIC_SELECTIONS = {
+    "all": tuple(METRIC_UNITS),
+    "ec-cpu": ("local_ec_cpu_cycles",),
+    "metadata": ("metadata_space_pct",),
+}
+
+
+def nonnegative_integer(value, name):
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+        raise ValueError(f"{name} must be a nonnegative integer")
+    result = int(value)
+    if result >= 2**64:
+        raise ValueError(f"{name} exceeds uint64")
+    return result
 
 
 def parse_line(line):
-    """Return None for unrelated log output; malformed metric records fail."""
-    stripped = line.strip()
-    if not stripped or stripped.split(maxsplit=1)[0] != PREFIX:
+    tokens = shlex.split(line.strip())
+    if not tokens or tokens[0] != EC_PREFIX:
         return None
-    record = {}
-    for token in shlex.split(stripped)[1:]:
-        key, separator, value = token.partition("=")
-        if not separator or not key or not value:
-            raise ValueError(f"expected a nonempty key=value token, got {token!r}")
-        if key in record:
-            raise ValueError(f"duplicate log field: {key}")
-        record[key] = value
-    missing = REQUIRED - record.keys()
-    if missing:
-        raise ValueError("missing log fields: " + ", ".join(sorted(missing)))
-    for key in TEXT_FIELDS:
-        if not record[key].strip():
-            raise ValueError(f"{key} must not be blank")
-    for key in INT_FIELDS:
-        value = record[key]
-        digits = value.removeprefix("-") if key == "exit_status" else value
-        if not digits.isascii() or not digits.isdecimal():
-            raise ValueError(f"{key} must be a nonnegative integer")
-        record[key] = int(value)
-    for key in FLOAT_FIELDS:
-        record[key] = float(record[key])
-        if not math.isfinite(record[key]) or record[key] < 0:
-            raise ValueError(f"{key} must be finite and nonnegative")
-    if record["schema_version"] != 1:
-        raise ValueError("unsupported Figure 12 log schema")
-    if not 1 <= record["ratio"] <= 100 or record["app_workers"] < 1 or record["repeat"] < 1:
-        raise ValueError("invalid ratio, application worker count or repeat")
-    if record["elapsed_s"] <= 0 or record["app_memory_bytes"] <= 0:
-        raise ValueError("elapsed_s and app_memory_bytes must be positive")
-    if record["phase"] != "work":
-        raise ValueError("Figure 12 expects the complete work phase")
-    if record["source_type"] != "measured":
-        raise ValueError("log collector accepts measured records only")
-    app = record["workload"].lower()
-    record["workload"] = ALIASES.get(app, app)
-    record["system"] = record["system"].lower()
-    if record["workload"] not in WORKLOADS or record["system"] not in SYSTEMS:
-        raise ValueError("unknown workload or system")
-    return record
+    fields = {}
+    for token in tokens[1:]:
+        key, sep, value = token.partition("=")
+        if not sep or not key or not value or key in fields:
+            raise ValueError(f"invalid or duplicate EC field: {token!r}")
+        fields[key] = value
+    required = {"schema_version", "system", "phase", "scope", "clock",
+                "boundary_sequence", "cycles", "scopes"}
+    if missing := required - fields.keys():
+        raise ValueError("missing EC fields: " + ", ".join(sorted(missing)))
+    for key in ("schema_version", "boundary_sequence", "cycles", "scopes"):
+        fields[key] = nonnegative_integer(fields[key], key)
+    if fields["schema_version"] != 1 or fields["boundary_sequence"] < 1:
+        raise ValueError("unsupported EC schema or no completed Work")
+    if fields["system"] not in SYSTEMS:
+        raise ValueError("unsupported EC runtime")
+    for key, expected in (("phase", "work"), ("scope", "compute_ec"),
+                          ("clock", "tsc")):
+        if fields[key] != expected:
+            raise ValueError(f"EC {key} must be {expected}")
+    if fields["cycles"] and not fields["scopes"]:
+        raise ValueError("nonzero EC cycles require a measured computation scope")
+    return fields

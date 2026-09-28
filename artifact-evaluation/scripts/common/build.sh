@@ -12,7 +12,7 @@ JOBS="${JOBS:-4}"
 DRY_RUN=0
 ENABLE_PAPI=0
 BUILD_TESTS=OFF
-TARGETS=(server run_chat_far gapbs_bfs_chunked)
+TARGETS=(server run_chat_far gapbs_bfs_chunked mg wordcount_far kvs_throughput nhop_graph)
 
 usage() {
   cat <<'EOF'
@@ -23,7 +23,7 @@ Options:
   --runtime-dir DIR   explicit runtime source directory
   --build-dir DIR     explicit CMake build directory
   --jobs N             parallel build jobs (default: 4)
-  --targets LIST      comma-separated targets (also supports mg,wordcount_far,kvs_throughput,nhop_graph,object_size)
+  --targets LIST      comma-separated targets (default: server and all Figure 9 applications)
   --enable-papi       opt in to hardware event profiling (off by default)
   --with-tests        build the Starfish Design 2 CPU and external-RDMA tests
   --dry-run            print commands without configuring or building
@@ -51,6 +51,23 @@ case "$SYSTEM" in
   nonft|starfish|carbink|hydra) ;;
   *) echo "unsupported system: $SYSTEM" >&2; exit 2 ;;
 esac
+
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo '--jobs must be a positive integer' >&2; exit 2; }
+for target in "${TARGETS[@]}"; do
+  case "$target" in
+    bandwidth_microbenchmark|bandwidth_microbenchmark_512|object_size|object_size_512)
+      [[ "$SYSTEM" = starfish ]] || {
+        echo 'bandwidth microbenchmark targets require --system starfish' >&2
+        exit 2
+      }
+      ;;
+  esac
+done
+
+if [[ "$SYSTEM" = carbink && " ${TARGETS[*]} " = *" server "* &&
+      " ${TARGETS[*]} " != *" carbink_server "* ]]; then
+  TARGETS+=(carbink_server)
+fi
 
 if [[ "$BUILD_TESTS" = ON ]]; then
   [[ "$SYSTEM" = starfish ]] || {
@@ -133,8 +150,9 @@ else
 fi
 APP_OPTIONS=(-DFARLIB_BUILD_MG=OFF -DFARLIB_BUILD_WORDCOUNT=OFF
   -DFARLIB_BUILD_WORDCOUNT_RECOVERY=OFF -DFARLIB_BUILD_KVS=OFF
-  -DFARLIB_BUILD_NQ=OFF -DFARLIB_BUILD_OBJECT_SIZE=OFF)
-if [[ "$SYSTEM" = hydra ]]; then
+  -DFARLIB_BUILD_NQ=OFF -DFARLIB_BUILD_OBJECT_SIZE=OFF
+  -DFARLIB_BUILD_BANDWIDTH_MICROBENCHMARK=OFF)
+if [[ "$SYSTEM" = hydra || "$SYSTEM" = carbink ]]; then
   if [[ "$ENABLE_PAPI" = 1 ]]; then
     APP_OPTIONS+=(-DFARLIB_ENABLE_PAPI=ON)
   else
@@ -146,7 +164,8 @@ for target in "${TARGETS[@]}"; do
     mg|test_mg_iterator_boundaries) APP_OPTIONS+=(-DFARLIB_BUILD_MG=ON) ;;
     kvs_throughput) APP_OPTIONS+=(-DFARLIB_BUILD_KVS=ON) ;;
     nhop_graph) APP_OPTIONS+=(-DFARLIB_BUILD_NQ=ON) ;;
-    object_size|object_size_512) APP_OPTIONS+=(-DFARLIB_BUILD_OBJECT_SIZE=ON) ;;
+    bandwidth_microbenchmark|bandwidth_microbenchmark_512|object_size|object_size_512)
+      APP_OPTIONS+=(-DFARLIB_BUILD_BANDWIDTH_MICROBENCHMARK=ON) ;;
     wordcount_far|wordcount_native|word_length_stats)
       APP_OPTIONS+=(-DFARLIB_BUILD_WORDCOUNT=ON) ;;
     wordcount_recovery)

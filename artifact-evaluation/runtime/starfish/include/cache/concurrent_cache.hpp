@@ -1,4 +1,5 @@
 #pragma once
+#include "../../../common/benchmark_memory.hpp"
 #include "design1/backup_usage_shards.hpp"
 #include "design1/batched_backup_budget.hpp"
 #include <x86intrin.h>
@@ -46,6 +47,7 @@
 #include "recovery/ec_read_recovery.hpp"
 #include "recovery/ec_read_context.hpp"
 #include "recovery/ec_recovery_scratch.hpp"
+#include "recovery/ec_background_rebuild.hpp"
 #include "cache/alloc/ec_split_buffers.hpp"
 #include "cache/alloc/ec_size_class_builder.hpp"
 #include "recovery/ec_backup_policy.hpp"
@@ -535,6 +537,17 @@ private:
     // cluster intentionally has process lifetime after all fibres are joined.
     uthread::Cluster *background_cluster_ = nullptr;
     std::unique_ptr<UThread> master_evacuation_thread;
+    std::array<std::unique_ptr<UThread>, ec_background::kWorkers> background_rebuild_threads_;
+    uthread::Mutex background_rebuild_mutex_;
+    uthread::Condition background_rebuild_cond_;
+    std::atomic<bool> background_rebuild_stop_{false};
+    std::atomic<int> background_rebuild_failed_endpoint_{-1};
+    std::atomic<uint64_t> background_rebuild_redirected_reads_{0};
+    ec_background::SharedState background_rebuild_state_;
+    void start_background_rebuild();
+    void stop_background_rebuild();
+    void background_rebuild_work();
+    bool handle_background_rebuild_complete(const ibv_wc &wc);
     size_t evacuate_thread_cnt;
     std::atomic_flag flag;
     std::atomic_bool stw_active{false};
@@ -999,7 +1012,8 @@ private:
         if (batched_backup_budget) {
             auto &handle = fibre_context ? current_backup_budget_handle()
                                          : current_backup_thread_handle();
-            return batched_backup_budget->acquire(handle, bytes);
+            return batched_backup_budget->acquire(
+                handle, bytes, segmented_backup_enabled());
         }
         if (bypass_backup_usage) {
             bypass_backup_usage->adjust(static_cast<int64_t>(bytes));
@@ -3449,6 +3463,15 @@ private:
             goto retry;
         }
 
+        // A placement transition can release the backup and restore the same
+        // state word between the precheck and this lock acquisition.
+        if (!entry.has_remote_backup_reservation()) {
+            auto unlocked = lock_state;
+            unlocked.invalid = 0;
+            auto expected = lock_state;
+            ASSERT(entry.cas_state_strong(expected, unlocked));
+            return false;
+        }
         uint64_t old_remote = entry.remote_addr();
         ASSERT(old_remote != FarObjectEntry::RemoteAddrInvalid48);
         entry.set_remote_invalid();
@@ -3740,6 +3763,7 @@ public:
         // still owned by a pending RMW transaction.
         bool last_stage_owns_old_remote = false;
         uint64_t staging_original_remote_addr = FarObjectEntry::RemoteAddrInvalid48;
+        bool staging_repair_eligible = false;
         
         EvictBufferSet() : buffers(nullptr), server_count(0) {}
 
@@ -3828,7 +3852,9 @@ public:
     };
     void init_ec_direct_writes();
     EvictBufferSet *persistent_evict_buffers(size_t owner);
-    bool stage_ec_direct_object(EvictBufferSet &, void *, size_t, FarObjectEntry *, uint32_t);
+    bool stage_ec_direct_object(EvictBufferSet &, void *, size_t, FarObjectEntry *, uint32_t,
+                                bool allow_no_capacity = false,
+                                bool recovery_fallback = false);
     size_t post_ec_direct_pending(EvictBufferSet &, size_t, size_t);
     void flush_ec_direct_groups(EvictBufferSet &, size_t);
     void complete_ec_direct_write(uint64_t, uint8_t, bool);
@@ -4525,6 +4551,44 @@ public:
 
     void print_design1_diagnostics() const;
 
+private:
+    std::unique_ptr<::FarLib::benchmark_memory::Sampler> benchmark_memory_sampler_;
+    std::unique_ptr<::FarLib::runtime_metadata::Reporter> runtime_metadata_reporter_;
+
+    ::FarLib::runtime_metadata::Snapshot runtime_metadata_usage() {
+        auto snapshot = ::FarLib::allocator::global_heap.metadata_usage();
+        snapshot.add(::FarLib::allocator::remote::remote_global_heap.metadata_usage());
+        snapshot.add(remote_allocator.small_object_stripe_manager().metadata_usage());
+        snapshot.add(::FarLib::simple_region_heat::metadata_usage());
+        return snapshot;
+    }
+
+    void start_runtime_metadata_reporting() {
+        if (!::FarLib::runtime_metadata::enabled_from_environment()) return;
+        if (::FarLib::get_config().ft_background_rebuild) {
+            ERROR("runtime_metadata covers steady-state allocator metadata; "
+                  "disable background recovery for Figure 12 measurement");
+        }
+        runtime_metadata_reporter_ =
+            std::make_unique<::FarLib::runtime_metadata::Reporter>(
+                "starfish", this, +[](void *context) {
+                    return static_cast<ConcurrentArrayCache *>(context)
+                        ->runtime_metadata_usage();
+                });
+    }
+
+    void start_benchmark_memory_sampling() {
+        if (!::FarLib::benchmark_memory::enabled_from_environment()) return;
+        benchmark_memory_sampler_ =
+            std::make_unique<::FarLib::benchmark_memory::Sampler>(
+                ::FarLib::get_config().server_count, "allocator_occupied_bytes",
+                "remote_global_heap", [this] {
+                    return ::FarLib::allocator::remote::remote_global_heap
+                        .get_endpoint_used_bytes();
+                });
+        benchmark_memory_sampler_->start();
+    }
+
 public:
     ConcurrentArrayCache(void *local_buf, size_t local_buf_size,
                          size_t remote_buf_size, size_t evict_batch_size)
@@ -4683,6 +4747,18 @@ public:
                 ASSERT(resident_local_budget_bytes != 0);
             }
         }
+        if (::FarLib::ec_benchmark_phase::enabled()) {
+            auto &stripes = remote_allocator.small_object_stripe_manager();
+            stripes.configure_backup_growth(retained_backup_budget_bytes);
+            std::cout << "INFO: ec_backup_growth budget_data_bytes="
+                      << retained_backup_budget_bytes
+                      << " capacity_data_limit_bytes="
+                      << stripes.backup_growth_data_limit_bytes()
+                      << " allocation_unit_data_bytes="
+                      << 4 * stripes.shard_table().shard_size()
+                      << " policy=dead_slot_first_bounded_full_stripe"
+                      << std::endl;
+        }
         const uint64_t max_transient_local_bytes =
             local_buf_size - resident_local_budget_bytes;
         backup_covers_transient_window =
@@ -4710,13 +4786,18 @@ public:
                       << " observer=per_os_thread_signed_shards peak=sampled_only"
                        << " reservation_flags=unchanged" << std::endl;
         }
+        // Keep the stable branch default; v13's credit policy is available
+        // only when explicitly selected for its recovery experiment.
         if (env_flag_or_default("FARLIB_BACKUP_CREDITS", false)) {
-            ASSERT(all_nonresident_backup_mode && !bypass_backup_usage);
+            if (!selective_backup_enabled() || bypass_backup_usage) {
+                ERROR("backup credits require enabled backup and cannot combine with counter bypass");
+            }
             batched_backup_budget = std::make_unique<BatchedBackupBudget>(
                 retained_backup_budget_bytes, ::FarLib::allocator::RegionSize);
             std::cout << "backup_credits enabled=1 capacity_check=strict"
                       << " acquire=fibre_fetch_or_native_completion release=os_thread_local"
                       << " quantum_bytes=" << ::FarLib::allocator::RegionSize
+                      << " reclaim_idle_on_failure=" << segmented_backup_enabled()
                       << " peak=issued_upper_bound reservation_flags=unchanged" << std::endl;
         }
         if (resident_profile_planner_enabled_flag) {
@@ -4855,6 +4936,7 @@ public:
             master_evacuation_thread = uthread::create<true>(
                 evict_fn, this, std::string("evacuation master"));
         }
+        start_background_rebuild();
         ::FarLib::allocator::global_heap.set_on_memory_low(
             [this] {
                 uthread::notify_all(&eviction_cond, &eviction_mutex);
@@ -4868,9 +4950,14 @@ public:
             resident_profile_thread =
                 std::thread([this] { run_resident_profile_planner(); });
         }
+        start_benchmark_memory_sampling();
+        start_runtime_metadata_reporting();
     }
 
     ~ConcurrentArrayCache() {
+        // Print the saved final Work-boundary snapshot, never post-cleanup zero.
+        runtime_metadata_reporter_.reset();
+        if (benchmark_memory_sampler_) benchmark_memory_sampler_->stop();
         ::FarLib::simple_region_heat::end_work();
         ec_batch_diag_report("cache_dtor_begin");
         ec_read_recovery_diag_report("cache_dtor_begin");
@@ -4894,6 +4981,9 @@ public:
             uint64_t fallback = 0, deferred = 0, read_bytes = 0;
             uint64_t write_bytes = 0, read_posts = 0, write_posts = 0;
             uint64_t full = 0, tail = 0, polls = 0, highwater = 0;
+            uint64_t growth_objects = 0, growth_payload_bytes = 0;
+            uint64_t replacement_objects = 0;
+            uint64_t capacity_replacement_objects = 0;
             for (size_t owner = 0; owner < ec_persistent_owner_count_; ++owner) {
                 const auto &worker = ec_rmw_workers_[owner];
                 ASSERT(worker.pending_count() == 0);
@@ -4901,6 +4991,10 @@ public:
                 committed += worker.committed;
                 aborted += worker.aborted;
                 fallback += worker.fallback;
+                growth_objects += worker.growth_objects;
+                growth_payload_bytes += worker.growth_payload_bytes;
+                replacement_objects += worker.replacement_objects;
+                capacity_replacement_objects += worker.capacity_replacement_objects;
                 deferred += worker.deferred;
                 read_bytes += worker.read_bytes;
                 write_bytes += worker.write_bytes;
@@ -4916,6 +5010,10 @@ public:
                       << " committed=" << committed
                       << " aborted=" << aborted
                       << " fallback=" << fallback
+                      << " growth_objects=" << growth_objects
+                      << " growth_payload_bytes=" << growth_payload_bytes
+                      << " replacement_objects=" << replacement_objects
+                      << " capacity_replacement_objects=" << capacity_replacement_objects
                       << " deferred=" << deferred
                       << " read_bytes=" << read_bytes
                       << " write_bytes=" << write_bytes
@@ -4950,6 +5048,7 @@ public:
 
     void quiesce_background_evacuation() {
         ec_batch_diag_step("quiesce_background_evacuation_begin");
+        stop_background_rebuild();
         // ft_method=ec_batch: one bounded drain of the write round *before* the
         // workers stop, so every group that is still observable gets its real
         // completions.  What is left after that is settled further down.
@@ -5044,8 +5143,8 @@ public:
         SimpleResidentStateSnapshot s{};
         s.local_resident_mapping =
             ::FarLib::simple_region_heat::local_resident_enabled();
-        s.backup_used_bytes = retained_backup_bytes.load(std::memory_order_acquire);
-        s.backup_peak_bytes = peak_retained_backup_bytes.load(std::memory_order_acquire);
+        s.backup_used_bytes = backup_usage_snapshot();
+        s.backup_peak_bytes = backup_peak_snapshot();
         s.backup_budget_bytes = retained_backup_budget_bytes;
         s.resident_regions = heap.get_resident_reserved_regions();
         s.resident_budget_regions = heap.get_resident_region_budget();
@@ -6001,5 +6100,6 @@ private:
 #include "cache/core/rdma/ec_batch_path.ipp"
 #include "cache/core/rdma/ec_direct_path.ipp"
 #include "recovery/ec_read_recovery.ipp"
+#include "recovery/ec_background_rebuild.ipp"
 #include "recovery/recompute_recipe_path.ipp"
 #include "cache/core/common/common_path.ipp"

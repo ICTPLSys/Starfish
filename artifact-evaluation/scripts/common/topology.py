@@ -24,7 +24,8 @@ _RUNTIME_WORKER_KEYS = (
     "evacuate_thread_cnt",
     "mark_thread_cnt",
 )
-_RUNTIME_CONFIG_KEYS = _RUNTIME_WORKER_KEYS + ("optimized_evacuator",)
+_RUNTIME_CONFIG_KEYS = _RUNTIME_WORKER_KEYS + (
+    "optimized_evacuator", "ft_method", "compaction_worker_count")
 
 
 def _parse_cpu_list(value, label, *, expected=None):
@@ -156,7 +157,9 @@ def _parse_runtime_config(runtime_config):
         values = {}
         for key in _RUNTIME_CONFIG_KEYS:
             if key in runtime_config:
-                if key == "optimized_evacuator":
+                if key == "ft_method":
+                    values[key] = str(runtime_config[key])
+                elif key == "optimized_evacuator":
                     values[key] = _config_bool(
                         runtime_config[key], f"runtime config {key}")
                 else:
@@ -188,7 +191,9 @@ def _parse_runtime_config(runtime_config):
                 f"runtime config {key} must have one value on line {line_number}")
         if key in values:
             raise ValueError(f"runtime config contains duplicate {key}")
-        if key == "optimized_evacuator":
+        if key == "ft_method":
+            values[key] = fields[1]
+        elif key == "optimized_evacuator":
             values[key] = _config_bool(
                 fields[1], f"runtime config {key}")
         else:
@@ -248,12 +253,21 @@ def runtime_workers(site, runtime_config=None):
             "optimized_evacuator requires 0 < mark_thread_cnt "
             "< evacuate_thread_cnt")
     evict_workers = evacuate_workers - mark_workers
-    return {
+    result = {
         "app_workers": app_workers,
         "background_workers": evacuate_workers,
         "background_mark_workers": mark_workers,
         "background_evict_workers": evict_workers,
     }
+    if values.get("ft_method") in ("carbink", "ec_span"):
+        compaction = max(1, values.get("compaction_worker_count", 1))
+        result.update({
+            "background_workers": evacuate_workers + compaction + 1,
+            "background_compaction_workers": compaction,
+            "background_scanner_workers": 1,
+            "rdma_clients": app_workers + 2 * evacuate_workers + 2 * compaction + 1,
+        })
+    return result
 
 
 def check_cpu_profile(site, runtime_config=None):

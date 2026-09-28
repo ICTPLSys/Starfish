@@ -81,6 +81,36 @@ class RecoveryCheck(unittest.TestCase):
         self.assertEqual(env["FARLIB_CAPTURE_CHAT_OUTPUT"], "/tmp/chat")
         self.assertEqual(original["FARLIB_EC_RECOVERY_VERIFY"], "bad")
 
+    def test_benchmark_origin_is_injected_for_memory_or_cpu_opt_in(self):
+        command = [
+            sys.executable, "-c",
+            "import os; print(os.environ.get("
+            "'FARLIB_BENCHMARK_START_MONOTONIC_NS', ''))",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            for env, cpu_opt_in in (
+                    ({"FARLIB_REMOTE_MEMORY_SAMPLES": "1"}, False),
+                    ({}, True),
+                    ({}, False)):
+                execution = {}
+                output_path = Path(root) / ("origin-" + str(len(list(Path(root).iterdir()))))
+                with output_path.open("w", encoding="utf-8") as output:
+                    status = recovery_check.run_client(
+                        command, stdin=None, stdout=output, env=env, timeout=3,
+                        capture=None, inject=None, evidence={},
+                        execution_state=execution,
+                        benchmark_start_env=cpu_opt_in)
+                self.assertEqual(status, 0)
+                origin = output_path.read_text(encoding="utf-8").strip()
+                if env or cpu_opt_in:
+                    self.assertTrue(origin.isdigit())
+                    self.assertEqual(
+                        int(origin), execution["benchmark_start_monotonic_ns"])
+                else:
+                    self.assertEqual(origin, "")
+                    self.assertNotIn("benchmark_start_monotonic_ns", execution)
+
+
     def test_first_answer_triggers_exactly_one_injection(self):
         with tempfile.TemporaryDirectory() as root, open(os.devnull, "w") as output:
             capture = Path(root) / "chat"
@@ -115,11 +145,14 @@ class RecoveryCheck(unittest.TestCase):
                 def inject():
                     raise RuntimeError("ownership mismatch")
                 with patch("recovery_check.subprocess.Popen", side_effect=spawn):
+                    execution = {}
                     with self.assertRaises(expected):
                         recovery_check.run_client(
                             [sys.executable, "-c", source], stdin=None, stdout=output,
                             env=os.environ, timeout=timeout, capture=capture,
-                            inject=inject, evidence={})
+                            inject=inject, evidence={}, execution_state=execution)
+                self.assertTrue(execution["reaped"])
+                self.assertIsNotNone(execution["exit_status"])
                 self.assertTrue(all(child.poll() is not None for child in children))
 
     def test_identity_is_checked_before_signal_and_no_name_based_kill(self):

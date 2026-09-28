@@ -56,7 +56,7 @@ public:
                 ERROR("FARLIB_EC_BENCHMARK_PHASED requires exclusive one-sided incremental ec_batch mode");
             ::FarLib::ec_benchmark_phase::begin_runtime();
             std::cout << "INFO: ec_benchmark_phase enabled=1 init=full_stripe"
-                         " work=one_sided_rmw dead_index=1 fresh_fallback=0"
+                         " work=one_sided_rmw dead_index=1 fresh_fallback=bounded_backup_growth"
                          " behavior_reuse=prefer_same_allow_other" << std::endl;
             prepare_ec_rmw_timing(std::max<size_t>(1, config.evacuate_thread_cnt));
         }
@@ -93,6 +93,10 @@ public:
     }
 
     ~RemoteAllocator() {
+        // Cache quiescence joins the repair fibre before member destruction;
+        // all readers/writers are gone before physical redirect targets free.
+        if (::FarLib::get_config().ft_background_rebuild)
+            small_object_stripes.release_background_targets_for_shutdown();
         if (::FarLib::ec_benchmark_phase::enabled())
             small_object_stripes.release_retained_empty_groups_for_shutdown();
         if (ec_space_reporter_) {

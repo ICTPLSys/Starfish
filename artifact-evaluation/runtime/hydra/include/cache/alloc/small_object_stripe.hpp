@@ -402,7 +402,7 @@ private:
     // of the single-object pool so the two paths cannot hand out the same
     // slot offset.
     std::array<SizeClassPool, ::FarLib::allocator::RegionBinCount> group_pools_;
-    std::mutex stripes_mutex_;
+    mutable std::mutex stripes_mutex_;
     std::atomic<uint64_t> next_endpoint_{0};
     // Endpoint liveness lives in RemoteGlobalHeap and is shared with ordinary
     // flat allocation.  A dead endpoint never changes the addresses already
@@ -986,6 +986,43 @@ public:
         stripe_storage_.reserve(stripe_capacity_);
         stripe_count_.store(0, std::memory_order_relaxed);
         next_endpoint_.store(0, std::memory_order_relaxed);
+    }
+
+    // Cold-path snapshot for the EC-group remote footprint.  Flat allocator
+    // bytes are intentionally excluded: this reports only groups whose six
+    // remote segments are still reserved by an in-progress or sealed group.
+    // Free and dead groups are reusable reservations and are therefore not
+    // counted.  The stripe registry lock protects stripe_storage_ while each
+    // stripe mutex protects its group-state bitmap and endpoint metadata.
+    std::vector<uint64_t> snapshot_group_endpoint_bytes() const {
+        const auto &config = ::FarLib::get_config();
+        const size_t endpoint_count =
+            config.server_count > 0
+                ? static_cast<size_t>(config.server_count)
+                : 0;
+        std::vector<uint64_t> result(endpoint_count, 0);
+        std::lock_guard<std::mutex> registry_lock(stripes_mutex_);
+        const size_t stripe_count = static_cast<size_t>(std::min<uint64_t>(
+            stripe_count_.load(std::memory_order_acquire),
+            static_cast<uint64_t>(stripe_storage_.size())));
+        for (size_t stripe_id = 0; stripe_id < stripe_count; ++stripe_id) {
+            const Stripe *stripe = stripe_storage_[stripe_id].get();
+            if (stripe == nullptr) continue;
+            std::lock_guard<std::mutex> stripe_lock(stripe->mutex);
+            for (uint32_t slot = 0; slot < stripe->slots_per_shard; ++slot) {
+                const uint8_t state = group_state_locked(*stripe, slot);
+                if (state != kSlotGroupInProgress &&
+                    state != kSlotGroupSealed) {
+                    continue;
+                }
+                for (uint8_t shard = 0; shard < kShardCount; ++shard) {
+                    const uint32_t endpoint = stripe->shard_endpoint[shard];
+                    if (endpoint >= result.size()) continue;
+                    result[endpoint] += stripe->slot_size;
+                }
+            }
+        }
+        return result;
     }
 
     bool enabled() const { return shard_table_.enabled(); }

@@ -22,6 +22,7 @@
 
 #include "cache/placement/simple_region_budget.hpp"
 #include "cache/diagnostics/simple_dirty_observer.hpp"
+#include "../../../../common/runtime_metadata.hpp"
 
 namespace FarLib::simple_region_heat {
 
@@ -108,6 +109,10 @@ class Classes {
     std::unique_ptr<std::atomic<uint8_t>[]> supply_labels_;
     std::unique_ptr<std::atomic<int>[]> supply_bins_;
 public:
+    Classes() = default;
+    explicit Classes(std::atomic<Classes *> &publication) {
+        publication.store(this, std::memory_order_release);
+    }
     void configure(uintptr_t base, size_t bytes, size_t region_bytes) {
         if(!region_bytes)throw std::invalid_argument("zero Region size");
         // Cache setup may call monitor configuration more than once while
@@ -134,6 +139,17 @@ public:
                 supply_bins_[i].store(-1);
             }
         }
+    }
+    // Cold-path accounting of arrays owned by this process-local table.
+    uint64_t metadata_bytes() const noexcept {
+        uint64_t bytes = 0;
+        if (labels_) bytes += static_cast<uint64_t>(slots_) *
+                              sizeof(std::atomic<uint8_t>);
+        if (supply_labels_) bytes += static_cast<uint64_t>(slots_) *
+                                      sizeof(std::atomic<uint8_t>);
+        if (supply_bins_) bytes += static_cast<uint64_t>(slots_) *
+                                    sizeof(std::atomic<int>);
+        return bytes;
     }
     uint8_t get(uintptr_t address) const {
         if(!labels_ || address<base_ || address-base_>=bytes_)return kCold;
@@ -282,7 +298,11 @@ public:
 private:
     std::atomic<uint64_t> epoch_{1};
 };
-inline Classes &classes() { static Classes c; return c; }
+inline std::atomic<Classes *> classes_instance{nullptr};
+inline Classes &classes() {
+    static Classes c(classes_instance);
+    return c;
+}
 inline uint8_t class_for(uintptr_t address) { return classes().get(address); }
 inline uint8_t allocation_class_for(uintptr_t address) {
     return classes().allocation_class(address);
@@ -399,13 +419,19 @@ public:
         return result;
     }
     size_t slots() const { return slots_; }
+    // The Counters object is embedded in Monitor; only its pointee is added.
+    uint64_t metadata_bytes() const noexcept {
+        return counts_ ? static_cast<uint64_t>(slots_) *
+                             sizeof(std::atomic<uint64_t>)
+                       : 0;
+    }
 };
 
 class Monitor {
     Counters counters_;
     std::atomic_bool active_{false};
     std::atomic<uint64_t> unmapped_{0};
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable wake_;
     bool stop_ = false;
     std::thread worker_;
@@ -433,7 +459,23 @@ class Monitor {
                   << " collect_sort_ns=" << collection_ns << std::endl;
     }
 public:
+    Monitor() = default;
+    explicit Monitor(std::atomic<Monitor *> &publication) {
+        publication.store(this, std::memory_order_release);
+    }
     ~Monitor() { end(); }
+    // Cold-path snapshot. Do not call classes(), local(), or remote() here:
+    // those accessors may instantiate disabled policy singletons.
+    runtime_metadata::Snapshot metadata_usage() const {
+        std::lock_guard lock(mutex_);
+        runtime_metadata::Snapshot snapshot;
+        const uint64_t diagnostic = sizeof(output_) + sizeof(window_) +
+                                    sizeof(unmapped_);
+        snapshot.group_bytes = sizeof(*this) - diagnostic +
+                               counters_.metadata_bytes();
+        snapshot.measurement_aux_bytes = diagnostic;
+        return snapshot;
+    }
     void configure(uintptr_t base, size_t local_bytes, size_t region_bytes) {
         if (worker_.joinable()) throw std::logic_error("configure active heat monitor");
         if (simple_region_budget::six_enabled() && !simple_region_budget::enabled())
@@ -590,7 +632,22 @@ public:
     }
 };
 
-inline Monitor &monitor() { static Monitor m; return m; }
+inline std::atomic<Monitor *> monitor_instance{nullptr};
+inline Monitor &monitor() {
+    static Monitor m(monitor_instance);
+    return m;
+}
+inline runtime_metadata::Snapshot metadata_usage() {
+    runtime_metadata::Snapshot snapshot;
+    if (auto *value = monitor_instance.load(std::memory_order_acquire))
+        snapshot.add(value->metadata_usage());
+    if (auto *value = classes_instance.load(std::memory_order_acquire))
+        snapshot.mapping_bytes += sizeof(*value) + value->metadata_bytes();
+    snapshot.group_bytes += simple_region_budget::existing_metadata_bytes();
+    snapshot.measurement_aux_bytes += sizeof(monitor_instance) +
+        sizeof(classes_instance) + simple_region_budget::metadata_observer_bytes();
+    return snapshot;
+}
 inline void begin_work() { if(enabled())monitor().begin(); }
 inline void end_work() { if(enabled())monitor().end(); }
 

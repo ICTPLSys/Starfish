@@ -78,7 +78,12 @@ public:
         return false;
     }
 
-    EcBatchStatus add_object(const void *object, size_t size, uint64_t *address, size_t key) {
+    EcBatchStatus add_object(const void *object, size_t size, uint64_t *address, size_t key,
+                             bool recovery_fallback = false) {
+        if (recovery_fallback &&
+            (!::FarLib::get_config().ft_rmw_read_failure_fallback ||
+             !::FarLib::get_config().ft_incremental_one_sided))
+            return EcBatchStatus::kInvalidArgument;
         if (manager_ == nullptr || bank_ == nullptr || object == nullptr ||
             address == nullptr || size == 0 || size > kEcDirectMaxSlotSize ||
             key >= kEcBatchBehaviorGroupCount) {
@@ -94,7 +99,9 @@ public:
             g.metadata.behavior_group = static_cast<uint32_t>(key);
             g.metadata.allocator_bin = static_cast<uint16_t>(allocator_bin);
             auto &r = g.entry->record;
-            if (!manager_->allocate_slot_group(size, &r.group)) {
+            if (!manager_->allocate_slot_group(
+                    size, &r.group, ::FarLib::ec_benchmark_phase::steady() &&
+                                    !recovery_fallback, recovery_fallback)) {
                 ++allocation_failed_;
                 bank_->cancel(g.token); g = {};
                 return EcBatchStatus::kManagerRejected;

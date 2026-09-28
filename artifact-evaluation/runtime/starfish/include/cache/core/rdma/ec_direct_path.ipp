@@ -99,7 +99,7 @@ inline void ConcurrentArrayCache::wait_ec_write_source(FarObjectEntry &entry) {
 
 inline bool ConcurrentArrayCache::stage_ec_direct_object(
     EvictBufferSet &buffers, void *data, size_t size, FarObjectEntry *entry,
-    uint32_t behavior_group) {
+    uint32_t behavior_group, bool allow_no_capacity, bool recovery_fallback) {
     profile::evict_breakdown::Scope scope(buffers.breakdown,
         profile::evict_breakdown::Stage::StageControl);
     auto &builder = *buffers.direct_builder;
@@ -107,6 +107,15 @@ inline bool ConcurrentArrayCache::stage_ec_direct_object(
     auto *client = rdma::get_client(client_idx);
     if (!client) ERROR("ec_direct: missing client");
     const size_t qp_idx = client->get_qp_idx();
+    if (recovery_fallback) {
+        const auto &config = ::FarLib::get_config();
+        if (!config.ft_rmw_read_failure_fallback || !config.ft_incremental_one_sided)
+            ERROR("ec_direct: recovery admission is disabled");
+        // Keep failure-only replacement capacity separate from a partially
+        // filled normal backup-growth group. This posts only already-published
+        // sources; the new source is not yet in the builder.
+        flush_ec_direct_groups(buffers, client_idx);
+    }
     bool waiting = false, consumed = false;
     size_t progress_passes = 0;
     std::chrono::steady_clock::time_point deadline;
@@ -129,7 +138,11 @@ inline bool ConcurrentArrayCache::stage_ec_direct_object(
     while (true) {
         uint64_t address = ::FarLib::allocator::remote::InvalidRemoteAddr;
         const auto status = consumed ? builder.flush()
-            : builder.add_object(data, size, &address, behavior_group);
+            : builder.add_object(data, size, &address, behavior_group, recovery_fallback);
+        if (allow_no_capacity && !consumed &&
+            address == ::FarLib::allocator::remote::InvalidRemoteAddr &&
+            status == ec_batch::EcBatchStatus::kManagerRejected)
+            return false;
         if (!consumed && address != ::FarLib::allocator::remote::InvalidRemoteAddr) {
             if (::FarLib::get_config().ft_incremental_one_sided) {
                 // Deferred sources may have moved to a new FarObjectEntry.
@@ -156,6 +169,13 @@ inline bool ConcurrentArrayCache::stage_ec_direct_object(
         progress();
     }
     if (!consumed) ERROR("ec_direct: successful add without a remote address");
+    if (recovery_fallback) {
+        // A failure may hand off only one object. Seal/post its partial group
+        // now; the ordinary immutable completion retains/releases its borrow.
+        // Never wait for future admissions to complete this source.
+        flush_ec_direct_groups(buffers, client_idx);
+        return true;
+    }
     if (++buffers.ec_objects_since_post >= EvictBatchSize) {
         (void)post_ec_direct_pending(buffers, client_idx, qp_idx);
         buffers.ec_objects_since_post = 0;

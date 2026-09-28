@@ -84,6 +84,10 @@ inline void UniqueFarPtrBase<T, Impl>::atomic_move_to_and_set_busy(
     assert(to.entry.load_state(std::memory_order::relaxed).state == BUSY);
 retry:
     EntryStateBits prev_state = entry.load_state(std::memory_order::relaxed);
+    // Completion and placement updates own the reservation flags while invalid.
+    if (::FarLib::get_config().exclusive_cache && prev_state.invalid) {
+        goto retry;
+    }
     EntryStateBits busy_state = {.dirty = 0, .state = BUSY, .hotness = 0, .ref_cnt = 0};
     if (!entry.cas_state_weak(prev_state, busy_state)) goto retry;
 

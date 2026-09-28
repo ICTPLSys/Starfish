@@ -164,6 +164,10 @@ retry:
         }
         if (invalidate_retained_backup_for_write(entry, obj.size)) {
             old_state = entry.load_state(std::memory_order::relaxed);
+            // The helper released the move lock before returning. A Resident
+            // transition or another owner may now hold it; revalidate the
+            // newly loaded state before changing hotness or admitting a write.
+            goto retry;
         }
     }
     auto new_state = old_state;

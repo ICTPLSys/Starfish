@@ -108,11 +108,33 @@ int run() {
     Manager manager;
     manager.init(config.remote_total, shard_size);
     checks.check(manager.enabled(), "stripe manager enabled");
+    const auto *heat_before = FarLib::simple_region_heat::monitor_instance.load();
+    const auto *labels_before = FarLib::simple_region_heat::classes_instance.load();
+    const auto *local_budget_before = FarLib::simple_region_budget::local_instance.load();
+    const auto *remote_budget_before = FarLib::simple_region_budget::remote_instance.load();
+    (void)FarLib::simple_region_heat::metadata_usage();
+    checks.check(heat_before == FarLib::simple_region_heat::monitor_instance.load() &&
+                     labels_before == FarLib::simple_region_heat::classes_instance.load() &&
+                     local_budget_before == FarLib::simple_region_budget::local_instance.load() &&
+                     remote_budget_before == FarLib::simple_region_budget::remote_instance.load(),
+                 "metadata snapshot never instantiates inactive policy state");
+    const auto empty_metadata = manager.metadata_usage();
+    checks.equal(empty_metadata.stripes, 0u, "metadata starts without Stripe objects");
+    checks.check(empty_metadata.mapping_bytes > 0,
+                 "preallocated EC index capacity is metadata");
+    checks.equal(empty_metadata.remote_regions, 0u,
+                 "manager does not recount remote allocator regions");
 
     constexpr size_t kGroupSize = 64 * 1024;
     Manager::SlotGroupHandle group;
     checks.check(manager.allocate_slot_group(kGroupSize, &group),
                  "allocate ordinary group");
+    const auto allocated_metadata = manager.metadata_usage();
+    checks.equal(allocated_metadata.stripes, 1u, "one materialized Stripe descriptor");
+    checks.check(allocated_metadata.metadata_bytes() > empty_metadata.metadata_bytes(),
+                 "metadata grows on Stripe/group materialization");
+    checks.check(allocated_metadata.measurement_aux_bytes > 0,
+                 "space-accounting arrays are separated as measurement auxiliary");
     const uint64_t slot = group.slot_size;
     Usage usage = manager.space_usage();
     checks.equal(usage.occupied_group_bytes, 6 * slot,
@@ -192,6 +214,14 @@ int run() {
     usage = manager.space_usage();
     checks.equal(usage.occupied_group_bytes, 0u,
                  "retired group leaves active occupancy at zero");
+    const auto retired_metadata = manager.metadata_usage();
+    checks.equal(retired_metadata.stripes, allocated_metadata.stripes,
+                 "retired group retains its Stripe descriptor");
+    checks.equal(retired_metadata.group_bytes, allocated_metadata.group_bytes,
+                 "zero live payload does not erase retained group metadata");
+    checks.equal(retired_metadata.measurement_aux_bytes,
+                 allocated_metadata.measurement_aux_bytes,
+                 "measurement arrays retain capacity after group retirement");
     checks.equal(usage.reusable_groups, 1u, "retired group becomes reusable");
     checks.equal(usage.reusable_group_bytes, 6 * slot,
                  "reusable bytes retain six segment reservation");

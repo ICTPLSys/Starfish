@@ -12,14 +12,18 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "latency_mode.hpp"
 #include "async/stream_runner.hpp"
 #include "cache/cache.hpp"
 #include "data_structure/concurrent_hashmap.hpp"
@@ -33,6 +37,11 @@
 #include "utils/threads.hpp"
 #include "utils/uthreads.hpp"
 #include "utils/zipfian.hpp"
+
+#if __has_include("utils/request_interval_diag.hpp")
+#include "utils/request_interval_diag.hpp"
+#define FARLIB_KVS_HAS_REQUEST_INTERVAL_DIAG 1
+#endif
 
 using namespace FarLib;
 using namespace FarLib::rdma;
@@ -115,6 +124,53 @@ uint64_t steady_time_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<
         std::chrono::nanoseconds>(std::chrono::steady_clock::now()
                                       .time_since_epoch()).count());
+}
+
+struct LatencyOptions {
+    uint64_t offered_load_ops;
+    uint64_t warmup_ns;
+    uint64_t measurement_ns;
+    uint64_t drain_timeout_ns;
+    uint64_t max_queue_delay_ns;
+    std::filesystem::path output_dir;
+};
+
+std::optional<LatencyOptions> latency_options_from_env() {
+    const char* rate = std::getenv("FARLIB_KVS_OFFERED_LOAD_OPS");
+    if (rate == nullptr) return std::nullopt;
+    const auto duration = [](const char* name) {
+        return kv_latency::milliseconds_to_ns(
+            kv_latency::parse_unsigned(std::getenv(name), name));
+    };
+    LatencyOptions options{
+        kv_latency::parse_unsigned(rate, "FARLIB_KVS_OFFERED_LOAD_OPS"),
+        duration("FARLIB_KVS_LATENCY_WARMUP_MS"),
+        duration("FARLIB_KVS_LATENCY_MEASURE_MS"),
+        duration("FARLIB_KVS_DRAIN_TIMEOUT_MS"),
+        0,
+        {}
+    };
+    if (const char* deadline = std::getenv("FARLIB_KVS_MAX_QUEUE_DELAY_US"))
+        options.max_queue_delay_ns = kv_latency::microseconds_to_ns(
+            kv_latency::parse_unsigned(deadline, "FARLIB_KVS_MAX_QUEUE_DELAY_US", true));
+    const char* output = std::getenv("FARLIB_KVS_LATENCY_OUTPUT_DIR");
+    if (!output || !*output)
+        throw std::invalid_argument("missing FARLIB_KVS_LATENCY_OUTPUT_DIR");
+    options.output_dir = output;
+    const uint64_t range = kv_latency::checked_add(
+        std::max(options.warmup_ns, options.measurement_ns),
+        options.drain_timeout_ns);
+    if (range > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        throw std::overflow_error("KV latency duration exceeds histogram range");
+    kv_latency::checked_add(steady_time_ns(), range);
+    return options;
+}
+
+// Each strict parser record is submitted as one stdio operation. Background
+// runtime output must not split the fields of a measurement record.
+void latency_log(const std::string& line) {
+    const std::string record = "\n" + line + "\n";
+    std::fputs(record.c_str(), stderr);
 }
 
 }  // namespace
@@ -248,6 +304,9 @@ public:
                                    size_t qi_end);
 
     void run_direct(const Config& config, size_t fibres, bool miss_yield);
+
+    bool run_latency(const Config& config, size_t fibres,
+                     const LatencyOptions& options);
 
     void run_direct(const char* name, const Config& config, size_t fibre_count,
                     bool miss_yield);
@@ -1240,7 +1299,291 @@ void Workload::run_direct(const Config& config, size_t fibres, bool miss_yield) 
     print_hist();
 }
 
-void run(size_t n_server_core) {
+bool Workload::run_latency(const Config& config, size_t fibres,
+                           const LatencyOptions& options) {
+    ASSERT(fibres == 48 && uthread::get_worker_count() == 24);
+    ASSERT(KVSObjectBytes == 512 && data.size() == 33554432);
+    ASSERT(config.put_ratio == 0.05 && config.remove_ratio == 0.0);
+    ASSERT(config.zipfian_constant == 0.99 && config.hotset_shift_ns == 0);
+    ASSERT(config.deterministic_random && config.random_seed == KVSDefaultSeed);
+    ASSERT(mutating_values_enabled());
+    const char* verify = std::getenv("FARLIB_KVS_POST_VERIFY_SAMPLES");
+    ASSERT(verify == nullptr ||
+           kv_latency::parse_unsigned(verify, "FARLIB_KVS_POST_VERIFY_SAMPLES") == 4096);
+    std::error_code directory_error;
+    std::filesystem::create_directories(options.output_dir, directory_error);
+    if (directory_error) {
+        latency_log("kvs_latency_error reason=histogram_directory");
+        return false;
+    }
+    const uint64_t arrival_seed = config.random_seed;
+    {
+        std::ostringstream line;
+        line << "kvs_latency_config offered_load_ops=" << options.offered_load_ops
+             << " fibres=" << fibres << " os_workers=" << uthread::get_worker_count()
+             << " warmup_ns=" << options.warmup_ns
+             << " measurement_ns=" << options.measurement_ns
+             << " drain_timeout_ns=" << options.drain_timeout_ns
+             << " max_queue_delay_ns=" << options.max_queue_delay_ns
+             << " deadline_action=" << (options.max_queue_delay_ns
+                 ? "drop_before_execution" : "disabled")
+             << " arrival=poisson_per_fibre queue_model=fifo_independent_lanes"
+             << " include_queue_wait=1 hist_sample_period=1"
+             << " object_bytes=" << KVSObjectBytes << " initial_count=" << data.size()
+             << " put_ratio=" << config.put_ratio << " zipf=" << config.zipfian_constant
+             << " random_seed=" << config.random_seed << " arrival_seed=" << arrival_seed
+             << " locked_get=1 real_put=1 get_content_validation=0";
+        latency_log(line.str());
+    }
+    latency_log("kvs_get_lock enabled=1 mode=open_loop");
+    latency_log("kvs_validation_config get_content=0 real_put=1 mode=open_loop");
+    {
+        std::ostringstream line;
+        line << "kvs_direct_config fibres=" << fibres
+             << " miss_yield=1 fairness_yield_every=64 shared_deadline=1"
+             << " object_bytes=" << KVSObjectBytes << " initial_count=" << data.size()
+             << " put_ratio=" << config.put_ratio << " mode=open_loop";
+        latency_log(line.str());
+    }
+    RemoteHashTable::reset_deref_counts();
+    struct RandomState {
+        std::default_random_engine rank;
+        std::default_random_engine operation;
+        ZipfianGenerator<true> rank_generator;
+        uint64_t put_sequence = 0;
+    };
+    // zeta initialization scans the full key domain. Do it once before warmup,
+    // then copy its parameters into private distributions; no expensive setup
+    // or shared mutable distribution is introduced at the phase boundary.
+    const ZipfianGenerator<true> rank_template(initial_data_count(),
+                                               config.zipfian_constant);
+    std::vector<RandomState> random;
+    random.reserve(fibres);
+    for (size_t lane = 0; lane < fibres; ++lane)
+        random.push_back({make_request_random_engine(config, lane),
+                          make_operation_random_engine(config, lane),
+                          rank_template, 0});
+
+    // Arrival streams are phase-local; operation RNGs and mutation versions
+    // continue across the fully drained warmup/measurement boundary.
+    const auto phase = [&](const char* name, uint64_t phase_id, uint64_t window_ns) {
+        struct Lane {
+            kv_latency::LaneCounts counts;
+            std::array<uint64_t, 3> generated{};
+            std::array<uint64_t, 3> completed{};
+            std::array<uint64_t, 3> dropped{};
+            std::array<uint64_t, 3> skipped{};
+            uint64_t fingerprint = 0;
+            std::unique_ptr<kv_latency::HistogramSet> histogram;
+        };
+        const uint64_t histogram_range =
+            kv_latency::checked_add(window_ns, options.drain_timeout_ns);
+        std::vector<Lane> lanes(fibres);
+        for (auto& lane : lanes)
+            lane.histogram = std::make_unique<kv_latency::HistogramSet>(histogram_range);
+        std::atomic_size_t ready{0};
+        std::atomic_bool go{false};
+        std::atomic<uint64_t> epoch{0};
+        auto worker = [&](size_t tid) {
+            auto& lane = lanes[tid];
+            auto& rng = random[tid];
+            std::uniform_real_distribution<float> op_dist(0.0, 1.0);
+            lane.fingerprint = 1469598103934665603ULL ^ tid;
+            if (ready.fetch_add(1, std::memory_order_acq_rel) + 1 == fibres) {
+                const uint64_t start = steady_time_ns();
+                kv_latency::checked_add(start, histogram_range);
+                epoch.store(start, std::memory_order_relaxed);
+                std::ostringstream line;
+                line << "kvs_latency_phase name=" << name
+                     << " event=start monotonic_ns=" << start;
+                latency_log(line.str());
+                go.store(true, std::memory_order_release);
+            }
+            while (!go.load(std::memory_order_acquire)) uthread::yield();
+            kv_latency::LaneSchedule schedule(
+                epoch.load(std::memory_order_relaxed), window_ns,
+                options.drain_timeout_ns, options.offered_load_ops, fibres,
+                kv_latency::lane_seed(arrival_seed, phase_id, tid),
+                options.max_queue_delay_ns);
+            ON_MISS_BEGIN
+                uthread::yield();
+            ON_MISS_END
+            uint64_t due;
+            while (schedule.next(due)) {
+                // Materialize every scheduled request, including dropped/skipped ones,
+                // so its operation counters/fingerprint remain replayable.
+                const int rank = rng.rank_generator(rng.rank);
+                const size_t idx = (*rank_to_id)[rank];
+                ASSERT(idx < data.size());
+                const OpType op = get_op_type(op_dist(rng.operation), config);
+                ++lane.generated[op];
+                lane.fingerprint ^= idx;
+                lane.fingerprint *= 1099511628211ULL;
+                lane.fingerprint ^= static_cast<uint64_t>(op);
+                lane.fingerprint *= 1099511628211ULL;
+                const uint64_t version =
+                    op == PUT ? mutation_version(tid, rng.put_sequence++) : 0;
+                // This wait has no far-memory dereference scope. A delayed
+                // request retains its original due time: no coordinated omission.
+                uint64_t begin = steady_time_ns();
+                while (begin < due) {
+                    uthread::yield();
+                    begin = steady_time_ns();
+                }
+                const auto admission = schedule.start_decision(begin);
+                if (admission != kv_latency::LaneSchedule::StartDecision::Started) {
+                    if (admission == kv_latency::LaneSchedule::StartDecision::DeadlineDropped)
+                        ++lane.dropped[op];
+                    else
+                        ++lane.skipped[op];
+                    if ((schedule.counts.scheduled & 63) == 0) uthread::yield();
+                    continue;
+                }
+                {
+                    RootDereferenceScope scope;
+                    const auto& [key, base] = data[idx];
+                    if (op == GET) {
+                        str_value_t value;
+                        const bool found = remote_hash_table.get(
+                            key, &value, __on_miss__, scope, true);
+                        ASSERT(found);
+                        // The benchmark performs the full 479-byte value copy,
+                        // even though content verification is outside timing.
+                        asm volatile("" : : "m"(value) : "memory");
+                    } else {
+                        ASSERT(op == PUT && version != 0);
+                        remote_hash_table.put(
+                            key, make_versioned_value(base, version),
+                            __on_miss__, scope);
+                    }
+                }
+                const uint64_t complete = steady_time_ns();
+                schedule.complete(complete);
+                ++lane.completed[op];
+                lane.histogram->record(due, begin, complete);
+                if ((schedule.counts.scheduled & 63) == 0) uthread::yield();
+            }
+            // The arrival window is fixed even when this lane's final request
+            // completes early. All lanes drain before the next phase starts.
+            while (steady_time_ns() < schedule.window_end()) uthread::yield();
+            lane.counts = schedule.counts;
+        };
+        uthread::fork_join(fibres, worker, "kvs_open_loop");
+        const uint64_t end = steady_time_ns();
+        const uint64_t start = epoch.load(std::memory_order_relaxed);
+        {
+            std::ostringstream line;
+            line << "kvs_latency_phase name=" << name
+                 << " event=end monotonic_ns=" << end;
+            latency_log(line.str());
+        }
+        kv_latency::LaneCounts total;
+        std::array<uint64_t, 3> generated{}, completed{}, dropped{}, skipped{};
+        uint64_t fingerprint = 0, merge_dropped = 0;
+        kv_latency::HistogramSet histogram(histogram_range);
+        for (const auto& lane : lanes) {
+            total.scheduled = kv_latency::checked_add(total.scheduled, lane.counts.scheduled);
+            total.started = kv_latency::checked_add(total.started, lane.counts.started);
+            total.completed = kv_latency::checked_add(total.completed, lane.counts.completed);
+            total.completed_in_window = kv_latency::checked_add(
+                total.completed_in_window, lane.counts.completed_in_window);
+            total.deadline_dropped = kv_latency::checked_add(
+                total.deadline_dropped, lane.counts.deadline_dropped);
+            total.completed_after_deadline = kv_latency::checked_add(
+                total.completed_after_deadline, lane.counts.completed_after_deadline);
+            total.skipped = kv_latency::checked_add(total.skipped, lane.counts.skipped);
+            total.drain_timeout |= lane.counts.drain_timeout;
+            for (size_t op = 0; op < 3; ++op) {
+                generated[op] = kv_latency::checked_add(generated[op], lane.generated[op]);
+                completed[op] = kv_latency::checked_add(completed[op], lane.completed[op]);
+                dropped[op] = kv_latency::checked_add(dropped[op], lane.dropped[op]);
+                skipped[op] = kv_latency::checked_add(skipped[op], lane.skipped[op]);
+                ASSERT(lane.generated[op] ==
+                       lane.completed[op] + lane.dropped[op] + lane.skipped[op]);
+            }
+            fingerprint ^= lane.fingerprint;
+            merge_dropped = kv_latency::checked_add(
+                merge_dropped, histogram.merge(*lane.histogram));
+        }
+        ASSERT(total.scheduled == generated[GET] + generated[PUT] + generated[REMOVE]);
+        ASSERT(total.completed == completed[GET] + completed[PUT] + completed[REMOVE]);
+        ASSERT(total.started == total.completed);
+        ASSERT(total.scheduled == total.started + total.deadline_dropped + total.skipped);
+        ASSERT(total.deadline_dropped == dropped[GET] + dropped[PUT] + dropped[REMOVE]);
+        ASSERT(total.skipped == skipped[GET] + skipped[PUT] + skipped[REMOVE]);
+        ASSERT(total.completed_after_deadline <= total.completed);
+        for (size_t op = 0; op < 3; ++op)
+            ASSERT(generated[op] == completed[op] + dropped[op] + skipped[op]);
+        {
+            std::ostringstream line;
+            line << "kvs_latency_receipt name=" << name
+                 << " scheduled=" << total.scheduled << " started=" << total.started
+                 << " completed=" << total.completed
+                 << " completed_in_window=" << total.completed_in_window
+                 << " deadline_dropped=" << total.deadline_dropped
+                 << " completed_after_deadline=" << total.completed_after_deadline
+                 << " skipped=" << total.skipped
+                 << " generated_get=" << generated[GET] << " generated_put=" << generated[PUT]
+                 << " generated_remove=" << generated[REMOVE]
+                 << " completed_get=" << completed[GET] << " completed_put=" << completed[PUT]
+                 << " completed_remove=" << completed[REMOVE]
+                 << " dropped_get=" << dropped[GET] << " dropped_put=" << dropped[PUT]
+                 << " dropped_remove=" << dropped[REMOVE]
+                 << " skipped_get=" << skipped[GET] << " skipped_put=" << skipped[PUT]
+                 << " skipped_remove=" << skipped[REMOVE]
+                 << " request_fingerprint=" << fingerprint;
+            latency_log(line.str());
+        }
+        uint64_t histogram_write_errors = 0;
+        const char* labels[] = {"total", "service", "dispatch"};
+        for (size_t i = 0; i < 3; ++i) {
+            const auto path = options.output_dir /
+                (std::string(name) + "." + labels[i] + ".hgrm");
+            FILE* file = std::fopen(path.c_str(), "wx");
+            if (!file) {
+                ++histogram_write_errors;
+                continue;
+            }
+            if (hdr_percentiles_print(histogram.get(
+                    static_cast<kv_latency::HistogramSet::Kind>(i)),
+                    file, 100, 1, format_type::CLASSIC) != 0)
+                ++histogram_write_errors;
+            if (std::fclose(file) != 0) ++histogram_write_errors;
+        }
+        const bool passed = histogram_write_errors == 0 &&
+            kv_latency::complete_measurement(total, histogram, merge_dropped);
+        {
+            std::ostringstream line;
+            line << "kvs_latency_result name=" << name
+                 << " status=" << (passed ? "passed" : "invalid")
+                 << " arrival_window_ns=" << window_ns
+                 << " drain_elapsed_ns=" << end - kv_latency::checked_add(start, window_ns)
+                 << " drain_timeout=" << total.drain_timeout
+                 << " hist_count=" << histogram.count(kv_latency::HistogramSet::Total)
+                 << " hist_service_count=" << histogram.count(kv_latency::HistogramSet::Service)
+                 << " hist_dispatch_count=" << histogram.count(kv_latency::HistogramSet::Dispatch)
+                 << " hist_dropped=" << histogram.dropped()
+                 << " merge_dropped=" << merge_dropped
+                 << " hist_write_errors=" << histogram_write_errors;
+            // Incomplete or truncated histograms are retained for diagnosis,
+            // but never exposed as an apparently valid P99 measurement.
+            if (passed) {
+                line << " p99_ns=" << histogram.p99(kv_latency::HistogramSet::Total)
+                     << " p99_service_ns=" << histogram.p99(kv_latency::HistogramSet::Service)
+                     << " p99_dispatch_ns=" << histogram.p99(kv_latency::HistogramSet::Dispatch);
+            }
+            latency_log(line.str());
+        }
+        return passed;
+    };
+    const bool warmup_ok = phase("warmup", 0, options.warmup_ns);
+    const bool measurement_ok =
+        warmup_ok && phase("measurement", 1, options.measurement_ns);
+    verify_mutating_values(4096);
+    return warmup_ok && measurement_ok;
+}
+
+bool run(size_t n_server_core, const std::optional<LatencyOptions>& latency_options) {
     constexpr size_t NEvalRepeat = 1;
     Workload workload;
     Workload::Config config{
@@ -1311,12 +1654,16 @@ void run(size_t n_server_core) {
     const char* execution_mode = std::getenv("FARLIB_KVS_EXECUTION_MODE");
     ASSERT(execution_mode == nullptr || std::strcmp(execution_mode, "queue") == 0 ||
            std::strcmp(execution_mode, "direct") == 0);
-    const bool direct = execution_mode != nullptr &&
-                        std::strcmp(execution_mode, "direct") == 0;
+    const bool direct = latency_options.has_value() ||
+                        (execution_mode != nullptr &&
+                         std::strcmp(execution_mode, "direct") == 0);
 
     if (!direct) {
     std::cout << "setup: " << config.n_server_thread << " server cores; "
               << config.n_client_thread << " clients" << std::endl;
+    } else if (latency_options) {
+        latency_log("setup: open-loop KV; 48 independent FIFO logical lanes; "
+                    "implicit backlog; no cross-lane stealing");
     } else {
         std::cout << "setup: self-generated direct KV operations; no request queues"
                   << std::endl;
@@ -1357,15 +1704,32 @@ void run(size_t n_server_core) {
 
     // warm up
 
+    bool successful = true;
     #ifdef ENABLE_BENCHMARK
-    if (direct) {
+    if (latency_options) {
+        const char* fibre_env = std::getenv("FARLIB_KVS_DIRECT_FIBRES");
+        const size_t fibres = fibre_env == nullptr ? 48 :
+            kv_latency::parse_unsigned(fibre_env, "FARLIB_KVS_DIRECT_FIBRES");
+        profile::reset_all();
+        perf_profile([&] {
+            profile::start_work();
+            profile::thread_start_work();
+            successful = workload.run_latency(config, fibres, *latency_options);
+            profile::thread_end_work();
+            profile::end_work();
+        }).print();
+        profile::print_profile_data();
+        allocator::remote::remote_global_heap.print_used_memory();
+    } else if (direct) {
         const char* fibre_env = std::getenv("FARLIB_KVS_DIRECT_FIBRES");
         const size_t fibres = fibre_env == nullptr ? n_server_core
             : std::strtoull(fibre_env, nullptr, 10);
         ASSERT(fibres > 0 && fibres < (1ULL << 15));
         const char* yield_env = std::getenv("FARLIB_KVS_DIRECT_MISS_YIELD");
         const bool miss_yield = yield_env == nullptr || std::strtoull(yield_env, nullptr, 10) != 0;
+#ifdef FARLIB_KVS_HAS_REQUEST_INTERVAL_DIAG
         request_interval_diag::begin_stage(fibres);
+#endif
         profile::reset_all();
         perf_profile([&] {
             profile::start_work();
@@ -1373,7 +1737,9 @@ void run(size_t n_server_core) {
             workload.run_direct(config, fibres, miss_yield);
             profile::thread_end_work();
             profile::end_work();
+#ifdef FARLIB_KVS_HAS_REQUEST_INTERVAL_DIAG
             request_interval_diag::end_stage();
+#endif
         }).print();
         profile::print_profile_data();
         allocator::remote::remote_global_heap.print_used_memory();
@@ -1403,15 +1769,29 @@ void run(size_t n_server_core) {
     // No worker accesses the KV after this point. Stop background evacuation
     // before Workload destroys its far-memory objects.
     runtime_quiesce_cache();
+    return successful;
 }
 
 int main(int argc, char* argv[]) {
+    if (argc == 2 && std::strcmp(argv[1], "--describe-latency-mode") == 0) {
+        std::fputs("kvs_latency_capability schema=1 arrival=poisson_per_fibre "
+                   "include_queue_wait=1 hist_sample_period=1 "
+                   "queue_deadline=drop_before_execution\n", stdout);
+        return 0;
+    }
     if (argc != 3) {
         std::cout << "usage: " << argv[0]
                   << " <configure file> <local memory (GB)>" << std::endl;
         return -1;
     }
 
+    std::optional<LatencyOptions> latency_options;
+    try {
+        latency_options = latency_options_from_env();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "kvs_latency_error %s\n", error.what());
+        return 2;
+    }
     perf_init();
     Configure config;
     config.from_file(argv[1]);
@@ -1434,7 +1814,7 @@ int main(int argc, char* argv[]) {
     std::cout << "kvs_scope_shards enabled=0 supported=0" << std::endl;
     std::cout << "kvs_lock_wait_scope_yield supported=0 legacy_check_memory_low=1" << std::endl;
 #endif
-    run(n_server_core);
+    const bool successful = run(n_server_core, latency_options);
 #ifndef FARLIB_KVS_NONFT_COMPAT
     if (Cache::get_default()->scope_counter_shards_enabled) {
         const auto v0 = Cache::get_default()->scope_counters.old_count(1);
@@ -1445,5 +1825,5 @@ int main(int argc, char* argv[]) {
     }
 #endif
     runtime_destroy();
-    return 0;
+    return successful ? 0 : 2;
 }

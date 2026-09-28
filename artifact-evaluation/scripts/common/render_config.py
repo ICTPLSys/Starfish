@@ -9,6 +9,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from endpoint import validate_port, validate_render_endpoints
+from recipe_defaults import builtin_defaults, builtin_identity, fixed_resident_budget
 
 
 KEY = re.compile(r"^\s*([A-Za-z_][A-Za-z_0-9]*)\s+(\S+)")
@@ -41,6 +42,18 @@ def _template_values(lines: List[str]) -> Dict[str, str]:
             raise ValueError(f"duplicate configuration key: {key}")
         values[key] = value
     return values
+
+
+def load_recipe(template: Path) -> str:
+    """Resolve shared built-in policies, then explicit application differences.
+
+    External custom recipes remain self-contained. Final generated configs
+    contain the resolved values, so no policy file is needed on memory nodes.
+    """
+    explicit = template.read_text(encoding="utf-8").splitlines(keepends=True)
+    values = builtin_defaults(template)
+    values.update(_template_values(explicit))
+    return "".join(f"{key} {value}\n" for key, value in values.items())
 
 
 def _split_list(value: str, label: str) -> List[str]:
@@ -95,12 +108,22 @@ def _endpoint_values(records: List[Dict[str, Any]]) -> Tuple[str, str, str]:
 def render(template: Path, *, system: str, ratio: int, footprint_bytes: int,
            server_addr: Optional[str] = None, server_port: Optional[int] = None,
            ib_device: str, ib_port: Optional[int] = None,
-           server_endpoints: Optional[List[Dict[str, Any]]] = None) -> str:
+           server_endpoints: Optional[List[Dict[str, Any]]] = None,
+           backup_enabled: Optional[bool] = None,
+           resident_enabled: Optional[bool] = None) -> str:
     if not 1 <= ratio <= 100 or footprint_bytes <= 0:
         raise ValueError("ratio must be 1..100 and footprint_bytes must be positive")
-    if system not in {"nonft", "starfish", "hydra"}:
+    if system not in {"nonft", "starfish", "hydra", "carbink"}:
         raise ValueError(f"unsupported system: {system}")
-    lines = template.read_text(encoding="utf-8").splitlines(keepends=True)
+    identity = builtin_identity(template)
+    if identity is not None and identity[1] != system:
+        raise ValueError("built-in recipe system does not match --system")
+    if any(value is not None and not isinstance(value, bool)
+           for value in (backup_enabled, resident_enabled)):
+        raise ValueError("backup/resident overrides must be JSON booleans")
+    if backup_enabled is True and system not in {"nonft", "starfish"}:
+        raise ValueError(f"{system} does not support retained backup")
+    lines = load_recipe(template).splitlines(keepends=True)
     template_values = _template_values(lines)
     selected_port = (ib_port if ib_port is not None
                      else int(_template_values(lines).get("ib_port", "1")))
@@ -146,28 +169,44 @@ def render(template: Path, *, system: str, ratio: int, footprint_bytes: int,
         replace(lines, "local_resident_budget_bytes", str(resident), capacity(resident))
     if system == "nonft":
         replace(lines, "ft_method", "none")
-        replace(lines, "enable_selective_backup", "0")
-        replace(lines, "remote_backup_budget_bytes", "0", "disabled for Non-FT")
-    elif system == "starfish":
+    if system in {"nonft", "starfish"}:
         replace(lines, "enable_selective_backup", "1")
         replace(lines, "remote_backup_budget_bytes", str(backup),
                 capacity(backup) + ", 10% of application footprint")
-    elif system == "hydra":
+    else:
+        replace(lines, "enable_selective_backup", "0")
+        replace(lines, "remote_backup_budget_bytes", "0")
+        replace(lines, "remote_backup_budget_pct", "0")
+    if system in {"hydra", "carbink"}:
         # Preserve the recipe's fixed Resident/cache fraction. Hydra has no
         # retained backup or behavior-group planner; do not borrow Starfish's
         # footprint-minus-backup rule for ratios above 50 percent.
-        template_local = int(template_values.get("client_buffer_size", "0"))
-        template_resident = int(template_values.get("local_resident_budget_bytes", "0"))
-        if template_local <= 0 or not 0 <= template_resident <= template_local:
-            raise ValueError("Hydra recipe requires valid cache and fixed Resident budgets")
-        resident = local * template_resident // template_local
+        resident = (None if "client_buffer_size" in template_values or
+                    "local_resident_budget_bytes" in template_values else
+                    fixed_resident_budget(template, local))
+        if resident is None:
+            template_local = int(template_values.get("client_buffer_size", "0"))
+            template_resident = int(template_values.get("local_resident_budget_bytes", "0"))
+            if template_local <= 0 or not 0 <= template_resident <= template_local:
+                raise ValueError(f"{system} recipe requires valid cache and fixed Resident budgets")
+            resident = local * template_resident // template_local
         replace(lines, "local_resident_budget_bytes", str(resident), capacity(resident))
-        replace(lines, "enable_selective_backup", "0")
-        replace(lines, "remote_backup_budget_bytes", "0", "Hydra has no retained backup")
         for key in ("enable_logical_object_profile", "enable_resident_profile_planner",
                     "enable_region_hotness_placement", "enable_region_fetch_hotness_placement",
                     "region_placement_bind_groups"):
             replace(lines, key, "0")
+    if backup_enabled is False:
+        replace(lines, "enable_selective_backup", "0")
+        replace(lines, "remote_backup_budget_bytes", "0")
+        replace(lines, "remote_backup_budget_pct", "0")
+    if resident_enabled is False:
+        replace(lines, "local_resident_budget_bytes", "0")
+        for key in ("enable_region_resident_placement", "enable_resident_profile_planner",
+                    "resident_profile_apply_plan", "enable_region_hotness_placement",
+                    "enable_region_fetch_hotness_placement", "region_placement_bind_groups"):
+            replace(lines, key, "0")
+    if backup_enabled is False and resident_enabled is False:
+        replace(lines, "enable_logical_object_profile", "0")
     result = "".join(lines)
     if "@" in result:
         raise ValueError("unresolved configuration placeholder")
@@ -197,7 +236,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("template", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--system", choices=("nonft", "starfish", "hydra"), required=True)
+    parser.add_argument("--system", choices=("nonft", "starfish", "hydra", "carbink"), required=True)
     parser.add_argument("--ratio", type=int, required=True)
     parser.add_argument("--footprint-bytes", type=int, required=True)
     parser.add_argument("--server-addr")

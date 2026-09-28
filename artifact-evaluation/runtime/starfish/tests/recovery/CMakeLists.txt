@@ -1,4 +1,6 @@
 set(RECOVERY_CPU_TESTS
+    background_rebuild_manager
+    shutdown_completion
     config_uint8_numeric
     ec_batch_pending_backpressure
     ec_batch_worker_private
@@ -6,6 +8,7 @@ set(RECOVERY_CPU_TESTS
     ec_isal_codec
     ec_update_participant
     ec_slot_reuse
+    ec_rmw_read_fallback
     ec_direct_codec
     ec_direct_write_bank
     ec_direct_group
@@ -45,3 +48,12 @@ target_compile_options(test_exclusive_work_alignment PRIVATE -UNDEBUG)
 target_link_libraries(test_exclusive_work_alignment PRIVATE ${COMMON_LIBS})
 add_test(NAME recovery_exclusive_work_alignment COMMAND test_exclusive_work_alignment)
 set_tests_properties(recovery_exclusive_work_alignment PROPERTIES TIMEOUT 60)
+
+add_executable(test_background_rebuild_control background_rebuild_control_test.cpp)
+target_compile_options(test_background_rebuild_control PRIVATE -UNDEBUG)
+target_link_libraries(test_background_rebuild_control PRIVATE Threads::Threads)
+add_test(NAME recovery_background_rebuild_control COMMAND test_background_rebuild_control)
+set_tests_properties(recovery_background_rebuild_control PROPERTIES TIMEOUT 60)
+add_test(NAME recovery_background_rebuild_creation_race
+         COMMAND test_background_rebuild_manager creation-race)
+set_tests_properties(recovery_background_rebuild_creation_race PROPERTIES TIMEOUT 60)

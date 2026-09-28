@@ -45,6 +45,7 @@ struct Transaction {
     bool target_published = false;
     bool writes_decided = false;
     bool old_remote_released = false;
+    bool repair_eligible = false;
     bool encoded = false;
 
     bool has_reservation() const noexcept {
@@ -156,6 +157,10 @@ struct Worker {
     uint64_t payload_bytes = 0;
     uint64_t aborted = 0;
     uint64_t fallback = 0;
+    uint64_t growth_objects = 0;
+    uint64_t growth_payload_bytes = 0;
+    uint64_t replacement_objects = 0;
+    uint64_t capacity_replacement_objects = 0;
     uint64_t deferred = 0;
     uint64_t read_bytes = 0;
     uint64_t write_bytes = 0;

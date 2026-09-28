@@ -1,6 +1,9 @@
 {
   "name": "eight-server",
   "compute_ip": "10.208.130.56",
+  "memory_endpoint_indices_by_system": {
+    "carbink": [0, 1, 2, 3, 4, 5]
+  },
   "memory_endpoints": [
     {"ip": "10.208.130.22"},
     {"ip": "10.208.130.54"},

@@ -52,6 +52,13 @@ CONFIG(bool, ft_incremental_update, false)
 // Keep the original participant RPC implementation available. Opt-in worker
 // RMW uses only one-sided RDMA; both endpoints must parse the same config.
 CONFIG(bool, ft_incremental_one_sided, false)
+// Opt in to re-encoding a borrowed source after one-sided RMW READ failure.
+// Healthy phased allocation and the irreversible WRITE decision are unchanged.
+CONFIG(bool, ft_rmw_read_failure_fallback, false)
+// Failure-triggered client-side reconstruction. Off outside Figure13.
+CONFIG(bool, ft_background_rebuild, false)
+// Decimal MB/s cap independently applied to repair READ and WRITE bytes.
+CONFIG(size_t, ft_rebuild_bandwidth_mbps, 2500)
 CONFIG(size_t, ft_small_object_cutoff, 4096)
 // Shard size of one EC shard.  Must equal the library's region size
 // (include/cache/region_based_allocator.hpp: RegionSize == 256 KiB); the

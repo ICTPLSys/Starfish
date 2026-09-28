@@ -75,6 +75,14 @@ class EcSpaceReporter {
              << " reusable_group_bytes=" << s.reusable_group_bytes
              << " reserved_stripe_bytes=" << s.reserved_stripe_bytes
              << " ec_pool_committed_bytes=" << committed
+             << " backup_growth_data_bytes="
+             << manager_.backup_growth_data_bytes()
+             << " backup_growth_data_limit_bytes="
+             << manager_.backup_growth_data_limit_bytes()
+             << " recovery_replacement_data_bytes="
+             << manager_.recovery_replacement_data_bytes()
+             << " recovery_replacement_data_limit_bytes="
+             << manager_.recovery_replacement_data_limit_bytes()
              << " split_groups=" << s.split_groups
              << " small_groups_by_live=";
         for (size_t i = 0; i < s.group_counts_by_live.size(); ++i) {

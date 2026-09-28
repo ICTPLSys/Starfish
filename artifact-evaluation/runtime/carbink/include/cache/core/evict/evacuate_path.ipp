@@ -497,17 +497,17 @@ inline void ConcurrentArrayCache::evacuate_work() {
         const size_t configured_mark_workers = get_mark_worker_count();
         const size_t evict_workers = get_evict_worker_count(configured_mark_workers);
         const size_t mark_workers = configured_mark_workers;
-        std::cerr << "runtime.exclusive_owned_batch="
-                  << (optimized_enabled &&
-                      optimized_legacy_exclusive_pipeline_enabled() &&
-                      exclusive_owned_batch_reclaim_enabled())
-                  << " mark_workers=" << mark_workers
-                  << " evict_workers=" << evict_workers << std::endl;
+        // Emit the complete record together while other workers start.
+        std::fprintf(stderr,
+                     "\nruntime.exclusive_owned_batch=%d mark_workers=%zu evict_workers=%zu\n",
+                     static_cast<int>(optimized_enabled &&
+                         optimized_legacy_exclusive_pipeline_enabled() &&
+                         exclusive_owned_batch_reclaim_enabled()),
+                     mark_workers, evict_workers);
         if (::FarLib::get_config().is_hydra_mode()) {
-            std::cerr << "hydra.reclaim batch_regions="
-                      << hydra_owned_reclaim_batch_limit()
-                      << " early_notify=" << hydra_reclaim_notify_enabled()
-                      << std::endl;
+            std::fprintf(stderr, "\nhydra.reclaim batch_regions=%zu early_notify=%d\n",
+                         static_cast<size_t>(hydra_owned_reclaim_batch_limit()),
+                         static_cast<int>(hydra_reclaim_notify_enabled()));
         }
         uint64_t handled_eviction_request_seq = 0;
         auto requeue_pending_pipeline_tasks = [&] {

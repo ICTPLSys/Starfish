@@ -1,4 +1,5 @@
 #pragma once
+#include "../../../common/benchmark_memory.hpp"
 #include "cache/backup_usage_shards.hpp"
 #include "cache/batched_backup_budget.hpp"
 #include <x86intrin.h>
@@ -43,6 +44,7 @@
 #include "utils/signal.hpp"
 #include "utils/stats.hpp"
 #include "utils/uthreads.hpp"
+#include "cache/core/common/sharded_scope_counters.hpp"
 #include "utils/wait_trace.hpp"
 #include "utils/inclusive_reclaim_diag.hpp"
 #include "utils/scope_diag.hpp"
@@ -150,6 +152,12 @@ public:
         std::atomic<MutatorState> global_state = InScopeV0;
         std::atomic_size_t count[MutatorStateCount];
     } mutator_states;
+
+    // Experimental toggle, fixed for this Cache's lifetime. Legacy OFF path
+    // remains available for a same-binary performance control.
+    const bool scope_counter_shards_enabled =
+        env_flag_or_default("FARLIB_SCOPE_COUNTER_SHARDS", false);
+    ShardedScopeCounters scope_counters;
 
     // Epoch-based release mechanism for streaming pipeline
     std::atomic<uint32_t> produce_epoch{0};
@@ -3956,6 +3964,24 @@ public:
 
     void print_design1_diagnostics() const;
 
+private:
+    std::unique_ptr<::FarLib::benchmark_memory::Sampler> benchmark_memory_sampler_;
+
+    void start_benchmark_memory_sampling() {
+        if (!::FarLib::benchmark_memory::enabled_from_environment()) return;
+        benchmark_memory_sampler_ =
+            std::make_unique<::FarLib::benchmark_memory::Sampler>(
+                ::FarLib::get_config().server_count, "allocator_occupied_bytes",
+                "remote_global_heap", [this] {
+                    const auto &heap = ::FarLib::allocator::remote::remote_global_heap;
+                    std::vector<uint64_t> values(::FarLib::get_config().server_count);
+                    for (size_t i = 0; i < values.size(); ++i)
+                        values[i] = heap.get_server_used_bytes(i);
+                    return values;
+                });
+        benchmark_memory_sampler_->start();
+    }
+
 public:
     ConcurrentArrayCache(void *local_buf, size_t local_buf_size,
                          size_t remote_buf_size, size_t evict_batch_size)
@@ -4175,9 +4201,11 @@ public:
                 std::thread([this] { run_resident_profile_planner(); });
         }
         start_read_supply_timeline();
+        start_benchmark_memory_sampling();
     }
 
     ~ConcurrentArrayCache() {
+        if (benchmark_memory_sampler_) benchmark_memory_sampler_->stop();
         stop_read_supply_timeline();
         quiesce_background_evacuation();
         ::FarLib::allocator::release_all_thread_heap_regions_for_shutdown();

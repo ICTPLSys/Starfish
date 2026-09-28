@@ -101,6 +101,8 @@ void test_defaults_and_numeric_fields() {
     defaults.from_file(empty.string().c_str());
     assert(defaults.qp_retry_cnt == uint8_t{7});
     assert(defaults.qp_timeout == uint8_t{8});
+    assert(!defaults.ft_background_rebuild);
+    assert(defaults.ft_rebuild_bandwidth_mbps == 2500);
 
     for (const uint8_t expected : {uint8_t{0}, uint8_t{1}, uint8_t{3},
                                    uint8_t{7}}) {

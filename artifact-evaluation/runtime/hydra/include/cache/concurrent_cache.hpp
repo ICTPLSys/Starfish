@@ -1,4 +1,5 @@
 #pragma once
+#include "../../../common/benchmark_memory.hpp"
 #include "cache/accounting/backup_usage_shards.hpp"
 #include "cache/accounting/batched_backup_budget.hpp"
 #include <x86intrin.h>
@@ -4526,6 +4527,20 @@ public:
 
     void print_design1_diagnostics() const;
 
+private:
+    std::unique_ptr<::FarLib::benchmark_memory::Sampler> benchmark_memory_sampler_;
+
+    void start_benchmark_memory_sampling() {
+        if (!::FarLib::benchmark_memory::enabled_from_environment()) return;
+        benchmark_memory_sampler_ =
+            std::make_unique<::FarLib::benchmark_memory::Sampler>(
+                ::FarLib::get_config().server_count, "live_encoded_page_bytes",
+                "ec_group_allocator", [this] {
+                    return this->remote_memory_endpoint_bytes();
+                });
+        benchmark_memory_sampler_->start();
+    }
+
 public:
     ConcurrentArrayCache(void *local_buf, size_t local_buf_size,
                          size_t remote_buf_size, size_t evict_batch_size)
@@ -4874,9 +4889,11 @@ public:
             resident_profile_thread =
                 std::thread([this] { run_resident_profile_planner(); });
         }
+        start_benchmark_memory_sampling();
     }
 
     ~ConcurrentArrayCache() {
+        if (benchmark_memory_sampler_) benchmark_memory_sampler_->stop();
         ::FarLib::simple_region_heat::end_work();
         ec_batch_diag_report("cache_dtor_begin");
         quiesce_background_evacuation();
@@ -5807,6 +5824,13 @@ public:
     }
 
 public:
+    // EC-group-only cold-path footprint.  Flat allocator bytes remain exposed
+    // by RemoteGlobalHeap and are intentionally not mixed into this vector.
+    std::vector<uint64_t> remote_memory_endpoint_bytes() const {
+        return remote_allocator.small_object_stripe_manager()
+            .snapshot_group_endpoint_bytes();
+    }
+
     bool memory_low() {
         return ::FarLib::allocator::global_heap.memory_low();
     }

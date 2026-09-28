@@ -5,6 +5,7 @@ import sys
 import unittest
 from unittest import mock
 import subprocess
+import tempfile
 
 COMMON = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(COMMON))
@@ -75,26 +76,30 @@ class MultiEndpoint(unittest.TestCase):
         self.assertIn("ft_method ec_batch", one)
 
     def test_hydra_keeps_ec_method_and_does_not_add_starfish_backup(self):
-        template = AE / "configs" / "wordcount" / "recomputable_ec.config"
+        template = AE / "configs" / "wordcount" / "hydra.config"
         endpoints = [{"server_addr": "192.0.2.20", "server_port": 1400 + i}
                      for i in range(6)]
         config = render(template, system="hydra", ratio=25,
                         footprint_bytes=10_000_000, ib_device="mlx5_0",
                         server_endpoints=endpoints)
-        self.assertIn("ft_method ec_batch", config)
+        self.assertIn("ft_method hydra", config)
         self.assertNotIn("remote_backup_budget_bytes 1000000", config)
 
     def test_legacy_single_api_rejects_multi_template(self):
-        template = AE / "configs" / "wordcount" / "recomputable_ec.config"
-        with self.assertRaises(ValueError):
-            render(template, system="starfish", ratio=25,
-                   footprint_bytes=10_000_000, server_addr="192.0.2.20",
-                   server_port=1998, ib_device="mlx5_0")
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "external.config"
+            template.write_text("server_count 2\nserver_addrs 192.0.2.20,192.0.2.21\n"
+                                "server_ports 1400,1400\n")
+            with self.assertRaises(ValueError):
+                render(template, system="starfish", ratio=25,
+                       footprint_bytes=10_000_000, server_addr="192.0.2.20",
+                       server_port=1998, ib_device="mlx5_0")
 
     def test_identity_checks_include_starttime_cwd_and_exact_argv(self):
         script = run_case.process_identity_script(
             1234, "/opt/server", "/tmp/run/endpoint-00/server.config", "777")
-        self.assertIn("awk '{print $22}'", script)
+        self.assertIn('start=${20}', script)
+        self.assertIn('fields=${snapshot##*) }', script)
         self.assertIn("/proc/$pid/cwd", script)
         self.assertIn("argv_real", script)
         self.assertIn("server.config", script)
@@ -109,7 +114,7 @@ class MultiEndpoint(unittest.TestCase):
         }
         calls = []
 
-        def fake_ssh(host, script, check=True):
+        def fake_ssh(host, script, check=True, timeout=30):
             calls.append((host, script, check))
             return mock.Mock(returncode=10, stdout="", stderr="")
 
@@ -130,6 +135,18 @@ class MultiEndpoint(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ownership mismatch"):
                 run_case.stop_server_process("memory0", state)
 
+    def test_cleanup_handles_exit_during_identity_read(self):
+        state = {
+            "pid": 1234, "starttime": "777", "server_bin": "/opt/server",
+            "remote_dir": "/tmp/run/endpoint-00",
+        }
+        responses = [mock.Mock(returncode=11, stdout="", stderr=""),
+                     mock.Mock(returncode=10, stdout="", stderr="")]
+        with mock.patch.object(run_case, "ssh", side_effect=responses) as ssh:
+            self.assertEqual(run_case.stop_server_process("memory0", state),
+                             "already_exited")
+        self.assertNotIn("kill -", ssh.call_args_list[1].args[1])
+
     def test_partial_cleanup_script_is_bounded(self):
         state = {
             "pid": 1234, "starttime": "777", "server_bin": "/opt/server",
@@ -137,8 +154,8 @@ class MultiEndpoint(unittest.TestCase):
         }
         calls = []
 
-        def fake_ssh(host, script, check=True):
-            calls.append((host, script, check))
+        def fake_ssh(host, script, check=True, timeout=30):
+            calls.append((host, script, check, timeout))
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         with mock.patch.object(run_case, "ssh", side_effect=fake_ssh):
@@ -146,10 +163,12 @@ class MultiEndpoint(unittest.TestCase):
         script = calls[0][1]
         self.assertIn("kill -TERM", script)
         self.assertIn("kill -KILL", script)
-        self.assertIn("seq 1 30", script)
-        self.assertIn("seq 1 10", script)
+        self.assertIn("seq 1 100", script)
+        self.assertIn("seq 1 200", script)
+        self.assertEqual(calls[0][3], 60)
         self.assertEqual(script.count("stat 2>/dev/null)\" = Z"), 2)
-        self.assertIn("awk '{print $22}'", script)
+        self.assertIn('start=${20}', script)
+        self.assertIn("seq 1 40", script)
 
     def test_ssh_does_not_load_login_logout_hooks(self):
         with mock.patch.object(run_case.subprocess, "run",

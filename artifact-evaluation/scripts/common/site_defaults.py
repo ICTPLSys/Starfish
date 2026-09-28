@@ -94,24 +94,23 @@ def _placement_named_map(value, label, selector, allowed_names):
 
 def _apply_placement(site, compute, *, system, app):
     placement = {}
-    placement.update({
-        key: copy.deepcopy(compute[key])
-        for key in PLACEMENT_KEYS
-        if key in compute
-    })
-    placement.update({
-        key: copy.deepcopy(site[key])
-        for key in PLACEMENT_KEYS
-        if key in site
-    })
-    if "placement_by_system" in site:
-        placement.update(_placement_named_map(
-            site["placement_by_system"], "placement_by_system",
-            system, SYSTEMS))
-    if "placement_by_app" in site:
-        placement.update(_placement_named_map(
-            site["placement_by_app"], "placement_by_app",
-            app, _KNOWN_APPS))
+    # All machine defaults precede all explicit site settings. Within either
+    # layer, the more specific selector wins; preserve existing site precedence.
+    cases = {f"{name}/{runtime}" for name in _KNOWN_APPS for runtime in SYSTEMS}
+    case = f"{app}/{system}" if app is not None and system is not None else None
+    for layer in (compute, site):
+        placement.update({
+            key: copy.deepcopy(layer[key])
+            for key in PLACEMENT_KEYS
+            if key in layer
+        })
+        for field, selector, allowed in (
+                ("placement_by_system", system, SYSTEMS),
+                ("placement_by_app", app, _KNOWN_APPS),
+                ("placement_by_case", case, cases)):
+            if field in layer:
+                placement.update(_placement_named_map(
+                    layer[field], field, selector, allowed))
     site.update(placement)
 
 

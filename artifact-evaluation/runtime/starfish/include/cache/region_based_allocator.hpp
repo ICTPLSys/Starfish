@@ -22,6 +22,7 @@
 #include "utils/debug.hpp"
 #include "utils/stats.hpp"
 #include "utils/bounded_return_queue.hpp"
+#include "../../../common/runtime_metadata.hpp"
 
 // Debug (compile-time opt-in; zero cost when disabled)
 //
@@ -223,14 +224,18 @@ inline bool normal_read_recovery_active(const BlockHead *block) {
 inline bool ec_write_source_borrowed(const BlockHead *block) {
     return (block->normal_read_recovery_active.load(std::memory_order_acquire) & 4u) != 0;
 }
-inline bool try_borrow_ec_write_source(BlockHead *block) {
+inline bool try_borrow_ec_write_source(BlockHead *block, bool allow_closed_read_gate = false) {
     // Reuse the existing per-block READ admission gate. Contention takes the
     // snapshot fallback; eviction never spins here or takes a global lock.
     if (block->rdma_read_pin_lock.test_and_set(std::memory_order_acquire)) return false;
+    const uint8_t flags = block->normal_read_recovery_active.load(std::memory_order_relaxed);
     const bool borrowed = block->pending_rdma_reads.load(std::memory_order_acquire) == 0 &&
-        block->normal_read_recovery_active.load(std::memory_order_relaxed) == 0;
+        (flags == 0 || (allow_closed_read_gate && flags == 1));
     // READ/recovery admission uses the same gate, so no second CAS is needed.
-    if (borrowed) block->normal_read_recovery_active.store(4, std::memory_order_release);
+    // A completed degraded read deliberately leaves bit0 closed against late
+    // ordinary READs. Borrow only after its owner/pins drain, and retain bit0
+    // across the WRITE borrow/release rather than reopening that old epoch.
+    if (borrowed) block->normal_read_recovery_active.store(flags | uint8_t{4}, std::memory_order_release);
     block->rdma_read_pin_lock.clear(std::memory_order_release);
     return borrowed;
 }
@@ -711,6 +716,36 @@ struct RegionList {
         return item_count.load(std::memory_order_acquire);
     }
 
+    void append_metadata(size_t &bytes) {
+        while (lock.test_and_set(std::memory_order_acquire)) {
+        }
+        const size_t bucket_count = six_group_buckets.bucket_count();
+        const size_t group_count = six_group_buckets.size();
+        RegionList *children = list_only_six_children.get();
+        // libstdc++'s default bucket_count==1 is an inline sentinel, not a
+        // heap allocation.  For this uint32_t-keyed map, _Hash_node is the
+        // actual allocated node (including its next pointer).  The fallback
+        // keeps the logical entry size on non-libstdc++ builds.
+        const size_t bucket_bytes = bucket_count > 1
+                                        ? bucket_count * sizeof(void *)
+                                        : 0;
+#if defined(__GLIBCXX__)
+        using map_node = std::__detail::_Hash_node<
+            std::pair<const uint32_t, RegionGroupBucket>, false>;
+        bytes += bucket_bytes + group_count * sizeof(map_node);
+#else
+        bytes += bucket_bytes +
+                 group_count *
+                     sizeof(std::pair<const uint32_t, RegionGroupBucket>);
+#endif
+        lock.clear(std::memory_order_release);
+        if (children == nullptr) return;
+        bytes += list_only_six::kChildCount * sizeof(RegionList);
+        for (size_t i = 0; i < list_only_six::kChildCount; ++i) {
+            children[i].append_metadata(bytes);
+        }
+    }
+
     bool nonempty() const {
         return size() != 0;
     }
@@ -985,6 +1020,7 @@ public:
     int64_t get_free_bytes() const;
     int64_t get_used_bytes() const;
     size_t get_committed_bytes() const;
+    runtime_metadata::Snapshot metadata_usage();
     ReclaimSupplySnapshot reclaim_supply_snapshot(size_t bin) const;
 
     void print_used_memory();
@@ -1148,6 +1184,27 @@ BlockHead *thread_local_allocate(size_t size, cache::far_obj_t obj,
                                  bool pin_publication = false);
 
 constexpr size_t BlockHeadSize = sizeof(BlockHead);
+
+inline runtime_metadata::Snapshot GlobalHeap::metadata_usage() {
+    runtime_metadata::Snapshot snapshot;
+    const size_t committed_regions = get_committed_bytes() / RegionSize;
+    snapshot.local_regions = committed_regions;
+    snapshot.region_bytes =
+        static_cast<uint64_t>(committed_regions * sizeof(RegionHead));
+    snapshot.group_bytes = sizeof(GlobalHeap);
+    size_t dynamic_group_bytes = 0;
+    for (size_t placement = 0; placement < RegionPlacementCount;
+         ++placement) {
+        for (size_t bin = 0; bin < RegionBinCount; ++bin) {
+            usable_region_list[placement][bin].append_metadata(
+                dynamic_group_bytes);
+        }
+        full_region_list[placement].append_metadata(dynamic_group_bytes);
+    }
+    free_region_list.append_metadata(dynamic_group_bytes);
+    snapshot.group_bytes += dynamic_group_bytes;
+    return snapshot;
+}
 
 }  // namespace allocator
 

@@ -22,6 +22,7 @@
 #include "utils/debug.hpp"
 #include "utils/stats.hpp"
 #include "utils/bounded_return_queue.hpp"
+#include "../../../common/runtime_metadata.hpp"
 
 // Debug (compile-time opt-in; zero cost when disabled)
 //
@@ -685,6 +686,36 @@ struct RegionList {
         return item_count.load(std::memory_order_acquire);
     }
 
+    void append_metadata(size_t &bytes) {
+        while (lock.test_and_set(std::memory_order_acquire)) {
+        }
+        const size_t bucket_count = six_group_buckets.bucket_count();
+        const size_t group_count = six_group_buckets.size();
+        RegionList *children = list_only_six_children.get();
+        // libstdc++'s default bucket_count==1 is an inline sentinel, not a
+        // heap allocation.  For this uint32_t-keyed map, _Hash_node is the
+        // actual allocated node (including its next pointer).  The fallback
+        // keeps the logical entry size on non-libstdc++ builds.
+        const size_t bucket_bytes = bucket_count > 1
+                                        ? bucket_count * sizeof(void *)
+                                        : 0;
+#if defined(__GLIBCXX__)
+        using map_node = std::__detail::_Hash_node<
+            std::pair<const uint32_t, RegionGroupBucket>, false>;
+        bytes += bucket_bytes + group_count * sizeof(map_node);
+#else
+        bytes += bucket_bytes +
+                 group_count *
+                     sizeof(std::pair<const uint32_t, RegionGroupBucket>);
+#endif
+        lock.clear(std::memory_order_release);
+        if (children == nullptr) return;
+        bytes += list_only_six::kChildCount * sizeof(RegionList);
+        for (size_t i = 0; i < list_only_six::kChildCount; ++i) {
+            children[i].append_metadata(bytes);
+        }
+    }
+
     bool nonempty() const {
         return size() != 0;
     }
@@ -959,6 +990,7 @@ public:
     int64_t get_free_bytes() const;
     int64_t get_used_bytes() const;
     size_t get_committed_bytes() const;
+    runtime_metadata::Snapshot metadata_usage();
     ReclaimSupplySnapshot reclaim_supply_snapshot(size_t bin) const;
 
     void print_used_memory();
@@ -1122,6 +1154,27 @@ BlockHead *thread_local_allocate(size_t size, cache::far_obj_t obj,
                                  bool pin_publication = false);
 
 constexpr size_t BlockHeadSize = sizeof(BlockHead);
+
+inline runtime_metadata::Snapshot GlobalHeap::metadata_usage() {
+    runtime_metadata::Snapshot snapshot;
+    const size_t committed_regions = get_committed_bytes() / RegionSize;
+    snapshot.local_regions = committed_regions;
+    snapshot.region_bytes =
+        static_cast<uint64_t>(committed_regions * sizeof(RegionHead));
+    snapshot.group_bytes = sizeof(GlobalHeap);
+    size_t dynamic_group_bytes = 0;
+    for (size_t placement = 0; placement < RegionPlacementCount;
+         ++placement) {
+        for (size_t bin = 0; bin < RegionBinCount; ++bin) {
+            usable_region_list[placement][bin].append_metadata(
+                dynamic_group_bytes);
+        }
+        full_region_list[placement].append_metadata(dynamic_group_bytes);
+    }
+    free_region_list.append_metadata(dynamic_group_bytes);
+    snapshot.group_bytes += dynamic_group_bytes;
+    return snapshot;
+}
 
 }  // namespace allocator
 

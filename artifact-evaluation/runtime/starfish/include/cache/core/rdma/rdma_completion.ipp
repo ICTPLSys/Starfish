@@ -123,7 +123,7 @@ retry:
     auto &entry = get_entry_of(obj);
     auto old_state = entry.load_state();
 
-    if (six_dirty_routing_enabled() && old_state.invalid) goto retry;
+    if (old_state.invalid) goto retry;
 
     if (old_state.state == PINNED) return;
     // FREE is terminal: the deallocator already consumed this completion's
@@ -176,75 +176,52 @@ retry:
             if (!entry.cas_state_weak(old_state, new_state)) goto retry;
         }
         break;
-    case EntryState::LOCAL:
-        // another access interrupted the eviction
-        // Consume this completion's write reference exactly once.
-        if (!entry.cas_state_weak(old_state, new_state)) goto retry;
-        if (new_state.ref_cnt != 0) {
-            // Another write still owns the local buffer and remote slot.
+    case EntryState::LOCAL: {
+        if (new_state.ref_cnt != 0 ||
+            !::FarLib::get_config().exclusive_cache) {
+            if (!entry.cas_state_weak(old_state, new_state)) goto retry;
             break;
         }
-        if (::FarLib::get_config().exclusive_cache) {
-            // Corner case: eviction was interrupted and the object stayed LOCAL.
-            // The remote slot allocated for this eviction must be freed (after the
-            // write completes) to preserve strict-exclusivity (LOCAL => no remote).
-            // Cleanup retries must not return to the decrement path above.
-            while (true) {
-                auto cleanup_state = entry.load_state();
-                if (cleanup_state.state != EntryState::LOCAL &&
-                    cleanup_state.state != EntryState::MARKED) {
-                    return;
-                }
-                if (cleanup_state.invalid) {
-                    uthread::yield();
-                    continue;
-                }
-                auto lock_state = cleanup_state;
-                lock_state.invalid = 1;
-                if (!entry.cas_state_weak(cleanup_state, lock_state)) {
-                    continue;
-                }
-                uint64_t old_remote = entry.remote_addr();
-                if (six_dirty_routing_enabled())
-                    entry.take_six_pending_evict();
-                if (old_remote != FarObjectEntry::RemoteAddrInvalid48) {
-                    const bool remote_endpoint_dead =
-                        reuse_ec_recovery_endpoint_is_dead(old_remote, obj.size);
-                    const bool keep = all_nonresident_backup_mode &&
-                        !cleanup_state.dirty && !entry.is_resident_local() &&
-                        !remote_endpoint_dead &&
-                        (entry.has_remote_backup_reservation() ||
-                         try_reserve_remote_backup(obj.size));
-                    if (keep) {
-                        entry.set_remote_backup_reservation(true);
-                        nonresident_interrupted_keep_count.fetch_add(1, std::memory_order_relaxed);
-                        nonresident_interrupted_keep_bytes.fetch_add(obj.size, std::memory_order_relaxed);
-                    } else {
-                        if ((all_nonresident_backup_mode || remote_endpoint_dead) &&
-                            entry.has_remote_backup_reservation()) {
-                            entry.set_remote_backup_reservation(false);
-                            release_remote_backup_budget(obj.size);
-                            if (remote_endpoint_dead) {
-                                profile::count_remote_backup_invalidated(obj.size);
-                            }
-                        }
-                        entry.set_remote_invalid();
-                        remote_allocator.deallocate(old_remote);
-                        profile::count_excl_interrupted_evict_free(obj.size);
+
+        // Consume the final write reference and take the existing move lock
+        // together. Publishing unlocked LOCAL/ref=0 before the backup decision
+        // lets a writer miss the new reservation and dirty it via a stale CAS.
+        auto lock_state = new_state;
+        lock_state.invalid = 1;
+        if (!entry.cas_state_weak(old_state, lock_state)) goto retry;
+        uint64_t old_remote = entry.remote_addr();
+        if (six_dirty_routing_enabled())
+            entry.take_six_pending_evict();
+        if (old_remote != FarObjectEntry::RemoteAddrInvalid48) {
+            const bool remote_endpoint_dead =
+                reuse_ec_recovery_endpoint_is_dead(old_remote, obj.size);
+            const bool keep = all_nonresident_backup_mode &&
+                !lock_state.dirty && !entry.is_resident_local() &&
+                !remote_endpoint_dead &&
+                (entry.has_remote_backup_reservation() ||
+                 try_reserve_remote_backup(obj.size));
+            if (keep) {
+                entry.set_remote_backup_reservation(true);
+                nonresident_interrupted_keep_count.fetch_add(1, std::memory_order_relaxed);
+                nonresident_interrupted_keep_bytes.fetch_add(obj.size, std::memory_order_relaxed);
+            } else {
+                if ((all_nonresident_backup_mode || remote_endpoint_dead) &&
+                    entry.has_remote_backup_reservation()) {
+                    entry.set_remote_backup_reservation(false);
+                    release_remote_backup_budget(obj.size);
+                    if (remote_endpoint_dead) {
+                        profile::count_remote_backup_invalidated(obj.size);
                     }
                 }
-                auto unlock_state = entry.load_state();
-                while (unlock_state.invalid) {
-                    auto final_state = unlock_state;
-                    final_state.invalid = 0;
-                    if (entry.cas_state_weak(unlock_state, final_state)) {
-                        return;
-                    }
-                }
-                return;
+                entry.set_remote_invalid();
+                remote_allocator.deallocate(old_remote);
+                profile::count_excl_interrupted_evict_free(obj.size);
             }
         }
-        break;
+        auto expected = lock_state;
+        ASSERT(entry.cas_state_strong(expected, new_state));
+        return;
+    }
     case EntryState::BUSY:
         goto retry;
     default:
@@ -687,6 +664,11 @@ retry:
 }
 
 inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
+    if (ec_background::is_wr_id(wc.wr_id)) [[unlikely]] {
+        if (!handle_background_rebuild_complete(wc))
+            ERROR("ec_background_rebuild: unowned completion");
+        return;
+    }
     // One-sided incremental traffic has its own non-pointer namespace.
     // Dispatch it before ordinary READ/WRITE handlers dereference wr_id.
     if (rdma::ec_rmw::ClientTransport::is_wr_id(wc.wr_id)) [[unlikely]] {

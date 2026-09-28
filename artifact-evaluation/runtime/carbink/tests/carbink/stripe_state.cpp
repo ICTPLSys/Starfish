@@ -129,6 +129,19 @@ int run() {
     Manager manager;
     manager.init(config.remote_total, shard_size);
     checks.check(manager.enabled(), "stripe manager enabled");
+    const auto *heat_before = FarLib::simple_region_heat::monitor_instance.load();
+    const auto *labels_before = FarLib::simple_region_heat::classes_instance.load();
+    const auto *local_budget_before = FarLib::simple_region_budget::local_instance.load();
+    const auto *remote_budget_before = FarLib::simple_region_budget::remote_instance.load();
+    (void)FarLib::simple_region_heat::metadata_usage();
+    checks.check(heat_before == FarLib::simple_region_heat::monitor_instance.load() &&
+                     labels_before == FarLib::simple_region_heat::classes_instance.load() &&
+                     local_budget_before == FarLib::simple_region_budget::local_instance.load() &&
+                     remote_budget_before == FarLib::simple_region_budget::remote_instance.load(),
+                 "metadata snapshot never instantiates inactive policy state");
+    const auto empty_metadata = manager.metadata_usage();
+    checks.equal(empty_metadata.stripes, 0u, "metadata starts without Stripe objects");
+    checks.check(empty_metadata.mapping_bytes > 0, "EC index capacity is metadata");
 
     constexpr size_t kGroupBytes = 8192;
     constexpr size_t kGroupsPerStripe = 32;
@@ -386,6 +399,18 @@ int run() {
                  "sealed group before publish is absent from scanner");
     checks.check(manager.mark_dead_group(unpublished.id),
                  "cleanup unpublished group");
+    const auto retained_metadata = manager.metadata_usage();
+    checks.check(retained_metadata.stripes > 0,
+                 "Stripe descriptors remain after group cleanup");
+    checks.check(retained_metadata.metadata_bytes() > empty_metadata.metadata_bytes(),
+                 "retained group capacity is counted independently of live payload");
+    checks.check(retained_metadata.mapping_bytes >=
+                     retained_metadata.group_slots * 4 * sizeof(uintptr_t),
+                 "span-owner mapping backing is included");
+    checks.equal(retained_metadata.spans, 0u,
+                 "span Page count belongs to Cache, not owner mapping slots");
+    checks.equal(retained_metadata.span_bytes, 0u,
+                 "owner mapping bytes are not double-counted as Page descriptors");
 
     std::printf("CARBINK_STRIPE_LIFECYCLE checks=%d failures=%d\n",
                 checks.count, checks.failures);

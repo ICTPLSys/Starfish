@@ -294,6 +294,29 @@ void test_growth_and_owner_return_stack() {
 
 }  // namespace
 
+void test_rebuilt_single_read() {
+    EcReadContextPool pool(1, 0);
+    const auto scratch = scratch_for(31);
+    for (uint8_t shard = 0; shard < 4; ++shard) {
+        uint64_t id = 0;
+        EcReadContext *context = nullptr;
+        const uint8_t mask = static_cast<uint8_t>(1u << shard);
+        assert(pool.acquire(0, 0x100000, 0x200000, 512, mask, shard,
+                            scratch, &id, &context, 0, kAllSegments));
+        // Hardware is allowed to complete before the posting mark.
+        assert_pending(pool.complete_segment_event(id, shard, true));
+        assert(pool.mark_segment_posted(id, shard));
+        const auto winner = pool.finish_posting(id);
+        assert(winner.kind == EcReadTokenEventKind::kWinner);
+        assert(winner.context == context);
+        assert(context->alive_mask == mask && context->own_shard_idx == shard);
+        assert(context->physical_alive_mask == kAllSegments);
+        assert(pool.release(id));
+        assert_ignored(pool.complete_segment_event(id, shard, true));
+        assert(pool.in_use() == 0);
+    }
+}
+
 int main() {
     test_success_reorder_and_close();
     test_completion_before_post_mark();
@@ -301,5 +324,6 @@ int main() {
     test_duplicate_stale_and_reused_context();
     test_concurrent_last_winner();
     test_growth_and_owner_return_stack();
+    test_rebuilt_single_read();
     return 0;
 }

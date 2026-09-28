@@ -453,6 +453,19 @@ struct Configure {
 
         // Fault-tolerance / EC layout validation.  Everything below only runs
         // when ft_method != none, so the default path is untouched.
+        if (ft_background_rebuild &&
+            (!is_ec_batch_mode() || !exclusive_cache ||
+             !enable_eager_evict || ft_standby_endpoint < 0 ||
+             ft_rebuild_bandwidth_mbps == 0 ||
+             ft_rebuild_bandwidth_mbps > 1000000)) {
+            config_error("ft_background_rebuild requires exclusive ec_batch, "
+                         "eager eviction, a standby, and bandwidth in 1..1000000 MB/s");
+        }
+        if (ft_background_rebuild) {
+            const char *pool = std::getenv("FARLIB_SEPARATE_BACKGROUND_CLUSTER");
+            if (!pool || std::string(pool) != "1")
+                config_error("ft_background_rebuild requires FARLIB_SEPARATE_BACKGROUND_CLUSTER=1");
+        }
         if (ft_enabled()) {
             const size_t ec_shard_count = ft_ec_data_shards + ft_ec_parity_shards;
             if (ft_standby_endpoint < -1) {

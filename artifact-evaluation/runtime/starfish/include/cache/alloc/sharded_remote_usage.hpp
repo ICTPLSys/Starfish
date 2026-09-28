@@ -57,6 +57,16 @@ class ShardedRemoteUsage {
     }
 
 public:
+    uint64_t metadata_bytes() const {
+        std::lock_guard<std::mutex> guard(registry_lock);
+        uint64_t bytes = sizeof(*this) + shards.capacity() * sizeof(shards[0]);
+        // delta capacity is fixed at Shard construction; writers only mutate
+        // Cell values. Registration/destruction is protected by registry_lock.
+        for (const auto &shard : shards)
+            bytes += sizeof(*shard) + shard->delta.capacity() * sizeof(Cell);
+        return bytes;
+    }
+
     // Same quiescent-only contract as RemoteGlobalHeap::register_remote:
     // no concurrent updates/snapshots/reset/destruction during this operation.
     void reset(size_t count) {

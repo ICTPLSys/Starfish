@@ -34,6 +34,13 @@ def canonical(value, mapping, field):
         raise ValueError(f"unknown {field}: {value!r}") from exc
 
 
+def _teardown_measurement_allowed(row):
+    return (row.get("measurement_usable", "").strip() == "1"
+            and row.get("execution_status", "").strip() == "teardown_failed"
+            and row.get("correctness", "").strip().lower() == "pass"
+            and row.get("exit_status", "").strip() in {"124", "-15", "-9"})
+
+
 def prepare(path: Path, source_type="measured"):
     if source_type not in SOURCE_TYPES:
         raise ValueError(f"unknown source type: {source_type}")
@@ -60,12 +67,17 @@ def prepare(path: Path, source_type="measured"):
                     raise ValueError("p99_latency must be finite and positive")
                 if row["source_type"] != source_type or not row["source"]:
                     raise ValueError("nonblank values require the selected source_type and source")
-                if "exit_status" in row and row["exit_status"] != "0":
+                if (row.get("exit_status", "0") != "0"
+                        and not _teardown_measurement_allowed(row)):
                     raise ValueError("failed runs cannot be plotted")
                 if "correctness" in row and row["correctness"].lower() != "pass":
                     raise ValueError("correctness must be pass")
             series[workload, system].append({"offered_load": load, "p99_latency": latency,
-                                             "source": row["source"]})
+                                             "source": row["source"],
+                                             "exit_status": row.get("exit_status", "0"),
+                                             "measurement_usable": row.get("measurement_usable", ""),
+                                             "execution_status": row.get("execution_status", ""),
+                                             "warning": row.get("warning", "")})
         except ValueError as exc:
             raise ValueError(f"CSV line {line}: {exc}") from exc
     for points in series.values():
@@ -81,8 +93,9 @@ def prepare(path: Path, source_type="measured"):
 
 def draw(data):
     """Preserve the paper's two-panel axes, system order, markers and line styles."""
-    plt = get_pyplot()
+    plt = get_pyplot(paper_font="Times New Roman")
     from matplotlib.lines import Line2D
+    from matplotlib.ticker import MaxNLocator
 
     fig, axes = plt.subplots(1, 2, figsize=(4.55, 2.35), sharey=False)
     markers = ["o", "s", "D", "^"]
@@ -103,22 +116,35 @@ def draw(data):
                     marker=markers[s_idx], linestyle=linestyles[s_idx],
                     linewidth=1.55, markersize=4.0, color=colors[s_idx],
                     label=SYSTEM_STYLES[system]["label"])
-        for spine in ax.spines.values():
+        for name, spine in ax.spines.items():
             spine.set_visible(True)
             spine.set_linewidth(1.4)
+            if name in ("top", "right"):
+                spine.set_color("#7a7a7a")
         ax.set_axisbelow(True)
         if has_values:
             ax.grid(True, axis="y", linestyle="--", alpha=0.5, linewidth=1.0)
         ax.set_box_aspect(0.82)
-        ax.set_title("(a) KV-B" if idx == 0 else "(b) NQ",
-                     fontsize=13.8, fontweight="bold", pad=2)
+        title = r"$\mathbf{KVS}$ YCSB-B" if idx == 0 else r"$\mathbf{Nhop}$"
+        ax.set_title(rf"$\mathbf{{({chr(97 + idx)})}}$ {title}",
+                     fontsize=13.8, fontweight="normal", pad=2)
         ax.tick_params(axis="x", labelsize=10.5, direction="in", length=2.5, pad=1.2)
         ax.tick_params(axis="y", labelsize=10.5, direction="in", length=2.5, pad=1.2)
         ax.set_yscale("log", base=10)
         ax.set_xlabel("Offered load (Mops)" if idx == 0 else "Offered load (Kops)",
                       fontsize=12.5, labelpad=2)
-        ax.set_xticks([0, 5, 10, 15, 20])
-        ax.set_xlim(0, 20.5 if idx == 0 else 23.5)
+        if workload == "nq":
+            max_load = max(
+                (point["offered_load"] for system in ORDER
+                 for point in data["series"][f"{workload}/{system}"]),
+                default=20.0)
+            ticks = MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(
+                0, max(max_load, 1.0))
+            ax.set_xticks(ticks)
+            ax.set_xlim(0, ticks[-1] * 1.025)
+        else:
+            ax.set_xticks([0, 5, 10, 15, 20])
+            ax.set_xlim(0, 20.5)
         ax.set_ylim(1, 1000 if idx == 0 else 3000)
         if has_values:
             ax.set_yticks([1, 10, 100, 1000])

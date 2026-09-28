@@ -24,6 +24,7 @@
 #include "utils/cpu_cycles.hpp"
 #include "utils/stats.hpp"
 #include "utils/uthreads.hpp"
+#include "../../../../common/runtime_metadata.hpp"
 
 namespace FarLib {
 
@@ -267,6 +268,13 @@ public:
 
     uint64_t get_used_count() const { return used_count; }
 
+    size_t metadata_blockmap_bytes_unsafe() const {
+        if (blockmap == nullptr) return 0;
+        const size_t map_size =
+            (entry_size + MapElementBitCount - 1) / MapElementBitCount;
+        return map_size * sizeof(uint64_t);
+    }
+
     // The budget sampler only calls this while holding the Region lock.  It
     // deliberately reports the free capacity of a public usable Region, not
     // the capacity of private or full descriptors.
@@ -464,6 +472,35 @@ public:
         assert(!((dummy_head.next == &dummy_tail) ^
                  (dummy_tail.prev == &dummy_head)));
         return dummy_head.next == &dummy_tail;
+    }
+
+    void append_metadata(size_t &bytes, bool include_children) {
+        while (flag.test_and_set(std::memory_order_acquire)) {
+        }
+        const size_t bucket_count = group_index.bucket_count();
+        const size_t group_count = group_index.size();
+        RemoteRegionList *children = list_only_six_children;
+        // libstdc++'s default bucket_count==1 is an inline sentinel, not a
+        // heap allocation.  _Hash_node includes the allocated link/payload
+        // for this uint32_t-keyed map; the fallback is logical entry size.
+        const size_t bucket_bytes = bucket_count > 1
+                                        ? bucket_count * sizeof(void *)
+                                        : 0;
+#if defined(__GLIBCXX__)
+        using map_node = std::__detail::_Hash_node<
+            std::pair<const uint32_t, GroupChain>, false>;
+        bytes += bucket_bytes + group_count * sizeof(map_node);
+#else
+        bytes += bucket_bytes +
+                 group_count * sizeof(std::pair<const uint32_t, GroupChain>);
+#endif
+        flag.clear(std::memory_order_release);
+        if (!include_children || children == nullptr) return;
+        bytes += six_group::list_only_six::kChildCount *
+                 sizeof(RemoteRegionList);
+        for (size_t i = 0; i < six_group::list_only_six::kChildCount; ++i) {
+            children[i].append_metadata(bytes, false);
+        }
     }
 
     RemoteRegionHead *pop_head() {
@@ -1331,6 +1368,83 @@ public:
 
     size_t get_ec_shard_region_count() const {
         return ec_region_count.load(std::memory_order_relaxed);
+    }
+
+    inline runtime_metadata::Snapshot metadata_usage() {
+        runtime_metadata::Snapshot snapshot;
+        snapshot.remote_regions = regions_size;
+        snapshot.region_bytes =
+            static_cast<uint64_t>(regions_size * sizeof(RemoteRegionHead));
+        snapshot.group_bytes = sizeof(RemoteGlobalHeap);
+        size_t dynamic_group_bytes = 0;
+        for (size_t bin = 0; bin < RegionBinCount; ++bin) {
+            usable_region_list[bin].append_metadata(
+                dynamic_group_bytes, false);
+            standby_waiting_region_list[bin].append_metadata(
+                dynamic_group_bytes, false);
+        }
+        full_region_list.append_metadata(dynamic_group_bytes, false);
+        free_region_list.append_metadata(dynamic_group_bytes, false);
+        if (list_only_six_children != nullptr) {
+            const size_t child_count =
+                RegionBinCount * six_group::list_only_six::kChildCount;
+            dynamic_group_bytes += child_count * sizeof(RemoteRegionList);
+            for (size_t i = 0; i < child_count; ++i) {
+                list_only_six_children[i].append_metadata(
+                    dynamic_group_bytes, false);
+            }
+        }
+        snapshot.group_bytes += dynamic_group_bytes;
+        if (regions != nullptr) {
+            for (size_t i = 0; i < regions_size; ++i) {
+                auto &region = regions[i];
+                region.lock();
+                snapshot.mapping_bytes +=
+                    region.metadata_blockmap_bytes_unsafe();
+                region.unlock();
+            }
+        }
+        if (endpoint_alive_ != nullptr) {
+            snapshot.mapping_bytes +=
+                endpoint_count_ * sizeof(std::atomic<uint8_t>);
+        }
+        if (server_used_bytes != nullptr) {
+            const size_t server_count =
+                static_cast<size_t>(FarLib::get_config().server_count);
+            // Per-endpoint usage accounting is reporting-only; it is not an
+            // ownership bitmap or an allocator placement structure.
+            snapshot.measurement_aux_bytes +=
+                server_count * sizeof(std::atomic<uint64_t>);
+        }
+        if (sharded_usage != nullptr) {
+            snapshot.measurement_aux_bytes += sharded_usage->metadata_bytes();
+        }
+        const size_t usage_headers = sizeof(server_used_bytes) +
+                                     sizeof(sharded_usage);
+        snapshot.group_bytes -= usage_headers;
+        snapshot.measurement_aux_bytes += usage_headers;
+        if (ec_region_claimed != nullptr) {
+            snapshot.mapping_bytes +=
+                regions_size * sizeof(std::atomic<uint8_t>);
+        }
+        if (regular_region_claimed != nullptr) {
+            snapshot.mapping_bytes +=
+                regions_size * sizeof(std::atomic<uint8_t>);
+        }
+        if (ec_endpoint_cursor != nullptr) {
+            const size_t server_count =
+                static_cast<size_t>(FarLib::get_config().server_count);
+            snapshot.mapping_bytes +=
+                server_count * sizeof(std::atomic<size_t>);
+        }
+        {
+            std::lock_guard<std::mutex> guard(ec_pool_mutex);
+            // This is a free/reusable-address index owned by the EC pool,
+            // not a span/page descriptor array.
+            snapshot.mapping_bytes +=
+                ec_free_units.capacity() * sizeof(uint64_t);
+        }
+        return snapshot;
     }
 
     // Snapshot only public usable Regions.  Full, free-list and private

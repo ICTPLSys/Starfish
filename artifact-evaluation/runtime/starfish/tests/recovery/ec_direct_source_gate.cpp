@@ -92,6 +92,31 @@ int run() {
                  "degraded-owner bit remains observable after failed borrow");
     block.normal_read_recovery_active.store(0, std::memory_order_release);
 
+    // Fault-enabled admission can borrow a completed recovered object without
+    // reopening its old ordinary-READ epoch. Live owners/pins still block it.
+    block.normal_read_recovery_active.store(1, std::memory_order_release);
+    checks.check(try_borrow_ec_write_source(&block, true),
+                 "opt-in can borrow a recovered object with a closed READ gate");
+    checks.check(block.normal_read_recovery_active.load() == 5,
+                 "source borrow retains the closed READ gate");
+    checks.check(acquire_normal_read_pin(&block) == 0,
+                 "recovered borrowed source rejects late ordinary READ");
+    release_ec_write_source(&block);
+    checks.check(block.normal_read_recovery_active.load() == 1 &&
+                 acquire_normal_read_pin(&block) == 0,
+                 "source release does not reopen the recovered READ epoch");
+    block.pending_rdma_reads.store(1);
+    checks.check(!try_borrow_ec_write_source(&block, true),
+                 "opt-in still waits for ordinary DMA pins");
+    block.pending_rdma_reads.store(0);
+    for (uint8_t flags : {uint8_t{2},uint8_t{3},uint8_t{4},uint8_t{5}}) {
+        block.normal_read_recovery_active.store(flags);
+        checks.check(!try_borrow_ec_write_source(&block, true) &&
+                     block.normal_read_recovery_active.load() == flags,
+                     "opt-in preserves an active recovery/write owner");
+    }
+    block.normal_read_recovery_active.store(0);
+
     release_ec_write_source(&block);
     checks.check(!ec_write_source_borrowed(&block),
                  "source release clears only the direct-borrow bit");

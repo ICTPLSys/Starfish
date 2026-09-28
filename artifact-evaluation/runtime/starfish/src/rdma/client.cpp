@@ -11,9 +11,11 @@
 #include <sys/syscall.h>
 #include <unordered_map>
 #include <unistd.h>
+#include <utility>
 
 #include "rdma/exchange_msg.hpp"
 #include "rdma/rdma.hpp"
+#include "rdma/shutdown_completion.hpp"
 #include "utils/debug.hpp"
 #include "utils/defer.hpp"
 #include "utils/uthreads.hpp"
@@ -457,6 +459,115 @@ void ClientControl::post_stop() {
     // Send stop message to all endpoints
     for (size_t ep_idx = 0; ep_idx < server_count; ep_idx++) {
         if (endpoint_qps[ep_idx].control_qp == nullptr) continue;
+
+        if (config.ft_background_rebuild) {
+            QueuePair *control_qp = endpoint_qps[ep_idx].control_qp.get();
+            if (control_qp->queue_pair == nullptr) continue;
+            const uint32_t control_qp_num = control_qp->queue_pair->qp_num;
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(2000);
+            auto fence_destroy_control = [&]() {
+                ibv_qp *raw_qp = control_qp->queue_pair;
+                ibv_qp_attr error_attr{};
+                error_attr.qp_state = IBV_QPS_ERR;
+                const int fence_ret =
+                    ibv_modify_qp(raw_qp, &error_attr, IBV_QP_STATE);
+                const int destroy_ret = ibv_destroy_qp(raw_qp);
+                if (destroy_ret == 0) {
+                    control_qp->queue_pair = nullptr;
+                }
+                if (fence_ret != 0 || destroy_ret != 0) {
+                    std::cerr << "ERROR: rdma_stop fence_destroy_failed"
+                              << " endpoint=" << ep_idx
+                              << " qp_num=" << control_qp_num
+                              << " fence_rc=" << fence_ret
+                              << " destroy_rc=" << destroy_ret
+                              << std::endl;
+                    ERROR("rdma_stop control QP fence/destroy failed");
+                }
+                return std::pair<int, int>{fence_ret, destroy_ret};
+            };
+            bool posted = false;
+            bool terminal = false;
+            bool timed_out = false;
+            while (!terminal) {
+                if (!posted) {
+                    ibv_send_wr stop_wr = {
+                        .wr_id = RQ_STOP,
+                        .next = nullptr,
+                        .sg_list = nullptr,
+                        .num_sge = 0,
+                        .opcode = IBV_WR_SEND,
+                        .send_flags = IBV_SEND_SIGNALED | IBV_SEND_SOLICITED,
+                    };
+                    ibv_send_wr *bad_wr = nullptr;
+                    const int send_ret = ibv_post_send(
+                        control_qp->queue_pair, &stop_wr, &bad_wr);
+                    if (send_ret == 0) {
+                        posted = true;
+                    } else if (send_ret != ENOMEM) {
+                        const auto [fence_ret, destroy_ret] =
+                            fence_destroy_control();
+                        std::cerr << "INFO: rdma_stop endpoint=" << ep_idx
+                                  << " result=post_error status=" << send_ret
+                                  << " qp_num=" << control_qp_num
+                                  << " fence_rc=" << fence_ret
+                                  << " destroy_rc=" << destroy_ret
+                                  << std::endl;
+                        terminal = true;
+                    }
+                }
+                if (terminal) break;
+                ibv_wc wc{};
+                const int n = ibv_poll_cq(control_cq.complete_queue, 1, &wc);
+                if (n < 0) {
+                    const auto [fence_ret, destroy_ret] =
+                        fence_destroy_control();
+                    std::cerr << "INFO: rdma_stop endpoint=" << ep_idx
+                              << " result=poll_error status=" << n
+                              << " qp_num=" << control_qp_num
+                              << " fence_rc=" << fence_ret
+                              << " destroy_rc=" << destroy_ret << std::endl;
+                    terminal = true;
+                    break;
+                }
+                if (n == 1) {
+                    const auto kind = classify_stop_completion(
+                        wc, static_cast<uint64_t>(RQ_STOP), control_qp_num);
+                    if (kind == StopCompletionKind::kSuccess) {
+                        std::cerr << "INFO: rdma_stop endpoint=" << ep_idx
+                                  << " result=success status=" << wc.status
+                                  << " qp_num=" << control_qp_num
+                                  << std::endl;
+                        terminal = true;
+                    } else if (kind == StopCompletionKind::kError) {
+                        std::cerr << "INFO: rdma_stop endpoint=" << ep_idx
+                                  << " result=wc_error status=" << wc.status
+                                  << " qp_num=" << control_qp_num
+                                  << " opcode=" << wc.opcode
+                                  << " vendor_err=" << wc.vendor_err
+                                  << std::endl;
+                        terminal = true;
+                    }
+                }
+                if (terminal) break;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    timed_out = true;
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            if (timed_out) {
+                const auto [fence_ret, destroy_ret] =
+                    fence_destroy_control();
+                std::cerr << "INFO: rdma_stop endpoint=" << ep_idx
+                          << " result=timeout qp_num=" << control_qp_num
+                          << " wait_ms=2000 fence_rc=" << fence_ret
+                          << " destroy_rc=" << destroy_ret << std::endl;
+            }
+            continue;
+        }
         
         ibv_send_wr stop_wr = {
             .wr_id = RQ_STOP,

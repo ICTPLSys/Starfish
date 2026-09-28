@@ -43,7 +43,14 @@ option(FARLIB_BUILD_MG
        "Build the optional MG benchmark target" OFF)
 option(FARLIB_BUILD_NQ
        "Build the optional frozen Friendster n-hop graph benchmark" OFF)
-option(FARLIB_BUILD_OBJECT_SIZE "Build the original object_size microbenchmark" OFF)
+option(FARLIB_BUILD_BANDWIDTH_MICROBENCHMARK
+       "Build the synthetic 512/4000-byte bandwidth microbenchmark" OFF)
+option(FARLIB_BUILD_OBJECT_SIZE
+       "Deprecated alias for FARLIB_BUILD_BANDWIDTH_MICROBENCHMARK" OFF)
+if(FARLIB_BUILD_OBJECT_SIZE)
+    message(DEPRECATION "Use FARLIB_BUILD_BANDWIDTH_MICROBENCHMARK instead")
+    set(FARLIB_BUILD_BANDWIDTH_MICROBENCHMARK ON)
+endif()
 option(FARLIB_BUILD_KVS "Build the aligned 512-byte KV throughput benchmark" OFF)
 
 # This macro changes ConcurrentArrayCache layout. Keep runtime and every
@@ -127,8 +134,9 @@ set(FARLIB_BFS_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/benchmark/microbenchmarks
 set(FARLIB_NQ_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/benchmark/microbenchmarks")
 add_subdirectory("${FARLIB_APPS_DIR}/llama" "${CMAKE_CURRENT_BINARY_DIR}/apps/llama")
 add_subdirectory("${FARLIB_APPS_DIR}/bfs" "${CMAKE_CURRENT_BINARY_DIR}/apps/bfs")
-if(FARLIB_BUILD_OBJECT_SIZE)
-    add_subdirectory("${FARLIB_APPS_DIR}/object_size" "${CMAKE_CURRENT_BINARY_DIR}/apps/object_size")
+if(FARLIB_BUILD_BANDWIDTH_MICROBENCHMARK)
+    add_subdirectory("${FARLIB_APPS_DIR}/bandwidth_microbenchmark"
+                     "${CMAKE_CURRENT_BINARY_DIR}/apps/bandwidth_microbenchmark")
 endif()
 if(FARLIB_BUILD_KVS)
     add_subdirectory("${FARLIB_APPS_DIR}/kvs" "${CMAKE_CURRENT_BINARY_DIR}/apps/kvs")

@@ -1,4 +1,7 @@
 #pragma once
+#include "work_traffic.hpp"
+#include "../../../common/runtime_metadata_reporter.hpp"
+#include "../../../common/runtime_ec_cpu.hpp"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -853,6 +856,8 @@ inline bool suspend_work() {
 inline void start_work() {
     assert(!working);
     ::FarLib::object_group_trace::phase_start();
+    work_traffic::begin();
+    runtime_ec_cpu::begin_work("carbink");
     working = true;
     global_start_cycles = get_cycles();
     work_phase_active.store(true, std::memory_order_release);
@@ -864,7 +869,10 @@ inline void end_work() {
     work_phase_active.store(false, std::memory_order_release);
     working = false;
     global_cycles = get_cycles() - global_start_cycles;
+    runtime_ec_cpu::end_work();
+    work_traffic::print(work_traffic::end());
     ::FarLib::object_group_trace::phase_end();
+    ::FarLib::runtime_metadata::end_work();
 }
 inline bool is_working() {
     return work_phase_active.load(std::memory_order_acquire);
@@ -1408,6 +1416,7 @@ inline void count_gc() {
 
 inline void count_rdma_read_post(size_t bytes) {
     if constexpr (Enabled) {
+        work_traffic::count_read(bytes);
         get_tlpd().rdma_read_post_count++;
         get_tlpd().rdma_read_post_bytes += (int64_t)bytes;
         if (read_size_profile::enabled()) {
@@ -1418,6 +1427,7 @@ inline void count_rdma_read_post(size_t bytes) {
 
 inline void count_rdma_read_posts(size_t count, size_t bytes) {
     if constexpr (Enabled) {
+        work_traffic::count_read(bytes);
         get_tlpd().rdma_read_post_count += static_cast<int64_t>(count);
         get_tlpd().rdma_read_post_bytes += static_cast<int64_t>(bytes);
         if (read_size_profile::enabled()) {
@@ -1428,6 +1438,7 @@ inline void count_rdma_read_posts(size_t count, size_t bytes) {
 
 inline void count_rdma_write_post(size_t bytes) {
     if constexpr (Enabled) {
+        work_traffic::count_write(bytes);
         get_tlpd().rdma_write_post_count++;
         get_tlpd().rdma_write_post_bytes += (int64_t)bytes;
     }

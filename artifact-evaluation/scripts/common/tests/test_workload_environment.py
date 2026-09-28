@@ -54,7 +54,10 @@ class WorkloadEnvironment(unittest.TestCase):
         inherited = dict(DESIGN2_ENV, FARLIB_BACKGROUND_CPU_BASE="99",
                          FibreCpuSet="0", GAPBS_BFS_OPTIMIZE="0")
         env = client_process_environment("llama", SITE, "nonft", inherited)
-        self.assertFalse(set(DESIGN2_ENV) & set(env))
+        self.assertEqual(set(DESIGN2_ENV) & set(env),
+                         {"FARLIB_LEGACY_SCAN_CURSORS",
+                          "FARLIB_PLANNER_BUDGET_EARLY_EXIT",
+                          "FARLIB_RESIDENT_PROFILE_REQUIRE_WORK_PHASE"})
         self.assertEqual(env["FibreCpuSet"], SITE["fibre_cpu_set"])
         self.assertEqual(env["FARLIB_BACKGROUND_CPU_BASE"], "40")
         self.assertEqual(env["FARLIB_SEPARATE_BACKGROUND_CLUSTER"], "1")
@@ -66,6 +69,13 @@ class WorkloadEnvironment(unittest.TestCase):
         self.assertEqual(llama["FibreWorkerCount"], "24")
         self.assertEqual(bfs["FibreWorkerCount"], "24")
         self.assertEqual(bfs["GAPBS_BFS_WORKERS"], "48")
+
+    def test_nonft_concurrent_pipeline_requires_scan_cursors(self):
+        for app in ("llama", "bfs", "mg"):
+            env = client_process_environment(
+                app, SITE, "nonft", {"FARLIB_LEGACY_SCAN_CURSORS": "0"})
+            self.assertEqual(env["FARLIB_OPT_LEGACY_EXCLUSIVE_PIPELINE"], "1")
+            self.assertEqual(env["FARLIB_LEGACY_SCAN_CURSORS"], "1")
 
 
 if __name__ == "__main__":

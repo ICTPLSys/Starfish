@@ -12,6 +12,18 @@ namespace FarLib {
 
 namespace detail {
 
+inline bool lock_wait_scope_yield_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("FARLIB_LOCK_WAIT_SCOPE_YIELD");
+        if (value == nullptr || (value[0] == '0' && value[1] == '\0'))
+            return false;
+        if (value[0] == '1' && value[1] == '\0') return true;
+        std::fprintf(stderr, "FARLIB_LOCK_WAIT_SCOPE_YIELD must be 0 or 1\n");
+        std::abort();
+    }();
+    return enabled;
+}
+
 inline bool spinlock_diag_enabled() {
     static const bool enabled = std::getenv("FARLIB_SPINLOCK_DIAG") != nullptr;
     return enabled;
@@ -143,8 +155,17 @@ public:
                                           get_cycles() - start_cycles);
                 next_log += period ? period : next_log;
             }
-            cache::check_memory_low(scope);
-            uthread::yield();
+            if (detail::lock_wait_scope_yield_enabled()) {
+                // We do not own this lock yet. Protect declared references
+                // while leaving the old epoch, then retry the same request
+                // after a cooperative yield, without waiting for a GC round.
+                scope.begin_eviction();
+                uthread::yield();
+                scope.end_eviction();
+            } else {
+                cache::check_memory_low(scope);
+                uthread::yield();
+            }
         }
         if (diag && loops != 0) {
             uint64_t cycles = get_cycles() - start_cycles;

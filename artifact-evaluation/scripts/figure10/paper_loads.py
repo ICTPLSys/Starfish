@@ -1,10 +1,13 @@
 """Figure 10 offered-load points, expressed as integer requests per second."""
 
-# Source: Sponge-Data/figures/paper_figure_mockups.py, fig2_tail_latency().
+# Paper point counts and KV-B grids: Sponge-Data/figures/paper_figure_mockups.py,
+# fig2_tail_latency().
 # Cross-checked against papers/starfish-nsdi/images/eval/eval_figure_02.pdf.
 # Copy ONLY the x-axis points, not the paper's P99 values or measurement claims.
-# KV-B: paper Mops * 1_000_000. NQ: paper Kops * 1_000.
-# Each system keeps its own nonuniform point set; axis ticks are not load points.
+# KV-B: paper Mops * 1_000_000; axis ticks are not load points.
+# NQ: retain each paper point count, space evenly from 1k QPS to the selected
+# scan limit, and round to 100 QPS (half up). These are not paper load points.
+# Hydra/Carbink scan limits are provisional, pending offered-load measurements.
 OFFERED_LOAD_OPS = {
     "kv-b": {
         "hydra": [
@@ -25,18 +28,18 @@ OFFERED_LOAD_OPS = {
         ],
     },
     "nq": {
-        "hydra": [678, 1356, 2034, 2713, 3052, 3391, 4069, 4340, 4612, 4883],
+        "hydra": [1000, 2400, 3900, 5300, 6800, 8200, 9700, 11100, 12600, 14000],
         "carbink": [
-            780, 1550, 2300, 3000, 3350, 3700, 4150,
-            4450, 4700, 5050, 5450, 5850, 6230,
+            1000, 2600, 4200, 5800, 7300, 8900, 10500,
+            12100, 13700, 15300, 16800, 18400, 20000,
         ],
         "starfish": [
-            910, 1821, 2731, 3642, 4096, 4552, 5462, 6827, 7283,
-            8194, 9104, 10925, 13657, 16388, 18209, 19600, 20800,
+            1000, 4700, 8400, 12100, 15800, 19400, 23100, 26800, 30500,
+            34200, 37900, 41600, 45300, 48900, 52600, 56300, 60000,
         ],
         "nonft": [
-            1081, 2162, 3243, 4324, 4864, 5405, 6486, 8107, 8648,
-            9729, 10810, 12971, 16214, 19457, 20538, 21619, 22700,
+            1000, 5900, 10900, 15800, 20800, 25700, 30600, 35600, 40500,
+            45400, 50400, 55300, 60300, 65200, 70100, 75100, 80000,
         ],
     },
 }

@@ -14,8 +14,18 @@ The Starfish runtime, the Non-FT, Hydra-like and Carbink-like baselines,
 and the evaluation environment are ready. See [Quick Start](#quick-start)
 for setup and a minimal experiment.
 
-AE reviewers should provide an SSH public key. Server access for AE reviewers
-will be provided through WireGuard.
+AE reviewers should post their SSH public key in standard OpenSSH format in
+the AE discussion. Once we authorize the key, connect to the compute server:
+
+```bash
+ssh -J atc26ae@8.140.50.79 atc26ae@10.208.130.56
+```
+
+No reviewer-side WireGuard installation or configuration is required. Use the
+matching private key on your own machine; never post or upload it. If the key
+is not a default SSH identity, configure `IdentityFile` for both the jump host
+and compute host in your local SSH config. The authors will provide the
+prepared artifact directory and site configuration in the AE discussion.
 
 ## Overview
 
@@ -26,7 +36,7 @@ Paths below are relative to `artifact-evaluation/`:
 | `runtime/starfish/`, `runtime/nonft/`, `runtime/hydra/`, `runtime/carbink/` | Starfish, Non-FT, and our Hydra-like and Carbink-like implementations |
 | `apps/`, `configs/` | Evaluation applications and configurations |
 | `scripts/figure9/` | Application-performance experiments, result collection and Figure 9 |
-| `scripts/figure10/`–`figure13/`, `scripts/appendix/` | Latency, resource cost, compute overhead, recovery and appendix figures |
+| `scripts/figure10/`–`figure13/` | Latency, resource cost, compute overhead and recovery figures |
 | `third_party/libfibre/` | Pinned libfibre source and its errnoname dependency; upstream licenses and source information are retained |
 
 ## Documentation
@@ -36,6 +46,8 @@ Paths below are relative to `artifact-evaluation/`:
 | [Installation](artifact-evaluation/docs/INSTALL.md) | Dependencies, installation and build commands |
 | [Data and models](artifact-evaluation/docs/DATA.md) | Download sources, preparation and input paths |
 | [Multi-server configuration](artifact-evaluation/docs/MULTI-SERVER.md) | Compute/memory roles, SSH/TCP addresses and ports |
+| [Configuration layout](artifact-evaluation/configs/README.md) | Recipes, overrides, generated files and deployment checks |
+| [Recovery integration status](artifact-evaluation/docs/RECOVERY-STATUS.md) | Starfish v13 source, supported mode and historical evidence |
 | [Server table](artifact-evaluation/docs/MACHINES.md) | Server IPs, IB devices and NUMA placement |
 | [Experiments](artifact-evaluation/docs/EXPERIMENTS.md) | Experiment commands, result files and plotting |
 | [Script index](artifact-evaluation/scripts/README.md) | Figure-specific instructions and CSV formats |
@@ -61,6 +73,9 @@ The script records input paths in `data/site.json`. Set the server addresses
 once using [multi-server configuration](artifact-evaluation/docs/MULTI-SERVER.md).
 To download and prepare inputs from their original sources instead, follow
 [Data and models](artifact-evaluation/docs/DATA.md).
+
+Before running benchmarks, we recommend that reviewers run `bash scripts/check_nodes.sh`
+and confirm that the intended compute and memory nodes are idle.
 
 ### Fast check
 
@@ -149,7 +164,7 @@ From `artifact-evaluation/`:
 | [Figure 9: application performance](artifact-evaluation/scripts/figure9/README.md) | `bash scripts/figure9/run.sh` | `bash scripts/plot.sh figure9` |
 | [Figure 10: tail latency](artifact-evaluation/scripts/figure10/README.md) | `bash scripts/figure10/run.sh` | `bash scripts/plot.sh figure10 --input data/figure10.csv` |
 | [Figure 11: FT resource cost](artifact-evaluation/scripts/figure11/README.md) | `bash scripts/figure11/collect.sh --logs-root results/figure9` | `bash scripts/plot.sh figure11 --input data/figure11.csv` |
-| [Figure 12: compute-node overhead](artifact-evaluation/scripts/figure12/README.md) | `bash scripts/figure12/collect.sh --logs-root results/figure9` | `bash scripts/plot.sh figure12 --input data/figure12.csv` |
+| [Figure 12: compute-node overhead](artifact-evaluation/scripts/figure12/README.md) | `bash scripts/figure12/run.sh --build --metrics all`, then follow its collection guide | `bash scripts/plot.sh figure12 --input data/figure12.csv` |
 | [Figure 13: failure recovery](artifact-evaluation/scripts/figure13/README.md) | `bash scripts/figure13/collect.sh --logs-root results/figure13` | `bash scripts/plot.sh figure13 --logs-root results/figure13` |
 
 The Figure 9 runner writes `data/figure9.csv`. Input formats and output files

@@ -112,8 +112,12 @@ fi
 
 runtime="$ROOT/runtime/$SYSTEM"
 need_file "runtime source" "$runtime/CMakeLists.txt"
-need_file "LLaMA application" "$ROOT/apps/llama/CMakeLists.txt" "$ROOT/apps/llama/run_chat_far.cpp"
-need_file "BFS application" "$ROOT/apps/bfs/CMakeLists.txt" "$ROOT/apps/bfs/gapbs_bfs_chunked.cpp"
+for app in llama bfs mg wordcount kvs nq; do
+  need_file "$app application" "$ROOT/apps/$app/CMakeLists.txt"
+done
+if [[ "$SYSTEM" = carbink ]]; then
+  need_file 'Carbink memory server' "$runtime/legacy/carbink_server/CMakeLists.txt"
+fi
 
 need_file 'RDMA verbs header' /usr/include/infiniband/verbs.h /usr/local/include/infiniband/verbs.h
 need_library 'RDMA verbs' ibverbs
@@ -122,7 +126,7 @@ need_library 'Boost program_options' boost_program_options
 need_file 'OpenSSL header' /usr/include/openssl/ssl.h /usr/local/include/openssl/ssl.h
 need_library 'OpenSSL crypto' crypto
 optional_file 'PAPI header (optional)' /usr/include/papi.h /usr/local/include/papi.h
-if [[ "$SYSTEM" = hydra ]]; then
+if [[ "$SYSTEM" = starfish || "$SYSTEM" = hydra || "$SYSTEM" = carbink ]]; then
   need_file 'ISA-L header' \
     /usr/include/isa-l/erasure_code.h /usr/local/include/isa-l/erasure_code.h
   need_library 'ISA-L' isal

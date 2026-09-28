@@ -141,7 +141,7 @@ def ensure_tools(deps):
 
 def register_inputs(site, inputs):
     """Fill only empty/example paths. Never replace a user's configured input."""
-    template = HERE / "site.example.json"
+    template = HERE / "site.eight-server.example.json"
     document = json.loads(site.read_text() if site.exists() else template.read_text())
     current = document.setdefault("inputs", {})
     for key, value in inputs.items():

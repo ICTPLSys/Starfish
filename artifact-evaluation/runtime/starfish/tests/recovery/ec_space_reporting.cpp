@@ -10,6 +10,14 @@
 #if __has_include(<infiniband/verbs.h>)
 #include "cache/alloc/remote_allocator.hpp"
 
+// This allocator-only fixture does not enable phased RMW or link its RDMA
+// coordinator. Fail if that unrelated diagnostic setup is ever requested.
+namespace FarLib::cache {
+void prepare_ec_rmw_timing(size_t) {
+    assert(false && "phased RMW timing is outside this accounting fixture");
+}
+}
+
 namespace FarLib {
 static rdma::Configure test_config;
 const rdma::Configure &get_config() { return test_config; }
