@@ -510,17 +510,22 @@ inline void ConcurrentArrayCache::evacuate_work() {
         const bool exclusive_alignment =
             optimized_enabled && optimized_legacy_exclusive_pipeline_enabled() &&
             exclusive_work_alignment_enabled() && mark_workers != 0 && evict_workers != 0;
-        std::cerr << "runtime.exclusive_owned_batch="
-                  << (optimized_enabled &&
-                      optimized_legacy_exclusive_pipeline_enabled() &&
-                      exclusive_owned_batch_reclaim_enabled())
-                  << " mark_workers=" << mark_workers
-                  << " evict_workers=" << evict_workers << std::endl;
-        std::cerr << "runtime.exclusive_work_alignment=" << exclusive_alignment
-                  << " mark_regions_per_worker=64 evict_scan_visits=4096"
-                  << " stop_evict_after_mark=" << exclusive_alignment
-                  << " stop_mark_after_evict=0 stop_boundary=owned_batch"
-                  << " exclusive_eligibility_unchanged=1 owned_gc=1" << std::endl;
+        std::fprintf(
+            stdout,
+            "runtime.exclusive_owned_batch=%d mark_workers=%zu evict_workers=%zu\n",
+            static_cast<int>(optimized_enabled &&
+                             optimized_legacy_exclusive_pipeline_enabled() &&
+                             exclusive_owned_batch_reclaim_enabled()),
+            mark_workers, evict_workers);
+        std::fprintf(
+            stdout,
+            "runtime.exclusive_work_alignment=%d "
+            "mark_regions_per_worker=64 evict_scan_visits=4096 "
+            "stop_evict_after_mark=%d stop_mark_after_evict=0 "
+            "stop_boundary=owned_batch exclusive_eligibility_unchanged=1 "
+            "owned_gc=1\n",
+            static_cast<int>(exclusive_alignment),
+            static_cast<int>(exclusive_alignment));
         // Only the sequential evacuation master updates these counters.
         // Observe after worker join, never add per-object shared statistics.
         uint64_t alignment_rounds = 0, alignment_work_rounds = 0;

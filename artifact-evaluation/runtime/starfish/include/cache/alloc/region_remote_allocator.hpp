@@ -1055,6 +1055,21 @@ public:
         return result;
     }
 
+    // Observer-only flat allocator view. It deliberately excludes the EC
+    // supplement, which is collected through the stripe observer accessor;
+    // the exact get_endpoint_used_bytes() path above retains its locks.
+    std::vector<uint64_t> get_endpoint_used_bytes_observer() const {
+        const size_t count = static_cast<size_t>(FarLib::get_config().server_count);
+        std::vector<uint64_t> result(count, 0);
+        if (sharded_usage) {
+            result = sharded_usage->snapshot_observer();
+        } else if (server_used_bytes) {
+            for (size_t i = 0; i < count; ++i)
+                result[i] = server_used_bytes[i].load(std::memory_order_relaxed);
+        }
+        return result;
+    }
+
     void inc_used_bytes(size_t bytes, uint64_t addr) {
         if (sharded_usage) {
             auto [ep, _] = FarLib::get_config().map_remote_addr(addr);

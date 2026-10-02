@@ -36,6 +36,7 @@
 // retain their original addresses for recovery.
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -71,6 +72,50 @@ inline constexpr uint8_t kSmallObjectStripeShardCount =
 static_assert(kSmallObjectStripeDataShards == 4 &&
                   kSmallObjectStripeParityShards == 2,
               "this phase only supports a 4+2 EC layout");
+
+// A stable snapshot of one original stripe while its failed physical shard is
+// reconstructed out of place.  The logical addresses remain immutable; the
+// manager publishes a sidecar base only after the replacement WRITE completes.
+struct BackgroundRebuildStripe {
+    uint64_t stripe_id = std::numeric_limits<uint64_t>::max();
+    uint8_t failed_shard = 0xff;
+    uint32_t failed_endpoint = std::numeric_limits<uint32_t>::max();
+    uint32_t slot_size = 0;
+    uint64_t shard_bytes = 0;
+    std::array<uint64_t, kSmallObjectStripeShardCount> original_base{};
+    std::array<uint32_t, kSmallObjectStripeShardCount> endpoint{};
+    uint64_t live_groups = 0;
+    uint64_t live_objects = 0;
+    std::vector<uint32_t> live_slot_ids;
+
+    BackgroundRebuildStripe() {
+        original_base.fill(::FarLib::allocator::remote::InvalidRemoteAddr);
+        endpoint.fill(std::numeric_limits<uint32_t>::max());
+    }
+};
+
+struct BackgroundRebuildSet {
+    uint64_t stripe_id = std::numeric_limits<uint64_t>::max();
+    uint32_t slot_size = 0;
+    uint64_t shard_bytes = 0;
+    std::array<uint64_t, kSmallObjectStripeShardCount> original_base{};
+    std::array<uint32_t, kSmallObjectStripeShardCount> endpoint{};
+    uint8_t missing_mask = 0;
+    uint64_t live_groups = 0;
+    uint64_t live_objects = 0;
+    std::vector<uint32_t> live_slot_ids;
+    BackgroundRebuildSet() {
+        original_base.fill(::FarLib::allocator::remote::InvalidRemoteAddr);
+        endpoint.fill(std::numeric_limits<uint32_t>::max());
+    }
+};
+
+enum class BackgroundRebuildStatus : uint8_t {
+    Skip = 0,
+    Busy = 1,
+    Ready = 2,
+    Unsupported = 3,
+};
 
 // Stripe geometry relative to a remote capacity (in shard/region units).
 class SmallObjectStripeShardTable {
@@ -279,6 +324,10 @@ private:
         // group_live_mask (count == popcount(mask)) by seal_slot_group /
         // release_group_object / mark_dead_group.
         std::vector<uint8_t> group_live_objects;
+        // A write reservation spans group allocation through its terminal
+        // CQE disposition.  Background scans treat this as Busy even after
+        // the group has sealed, while the normal path leaves it zero.
+        std::vector<uint8_t> group_pending_write;
         // A split object owns all four data fragments as one public object.
         // The live mask remains 0xf; this metadata distinguishes split
         // ownership from an ordinary batch with holes.
@@ -294,7 +343,22 @@ private:
         // and six remote segments are in flight.  Claims are checked by both
         // allocation and release-side requeue paths.
         std::vector<uint8_t> group_compaction_claimed;
+        std::vector<uint8_t> group_shadow_quarantined;
+        // Observer-only mirror of the exact states counted by
+        // live_group_bytes_by_endpoint(): in-progress/sealed and
+        // dead+compaction-claimed. Writers update it under stripe.mutex.
+        std::atomic<uint64_t> observer_reserved_group_count{0};
         std::array<uint64_t, kShardCount> shard_base{};
+        // A rebuilt physical shard is published here only after its complete
+        // replacement codeword has been written.  Logical addresses and their
+        // generation/owner metadata never move.
+        std::array<std::atomic<uint64_t>, kShardCount> rebuilt_base;
+        // Shadow stripes are out-of-place compaction targets.  They use a
+        // separate per-layout pool and are never ordinary allocation sources.
+        bool shadow_only = false;
+        bool shadow_quarantined = false;
+        bool shadow_regions_released = false;
+        std::array<uint32_t, kShardCount> shadow_layout{};
         std::array<Bitmap, kDataShards> free_bits;
         std::array<Bitmap, kDataShards> dead_bits;
         mutable std::mutex mutex;
@@ -302,6 +366,10 @@ private:
         Stripe() {
             shard_base.fill(kInvalidRemoteAddr);
             shard_endpoint.fill(std::numeric_limits<uint32_t>::max());
+            shadow_layout.fill(std::numeric_limits<uint32_t>::max());
+            for (auto &base : rebuilt_base) {
+                base.store(kInvalidRemoteAddr, std::memory_order_relaxed);
+            }
         }
     };
 
@@ -394,11 +462,18 @@ public:
         uint8_t live_count = 0;
         uint64_t generation = 0;
         std::array<uintptr_t, kDataShards> owners{};
+        bool shadow_only = false;
     };
 private:
     struct SizeClassPool {
         std::mutex mutex;
         std::vector<uint64_t> stripes_with_space;
+    };
+
+    struct ShadowLayoutPool {
+        std::array<uint32_t, kShardCount> layout{};
+        SizeClassPool groups;
+        size_t created_stripes = 0;
     };
 
     struct LocalLeaseEntry {
@@ -425,6 +500,9 @@ private:
     // slot offset.
     std::array<SizeClassPool, ::FarLib::allocator::RegionBinCount> group_pools_;
     mutable std::mutex stripes_mutex_;
+    std::mutex shadow_layout_pools_mutex_;
+    std::vector<std::unique_ptr<ShadowLayoutPool>> shadow_layout_pools_;
+    static constexpr size_t kMaxShadowLayoutPools = 32;
     std::atomic<uint64_t> next_endpoint_{0};
     // Endpoint liveness lives in RemoteGlobalHeap and is shared with ordinary
     // flat allocation.  A dead endpoint never changes the addresses already
@@ -453,6 +531,21 @@ private:
             bool ok = ::FarLib::allocator::remote::remote_global_heap
                           .release_whole_region(shard_base[shard]);
             ASSERT(ok);
+        }
+    }
+
+    void release_published_background_targets_locked() {
+        for (auto &stripe : stripe_storage_) {
+            if (stripe == nullptr) continue;
+            for (uint8_t shard = 0; shard < kShardCount; shard++) {
+                const uint64_t target = stripe->rebuilt_base[shard].exchange(
+                    kInvalidRemoteAddr, std::memory_order_acq_rel);
+                if (target == kInvalidRemoteAddr) continue;
+                const bool ok =
+                    ::FarLib::allocator::remote::remote_global_heap
+                        .release_whole_region(target);
+                ASSERT(ok);
+            }
         }
     }
 
@@ -529,6 +622,37 @@ private:
         pool.stripes_with_space.push_back(stripe_id);
     }
 
+    ShadowLayoutPool *shadow_layout_pool_for(
+        const std::array<uint32_t, kShardCount> &layout, bool create) {
+        std::lock_guard<std::mutex> lock(shadow_layout_pools_mutex_);
+        for (auto &candidate : shadow_layout_pools_) {
+            if (candidate != nullptr && candidate->layout == layout) {
+                return candidate.get();
+            }
+        }
+        if (!create || shadow_layout_pools_.size() >= kMaxShadowLayoutPools) {
+            return nullptr;
+        }
+        auto candidate = std::make_unique<ShadowLayoutPool>();
+        candidate->layout = layout;
+        ShadowLayoutPool *result = candidate.get();
+        shadow_layout_pools_.push_back(std::move(candidate));
+        return result;
+    }
+
+    uint64_t pop_shadow_candidate(
+        const std::array<uint32_t, kShardCount> &layout) {
+        ShadowLayoutPool *pool = shadow_layout_pool_for(layout, false);
+        if (pool == nullptr) return kInvalidStripeId;
+        std::lock_guard<std::mutex> lock(pool->groups.mutex);
+        if (pool->groups.stripes_with_space.empty()) {
+            return kInvalidStripeId;
+        }
+        const uint64_t stripe_id = pool->groups.stripes_with_space.back();
+        pool->groups.stripes_with_space.pop_back();
+        return stripe_id;
+    }
+
     bool mark_queued_if_has_space_locked(Stripe &stripe) {
         if (!stripe_has_space_locked(stripe) || stripe.in_pool) {
             return false;
@@ -597,13 +721,40 @@ private:
                                     kGroupStateMask);
     }
 
+    static bool observer_reserved_locked(const Stripe &stripe, uint32_t slot,
+                                         uint8_t state) {
+        return state == kSlotGroupInProgress ||
+               state == kSlotGroupSealed ||
+               (state == kSlotGroupDead &&
+                slot < stripe.group_compaction_claimed.size() &&
+                stripe.group_compaction_claimed[slot] != 0);
+    }
+
+    static void observer_adjust_reserved_locked(Stripe &stripe, bool before,
+                                                bool after) {
+        if (!before && after) {
+            stripe.observer_reserved_group_count.fetch_add(
+                1, std::memory_order_relaxed);
+        } else if (before && !after) {
+            const uint64_t old = stripe.observer_reserved_group_count.fetch_sub(
+                1, std::memory_order_relaxed);
+            assert(old > 0);
+        }
+    }
+
     static void set_group_state_locked(Stripe &stripe, uint32_t slot,
                                        uint8_t state) {
+        const uint8_t previous = group_state_locked(stripe, slot);
+        const bool counted_before =
+            observer_reserved_locked(stripe, slot, previous);
         size_t bit = group_state_bit(slot);
         uint64_t &word = stripe.group_state_words[bit / kBitsPerWord];
         size_t shift = bit % kBitsPerWord;
         word = (word & ~(kGroupStateMask << shift)) |
                ((static_cast<uint64_t>(state) & kGroupStateMask) << shift);
+        observer_adjust_reserved_locked(
+            stripe, counted_before,
+            observer_reserved_locked(stripe, slot, state));
     }
 
     static bool group_owns_slot_locked(const Stripe &stripe, uint32_t slot) {
@@ -613,6 +764,18 @@ private:
                                                 uint32_t slot) {
         return slot < stripe.group_compaction_claimed.size() &&
                stripe.group_compaction_claimed[slot] != 0;
+    }
+
+    static void set_group_compaction_claimed_locked(
+        Stripe &stripe, uint32_t slot, bool claimed) {
+        if (slot >= stripe.group_compaction_claimed.size()) return;
+        const uint8_t state = group_state_locked(stripe, slot);
+        const bool counted_before =
+            observer_reserved_locked(stripe, slot, state);
+        stripe.group_compaction_claimed[slot] = claimed ? 1 : 0;
+        observer_adjust_reserved_locked(
+            stripe, counted_before,
+            observer_reserved_locked(stripe, slot, state));
     }
 
     // Invariant 3: the six shards of a group must sit on six distinct
@@ -625,6 +788,44 @@ private:
                     return false;
                 }
             }
+        }
+        return true;
+    }
+
+    static bool background_live_groups_locked(
+        const Stripe &stripe, uint64_t *live_groups, uint64_t *live_objects,
+        std::vector<uint32_t> *live_slots, bool *busy) {
+        if (live_groups == nullptr || live_objects == nullptr ||
+            live_slots == nullptr || busy == nullptr) {
+            return false;
+        }
+        *live_groups = 0;
+        *live_objects = 0;
+        live_slots->clear();
+        *busy = false;
+        if (stripe.group_state_words.empty()) {
+            return stripe.live_count == 0;
+        }
+        if (stripe.group_live_mask.size() < stripe.slots_per_shard ||
+            stripe.group_live_objects.size() < stripe.slots_per_shard ||
+            stripe.group_pending_write.size() < stripe.slots_per_shard) {
+            return false;
+        }
+        const bool background_enabled =
+            ::FarLib::get_config().ft_background_rebuild;
+        for (uint32_t slot = 0; slot < stripe.slots_per_shard; slot++) {
+            const uint8_t state = group_state_locked(stripe, slot);
+            if (state == kSlotGroupInProgress ||
+                (background_enabled && stripe.group_pending_write[slot] != 0)) {
+                *busy = true;
+            }
+            if (state != kSlotGroupSealed) continue;
+            const uint8_t live =
+                static_cast<uint8_t>(stripe.group_live_mask[slot] & 0x0fu);
+            if (live == 0) continue;
+            live_slots->push_back(slot);
+            ++(*live_groups);
+            *live_objects += stripe.group_live_objects[slot];
         }
         return true;
     }
@@ -642,6 +843,7 @@ private:
         stripe.next_group_slot = 0;
         stripe.group_dead_count = 0;
         stripe.group_live_objects.assign(stripe.slots_per_shard, 0);
+        stripe.group_pending_write.assign(stripe.slots_per_shard, 0);
         stripe.group_is_split.assign(stripe.slots_per_shard, 0);
         stripe.next_group_generation = 1;
         stripe.group_ready_after_write.assign(stripe.slots_per_shard, 0);
@@ -649,6 +851,7 @@ private:
         stripe.group_owners.resize(stripe.slots_per_shard);
         for (auto &owners : stripe.group_owners) owners.fill(0);
         stripe.group_compaction_claimed.assign(stripe.slots_per_shard, 0);
+        stripe.group_shadow_quarantined.assign(stripe.slots_per_shard, 0);
         // Published before the first group slot address can exist: the release
         // path uses it to skip the group lookup for stripes that never served a
         // group, and it is never cleared again.
@@ -674,6 +877,11 @@ private:
             }
             uint32_t slot = static_cast<uint32_t>(slot64);
             if (group_compaction_claimed_locked(stripe, slot)) continue;
+            if (::FarLib::get_config().ft_background_rebuild &&
+                slot < stripe.group_pending_write.size() &&
+                stripe.group_pending_write[slot] != 0) {
+                continue;
+            }
             uint8_t state = group_state_locked(stripe, slot);
             bool from_dead = false;
             if (state == kSlotGroupDead) {
@@ -716,6 +924,9 @@ private:
             stripe.group_live_mask[slot] = 0;
             stripe.group_live_objects[slot] = 0;
             stripe.group_is_split[slot] = 0;
+            if (::FarLib::get_config().ft_background_rebuild) {
+                stripe.group_pending_write[slot] = 1;
+            }
             stripe.live_count += kDataShards;
             *slot_id_out = slot;
             if (from_dead_out != nullptr) *from_dead_out = from_dead;
@@ -732,14 +943,35 @@ private:
     }
 
     bool mark_group_queued_if_has_space_locked(Stripe &stripe) {
-        if (!group_has_space_locked(stripe) || stripe.in_group_pool) {
+        if (!group_has_space_locked(stripe) || stripe.in_group_pool ||
+            stripe.shadow_quarantined || stripe.shadow_regions_released) {
             return false;
         }
         stripe.in_group_pool = true;
         return true;
     }
 
+    std::array<uint32_t, kShardCount> effective_shadow_layout(
+        const Stripe &stripe) const {
+        auto layout = stripe.shadow_layout;
+        const auto &config = ::FarLib::get_config();
+        for (uint8_t shard = 0; shard < kShardCount; ++shard)
+            layout[shard] = static_cast<uint32_t>(config.map_remote_addr(
+                resolve_rebuilt_addr(stripe.stripe_id, shard,
+                                     stripe.shard_base[shard])).first);
+        return layout;
+    }
+
     void push_group_candidate(uint16_t bin, uint64_t stripe_id) {
+        Stripe *stripe = stripe_by_id(stripe_id);
+        if (stripe != nullptr && stripe->shadow_only) {
+            ShadowLayoutPool *pool =
+                shadow_layout_pool_for(effective_shadow_layout(*stripe), true);
+            if (pool == nullptr) return;
+            std::lock_guard<std::mutex> lock(pool->groups.mutex);
+            pool->groups.stripes_with_space.push_back(stripe_id);
+            return;
+        }
         auto &pool = group_pools_[bin];
         std::lock_guard<std::mutex> lock(pool.mutex);
         pool.stripes_with_space.push_back(stripe_id);
@@ -850,23 +1082,46 @@ private:
     }
 
     bool stripe_eligible_for_new_group(const Stripe &stripe) const {
+        const auto &config = ::FarLib::get_config();
+        const bool reuse_rebuilt =
+            config.ft_background_rebuild && config.is_carbink_mode();
         const bool standby_active = standby_active_for_policy();
         const int standby_endpoint =
             ::FarLib::allocator::remote::remote_global_heap.standby_endpoint();
         bool has_standby = false;
         for (uint8_t shard = 0; shard < kShardCount; shard++) {
-            const uint32_t endpoint = stripe.shard_endpoint[shard];
+            // Keep logical addresses stable for owners and reverse lookup.
+            // Only Carbink routes new WRs through the published repair map.
+            const uint32_t endpoint = reuse_rebuilt
+                ? static_cast<uint32_t>(config.map_remote_addr(
+                      resolve_rebuilt_addr(stripe.stripe_id, shard,
+                                           stripe.shard_base[shard])).first)
+                : stripe.shard_endpoint[shard];
             if (!endpoint_alive_for_policy(endpoint)) return false;
             if (standby_active &&
                 endpoint == static_cast<uint32_t>(standby_endpoint)) {
                 has_standby = true;
             }
         }
-        // A pre-failure stripe may remain valid for recovery, but after the
-        // standby is activated it must not be recycled as a new group.  This
-        // preserves its old physical addresses while ensuring all newly
-        // allocated groups include the spare.
+        // Unrepaired stripes remain frozen. A fully published Carbink repair
+        // may reuse dead/free groups, with the missing role on the spare.
         return !standby_active || has_standby;
+    }
+
+    bool stripe_effectively_healthy_locked(const Stripe &stripe) const {
+        const auto &config = ::FarLib::get_config();
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            const uint64_t logical = stripe.shard_base[shard];
+            const uint64_t base =
+                resolve_rebuilt_addr(stripe.stripe_id, shard, logical);
+            if (base == kInvalidRemoteAddr ||
+                !config.validate_mapping(base, shard_table_.shard_size())) {
+                return false;
+            }
+            const size_t endpoint = config.map_remote_addr(base).first;
+            if (!endpoint_is_alive(endpoint)) return false;
+        }
+        return true;
     }
 
     bool allocate_from_local_lease(uint16_t bin, uint64_t *addr_out,
@@ -917,7 +1172,8 @@ private:
     // distinct endpoints, so group allocations create stripes with this set
     // (and bail out instead of building a stripe that cannot host a group).
     Stripe *create_stripe(size_t bin,
-                          bool require_distinct_endpoints = false) {
+                          bool require_distinct_endpoints = false,
+                          uint32_t *first_group_slot = nullptr) {
         const auto &config = ::FarLib::get_config();
         std::array<size_t, kShardCount> endpoints{};
         const bool endpoint_liveness_enabled =
@@ -986,12 +1242,49 @@ private:
         Stripe *stripe_ptr = nullptr;
         uint64_t stripe_id = kInvalidStripeId;
         std::lock_guard<std::mutex> lock(stripes_mutex_);
+        // Revalidate the selected physical layout at the publication
+        // barrier.  A creator racing an endpoint failure must be discarded,
+        // not published outside the background scan limit.
+        if (endpoint_liveness_enabled) {
+            bool has_standby = false;
+            const bool standby_active = standby_active_for_policy();
+            const int standby_endpoint =
+                ::FarLib::allocator::remote::remote_global_heap
+                    .standby_endpoint();
+            for (uint8_t a = 0; a < kShardCount; a++) {
+                if (!endpoint_alive_for_policy(endpoints[a])) {
+                    release_allocated_shards(shard_base);
+                    return nullptr;
+                }
+                if (standby_active &&
+                    endpoints[a] == static_cast<size_t>(standby_endpoint)) {
+                    has_standby = true;
+                }
+                if (require_distinct_endpoints) {
+                    for (uint8_t b = 0; b < a; b++) {
+                        if (endpoints[a] == endpoints[b]) {
+                            release_allocated_shards(shard_base);
+                            return nullptr;
+                        }
+                    }
+                }
+            }
+            if (standby_active && !has_standby) {
+                release_allocated_shards(shard_base);
+                return nullptr;
+            }
+        }
         stripe_id = stripe_count_.load(std::memory_order_relaxed);
         if (stripe_id >= stripe_capacity_) {
             release_allocated_shards(shard_base);
             return nullptr;
         }
         stripe->stripe_id = stripe_id;
+        if (first_group_slot != nullptr &&
+            !allocate_group_from_stripe_locked(*stripe, first_group_slot)) {
+            release_allocated_shards(shard_base);
+            return nullptr;
+        }
         stripe_ptr = stripe.get();
         stripe_storage_.push_back(std::move(stripe));
         stripe_index_[static_cast<size_t>(stripe_id)].store(
@@ -1009,12 +1302,100 @@ private:
         return stripe_ptr;
     }
 
+    Stripe *create_shadow_stripe(
+        uint16_t bin, const std::array<uint32_t, kShardCount> &layout,
+        uint32_t *first_group_slot) {
+        if (first_group_slot == nullptr ||
+            !::FarLib::get_config().ft_background_rebuild) {
+            return nullptr;
+        }
+        const auto &config = ::FarLib::get_config();
+        for (uint8_t a = 0; a < kShardCount; a++) {
+            if (layout[a] >= static_cast<uint32_t>(config.server_count) ||
+                !endpoint_alive_for_policy(layout[a])) {
+                return nullptr;
+            }
+            for (uint8_t b = 0; b < a; b++) {
+                if (layout[a] == layout[b]) return nullptr;
+            }
+        }
+        std::array<uint64_t, kShardCount> shard_base;
+        shard_base.fill(kInvalidRemoteAddr);
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            shard_base[shard] = allocate_region_for_endpoint(layout[shard]);
+            if (shard_base[shard] == kInvalidRemoteAddr) {
+                release_allocated_shards(shard_base);
+                return nullptr;
+            }
+        }
+        auto stripe = std::make_unique<Stripe>();
+        stripe->bin = bin;
+        stripe->shadow_only = true;
+        stripe->shadow_layout = layout;
+        stripe->slot_size =
+            static_cast<uint32_t>(::FarLib::allocator::get_bin_size(bin));
+        stripe->slots_per_shard =
+            static_cast<uint32_t>(shard_table_.shard_size() / stripe->slot_size);
+        stripe->free_count = stripe->slots_per_shard * kDataShards;
+        stripe->shard_base = shard_base;
+        stripe->shard_endpoint = layout;
+        for (uint8_t shard = 0; shard < kDataShards; shard++) {
+            stripe->free_bits[shard].init_full(stripe->slots_per_shard);
+            stripe->dead_bits[shard].init_empty(stripe->slots_per_shard);
+        }
+
+        std::lock_guard<std::mutex> lock(stripes_mutex_);
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            if (!endpoint_alive_for_policy(layout[shard])) {
+                release_allocated_shards(shard_base);
+                return nullptr;
+            }
+        }
+        const uint64_t stripe_id =
+            stripe_count_.load(std::memory_order_relaxed);
+        if (stripe_id >= stripe_capacity_) {
+            release_allocated_shards(shard_base);
+            return nullptr;
+        }
+        stripe->stripe_id = stripe_id;
+        if (!allocate_group_from_stripe_locked(*stripe, first_group_slot)) {
+            release_allocated_shards(shard_base);
+            return nullptr;
+        }
+        std::array<size_t, kDataShards> data_region_ids{};
+        for (uint8_t shard = 0; shard < kDataShards; shard++) {
+            data_region_ids[shard] =
+                shard_base[shard] / shard_table_.shard_size();
+            if (data_region_ids[shard] >= shard_binding_count_) {
+                release_allocated_shards(shard_base);
+                return nullptr;
+            }
+        }
+        Stripe *stripe_ptr = stripe.get();
+        stripe_storage_.push_back(std::move(stripe));
+        stripe_index_[static_cast<size_t>(stripe_id)].store(
+            stripe_ptr, std::memory_order_release);
+        for (uint8_t shard = 0; shard < kDataShards; shard++) {
+            shard_bindings_[data_region_ids[shard]].store(
+                encode_binding(stripe_id, shard, bin),
+                std::memory_order_release);
+        }
+        stripe_count_.store(stripe_id + 1, std::memory_order_release);
+        return stripe_ptr;
+    }
+
 public:
     SmallObjectStripeManager() = default;
+    using BackgroundRebuildStripe = ::FarLib::cache::BackgroundRebuildStripe;
+    using BackgroundRebuildSet = ::FarLib::cache::BackgroundRebuildSet;
+    using BackgroundRebuildStatus = ::FarLib::cache::BackgroundRebuildStatus;
+    using View = BackgroundRebuildStripe;
 
     // remote_capacity_bytes: total remote capacity (server_count *
     // server_buffer_size); shard_size: one region, i.e. SmallObjectStripeShardSize.
     void init(size_t remote_capacity_bytes, size_t shard_size) {
+        release_background_targets_for_shutdown();
+        release_quarantined_shadows_for_shutdown();
         shard_table_.init(remote_capacity_bytes, shard_size);
         shard_binding_count_ = shard_table_.shard_region_count();
         shard_bindings_.reset(new std::atomic<uint64_t>[shard_binding_count_]);
@@ -1028,6 +1409,10 @@ public:
         }
         stripe_storage_.clear();
         stripe_storage_.reserve(stripe_capacity_);
+        {
+            std::lock_guard<std::mutex> lock(shadow_layout_pools_mutex_);
+            shadow_layout_pools_.clear();
+        }
         stripe_count_.store(0, std::memory_order_relaxed);
         next_endpoint_.store(0, std::memory_order_relaxed);
     }
@@ -1153,6 +1538,37 @@ public:
         }
         return bytes;
     }
+
+    // Nonblocking observer path for the same reservation metric as
+    // live_group_bytes_by_endpoint(). stripe_index_ publication is
+    // release/acquire and lifecycle reset/destruction is quiescent after the
+    // sampler is shut down; no registry/stripe mutex or slot scan is needed.
+    std::vector<uint64_t> observer_group_endpoint_bytes() const {
+        const int configured_endpoint_count =
+            ::FarLib::get_config().server_count;
+        const size_t endpoint_count =
+            configured_endpoint_count > 0
+                ? static_cast<size_t>(configured_endpoint_count)
+                : 0;
+        std::vector<uint64_t> bytes(endpoint_count, 0);
+        if (!enabled() || endpoint_count == 0) return bytes;
+        const size_t count = static_cast<size_t>(std::min<uint64_t>(
+            stripe_count_.load(std::memory_order_acquire),
+            static_cast<uint64_t>(stripe_capacity_)));
+        for (size_t stripe_id = 0; stripe_id < count; ++stripe_id) {
+            const Stripe *stripe = stripe_by_id(stripe_id);
+            if (stripe == nullptr) continue;
+            const uint64_t groups = stripe->observer_reserved_group_count.load(
+                std::memory_order_relaxed);
+            if (groups == 0) continue;
+            for (uint8_t shard = 0; shard < kShardCount; ++shard) {
+                const uint32_t endpoint = stripe->shard_endpoint[shard];
+                if (endpoint >= bytes.size()) continue;
+                bytes[endpoint] += groups * stripe->slot_size;
+            }
+        }
+        return bytes;
+    }
     const SmallObjectStripeShardTable &shard_table() const {
         return shard_table_;
     }
@@ -1166,6 +1582,581 @@ public:
     bool mark_endpoint_dead(size_t endpoint_idx) {
         return ::FarLib::allocator::remote::remote_global_heap
             .mark_endpoint_dead(endpoint_idx);
+    }
+
+    uint64_t background_rebuild_scan_limit() const {
+        std::lock_guard<std::mutex> lock(stripes_mutex_);
+        return stripe_count_.load(std::memory_order_acquire);
+    }
+
+    uint64_t background_rebuild_scan_limit(uint32_t) const {
+        return background_rebuild_scan_limit();
+    }
+
+    uint64_t count_rebuild_remaining(uint32_t failed_endpoint) const {
+        const uint64_t limit = background_rebuild_scan_limit();
+        uint64_t remaining = 0;
+        for (uint64_t id = 0; id < limit; id++) {
+            BackgroundRebuildStripe view;
+            const auto status =
+                background_rebuild_view(id, failed_endpoint, &view);
+            if (status != BackgroundRebuildStatus::Skip) ++remaining;
+        }
+        return remaining;
+    }
+
+    BackgroundRebuildStatus background_rebuild_view(
+        uint64_t stripe_id, uint32_t failed_endpoint,
+        BackgroundRebuildStripe *view_out) const {
+        if (view_out == nullptr) return BackgroundRebuildStatus::Unsupported;
+        *view_out = BackgroundRebuildStripe{};
+        if (!::FarLib::get_config().ft_background_rebuild) {
+            return BackgroundRebuildStatus::Skip;
+        }
+        const Stripe *stripe = stripe_by_id(stripe_id);
+        if (stripe == nullptr) return BackgroundRebuildStatus::Skip;
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        if (stripe->stripe_id != stripe_id) return BackgroundRebuildStatus::Skip;
+        if (failed_endpoint >=
+            ::FarLib::allocator::remote::remote_global_heap.endpoint_count()) {
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        uint8_t failed_shard = 0xff;
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            if (stripe->shard_endpoint[shard] != failed_endpoint) continue;
+            if (failed_shard != 0xff) {
+                return BackgroundRebuildStatus::Unsupported;
+            }
+            failed_shard = shard;
+        }
+        if (failed_shard == 0xff) return BackgroundRebuildStatus::Skip;
+        if (endpoint_is_alive(failed_endpoint)) {
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        if (!stripe->has_groups.load(std::memory_order_acquire)) {
+            return stripe->live_count == 0
+                       ? BackgroundRebuildStatus::Skip
+                       : BackgroundRebuildStatus::Unsupported;
+        }
+        if (!endpoints_distinct(*stripe)) {
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            const uint64_t redirected =
+                stripe->rebuilt_base[shard].load(std::memory_order_acquire);
+            if (redirected == kInvalidRemoteAddr) continue;
+            if (shard == failed_shard) return BackgroundRebuildStatus::Skip;
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        const auto &config = ::FarLib::get_config();
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            if (shard == failed_shard) continue;
+            const uint64_t base = stripe->shard_base[shard];
+            if (base == kInvalidRemoteAddr ||
+                !config.validate_mapping(base, shard_table_.shard_size()) ||
+                !endpoint_is_alive(config.map_remote_addr(base).first)) {
+                return BackgroundRebuildStatus::Unsupported;
+            }
+        }
+        uint64_t live_groups = 0;
+        uint64_t live_objects = 0;
+        std::vector<uint32_t> live_slots;
+        bool busy = false;
+        if (!background_live_groups_locked(*stripe, &live_groups,
+                                           &live_objects, &live_slots,
+                                           &busy)) {
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        BackgroundRebuildStripe snapshot;
+        snapshot.stripe_id = stripe_id;
+        snapshot.failed_shard = failed_shard;
+        snapshot.failed_endpoint = failed_endpoint;
+        snapshot.slot_size = stripe->slot_size;
+        snapshot.shard_bytes = shard_table_.shard_size();
+        snapshot.original_base = stripe->shard_base;
+        snapshot.endpoint = stripe->shard_endpoint;
+        snapshot.live_groups = live_groups;
+        snapshot.live_objects = live_objects;
+        snapshot.live_slot_ids = std::move(live_slots);
+        *view_out = std::move(snapshot);
+        if (live_groups == 0 && config.is_carbink_mode()) {
+            if (stripe->shadow_quarantined || stripe->shadow_regions_released)
+                return BackgroundRebuildStatus::Skip;
+            if (stripe->live_count != 0)
+                return BackgroundRebuildStatus::Unsupported;
+            for (uint32_t slot = 0; slot < stripe->slots_per_shard; ++slot) {
+                if (group_compaction_claimed_locked(*stripe, slot)) busy = true;
+                if (stripe->group_live_mask[slot] != 0 ||
+                    stripe->group_live_objects[slot] != 0)
+                    return BackgroundRebuildStatus::Unsupported;
+            }
+        }
+        if (busy) return BackgroundRebuildStatus::Busy;
+        if (live_groups == 0 &&
+            (!config.is_carbink_mode() || stripe->shadow_quarantined))
+            return BackgroundRebuildStatus::Skip;
+        if (stripe->shard_base[failed_shard] == kInvalidRemoteAddr ||
+            stripe->slot_size == 0) {
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        return BackgroundRebuildStatus::Ready;
+    }
+
+    bool publish_background_rebuild(const BackgroundRebuildStripe &view,
+                                    uint64_t target_base) {
+        if (!::FarLib::get_config().ft_background_rebuild ||
+            target_base == kInvalidRemoteAddr ||
+            view.stripe_id == kInvalidStripeId ||
+            view.failed_shard >= kShardCount || view.slot_size == 0 ||
+            view.shard_bytes != shard_table_.shard_size() ||
+            (view.live_groups == 0 &&
+             !::FarLib::get_config().is_carbink_mode()) ||
+            view.live_groups != view.live_slot_ids.size() ||
+            view.live_objects < view.live_groups) {
+            return false;
+        }
+        const auto &config = ::FarLib::get_config();
+        const auto mapped = config.map_remote_addr(target_base);
+        if (config.ft_standby_endpoint < 0 ||
+            mapped.first != static_cast<size_t>(config.ft_standby_endpoint) ||
+            !endpoint_is_alive(mapped.first) ||
+            view.failed_endpoint >=
+                ::FarLib::allocator::remote::remote_global_heap.endpoint_count() ||
+            endpoint_is_alive(view.failed_endpoint) ||
+            !config.validate_mapping(target_base, view.shard_bytes)) {
+            return false;
+        }
+        Stripe *stripe = stripe_by_id(view.stripe_id);
+        if (stripe == nullptr) return false;
+        std::unique_lock<std::mutex> lock(stripe->mutex);
+        if (stripe->group_state_words.empty() ||
+            stripe->stripe_id != view.stripe_id ||
+            stripe->slot_size != view.slot_size ||
+            stripe->shard_endpoint[view.failed_shard] !=
+                view.failed_endpoint ||
+            endpoint_is_alive(view.failed_endpoint) ||
+            !endpoints_distinct(*stripe) ||
+            stripe->shard_base[view.failed_shard] == kInvalidRemoteAddr) {
+            return false;
+        }
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            if (stripe->shard_base[shard] != view.original_base[shard] ||
+                stripe->shard_endpoint[shard] != view.endpoint[shard]) {
+                return false;
+            }
+            if (stripe->rebuilt_base[shard].load(
+                    std::memory_order_acquire) != kInvalidRemoteAddr) {
+                return false;
+            }
+            if (target_base == stripe->shard_base[shard]) return false;
+        }
+        uint64_t live_groups = 0;
+        uint64_t live_objects = 0;
+        std::vector<uint32_t> live_slots;
+        bool busy = false;
+        if (!background_live_groups_locked(*stripe, &live_groups,
+                                           &live_objects, &live_slots,
+                                           &busy) ||
+            busy || live_groups > view.live_groups ||
+            live_objects > view.live_objects ||
+            !std::is_sorted(view.live_slot_ids.begin(),
+                            view.live_slot_ids.end())) {
+            return false;
+        }
+        for (uint32_t current_slot : live_slots) {
+            if (!std::binary_search(view.live_slot_ids.begin(),
+                                    view.live_slot_ids.end(), current_slot)) {
+                return false;
+            }
+        }
+        if (view.live_groups == 0) {
+            if (stripe->live_count != 0 || stripe->shadow_quarantined ||
+                stripe->shadow_regions_released) return false;
+            for (uint32_t slot = 0; slot < stripe->slots_per_shard; ++slot)
+                if (group_compaction_claimed_locked(*stripe, slot) ||
+                    stripe->group_live_mask[slot] != 0 ||
+                    stripe->group_live_objects[slot] != 0)
+                    return false;
+        }
+        stripe->rebuilt_base[view.failed_shard].store(
+            target_base, std::memory_order_release);
+        // Publication follows the repair WRITE completion. New writes can
+        // now use this codeword without racing its background snapshot.
+        // The old shadow-layout pool may still contain a stale candidate.
+        // Its effective-layout check will reject it without clearing the
+        // new pool membership. Keep original addresses/layout immutable.
+        if (stripe->shadow_only) stripe->in_group_pool = false;
+        const bool requeue = config.is_carbink_mode() &&
+            mark_group_queued_if_has_space_locked(*stripe);
+        lock.unlock();
+        if (requeue) push_group_candidate(stripe->bin, stripe->stripe_id);
+        return true;
+    }
+
+    uint64_t count_rebuild_set_remaining(uint64_t mask) const {
+        const uint64_t limit = background_rebuild_scan_limit();
+        uint64_t remaining = 0;
+        for (uint64_t id = 0; id < limit; ++id) {
+            BackgroundRebuildSet view;
+            if (background_rebuild_set_view(id, mask, &view) !=
+                BackgroundRebuildStatus::Skip) {
+                ++remaining;
+            }
+        }
+        return remaining;
+    }
+
+    BackgroundRebuildStatus background_rebuild_set_view(
+        uint64_t stripe_id, uint64_t mask,
+        BackgroundRebuildSet *out) const {
+        if (out == nullptr) return BackgroundRebuildStatus::Unsupported;
+        *out = BackgroundRebuildSet{};
+        const auto &config = ::FarLib::get_config();
+        if (!config.ft_background_rebuild) return BackgroundRebuildStatus::Skip;
+        const size_t endpoint_count =
+            ::FarLib::allocator::remote::remote_global_heap.endpoint_count();
+        if (endpoint_count == 0 || endpoint_count > 64 || mask == 0) {
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        const uint64_t valid_mask =
+            endpoint_count == 64
+                ? std::numeric_limits<uint64_t>::max()
+                : ((uint64_t{1} << endpoint_count) - 1);
+        if ((mask & ~valid_mask) != 0) return BackgroundRebuildStatus::Unsupported;
+        const Stripe *stripe = stripe_by_id(stripe_id);
+        if (stripe == nullptr) return BackgroundRebuildStatus::Skip;
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        if (stripe->stripe_id != stripe_id) return BackgroundRebuildStatus::Skip;
+        if (!stripe->has_groups.load(std::memory_order_acquire) ||
+            !endpoints_distinct(*stripe)) {
+            return stripe->live_count == 0
+                       ? BackgroundRebuildStatus::Skip
+                       : BackgroundRebuildStatus::Unsupported;
+        }
+        uint8_t missing = 0, missing_count = 0;
+        for (uint8_t shard = 0; shard < kShardCount; ++shard) {
+            const uint32_t endpoint = stripe->shard_endpoint[shard];
+            if (endpoint >= endpoint_count || endpoint >= 64 ||
+                stripe->shard_base[shard] == kInvalidRemoteAddr) {
+                return BackgroundRebuildStatus::Unsupported;
+            }
+            if ((mask & (uint64_t{1} << endpoint)) == 0) continue;
+            if (endpoint_is_alive(endpoint)) return BackgroundRebuildStatus::Unsupported;
+            missing = static_cast<uint8_t>(missing | (1u << shard));
+            ++missing_count;
+        }
+        if (missing_count == 0) return BackgroundRebuildStatus::Skip;
+        if (missing_count > 2 ||
+            static_cast<uint8_t>(kShardCount - missing_count) < 4 ||
+            (missing_count == 2 &&
+             config.ft_background_rebuild_failures != 2)) {
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        for (uint8_t shard = 0; shard < kShardCount; ++shard) {
+            if ((missing & static_cast<uint8_t>(1u << shard)) != 0) continue;
+            const uint64_t base = stripe->shard_base[shard];
+            if (!endpoint_is_alive(stripe->shard_endpoint[shard]) ||
+                !config.validate_mapping(base, shard_table_.shard_size()) ||
+                !endpoint_is_alive(config.map_remote_addr(base).first)) {
+                return BackgroundRebuildStatus::Unsupported;
+            }
+        }
+        uint8_t published = 0;
+        for (uint8_t shard = 0; shard < kShardCount; ++shard) {
+            const uint64_t redirected =
+                stripe->rebuilt_base[shard].load(std::memory_order_acquire);
+            if (redirected == kInvalidRemoteAddr) continue;
+            if ((missing & static_cast<uint8_t>(1u << shard)) == 0) {
+                return BackgroundRebuildStatus::Unsupported;
+            }
+            published = static_cast<uint8_t>(published | (1u << shard));
+        }
+        if (published == missing) return BackgroundRebuildStatus::Skip;
+        if (published != 0) return BackgroundRebuildStatus::Unsupported;
+
+        uint64_t live_groups = 0, live_objects = 0;
+        std::vector<uint32_t> slots;
+        bool busy = false;
+        if (!background_live_groups_locked(*stripe, &live_groups, &live_objects,
+                                            &slots, &busy)) {
+            return BackgroundRebuildStatus::Unsupported;
+        }
+        if (live_groups == 0 && config.is_carbink_mode()) {
+            if (stripe->shadow_quarantined || stripe->shadow_regions_released) {
+                return BackgroundRebuildStatus::Skip;
+            }
+            if (stripe->live_count != 0) return BackgroundRebuildStatus::Unsupported;
+            for (uint32_t slot = 0; slot < stripe->slots_per_shard; ++slot) {
+                if (group_compaction_claimed_locked(*stripe, slot)) busy = true;
+                if (stripe->group_live_mask[slot] != 0 ||
+                    stripe->group_live_objects[slot] != 0) {
+                    return BackgroundRebuildStatus::Unsupported;
+                }
+            }
+        }
+        if (busy) return BackgroundRebuildStatus::Busy;
+        if (live_groups == 0 &&
+            (!config.is_carbink_mode() || stripe->shadow_quarantined)) {
+            return BackgroundRebuildStatus::Skip;
+        }
+        if (stripe->slot_size == 0) return BackgroundRebuildStatus::Unsupported;
+
+        BackgroundRebuildSet snapshot;
+        snapshot.stripe_id = stripe_id;
+        snapshot.slot_size = stripe->slot_size;
+        snapshot.shard_bytes = shard_table_.shard_size();
+        snapshot.original_base = stripe->shard_base;
+        snapshot.endpoint = stripe->shard_endpoint;
+        snapshot.missing_mask = missing;
+        snapshot.live_groups = live_groups;
+        snapshot.live_objects = live_objects;
+        snapshot.live_slot_ids = std::move(slots);
+        *out = std::move(snapshot);
+        return BackgroundRebuildStatus::Ready;
+    }
+
+    bool publish_background_rebuild_set(
+        const BackgroundRebuildSet &view,
+        const std::array<uint64_t, kSmallObjectStripeShardCount> &targets) {
+        constexpr uint8_t all_mask =
+            static_cast<uint8_t>((1u << kShardCount) - 1u);
+        const auto &config = ::FarLib::get_config();
+        if (!config.ft_background_rebuild ||
+            view.stripe_id == kInvalidStripeId || view.missing_mask == 0 ||
+            (view.missing_mask & static_cast<uint8_t>(~all_mask)) != 0 ||
+            view.slot_size == 0 ||
+            view.shard_bytes != shard_table_.shard_size() ||
+            (view.live_groups == 0 && !config.is_carbink_mode()) ||
+            view.live_groups != view.live_slot_ids.size() ||
+            view.live_objects < view.live_groups) {
+            return false;
+        }
+        uint8_t missing_count = 0;
+        for (uint8_t shard = 0; shard < kShardCount; ++shard)
+            if ((view.missing_mask & static_cast<uint8_t>(1u << shard)) != 0)
+                ++missing_count;
+        if (missing_count == 0 || missing_count > 2 ||
+            static_cast<uint8_t>(kShardCount - missing_count) < 4 ||
+            (missing_count == 2 &&
+             config.ft_background_rebuild_failures != 2)) {
+            return false;
+        }
+        const size_t endpoint_count =
+            ::FarLib::allocator::remote::remote_global_heap.endpoint_count();
+        if (endpoint_count == 0 || endpoint_count > 64) return false;
+        Stripe *stripe = stripe_by_id(view.stripe_id);
+        if (stripe == nullptr) return false;
+        std::unique_lock<std::mutex> lock(stripe->mutex);
+        if (stripe->group_state_words.empty() ||
+            stripe->stripe_id != view.stripe_id ||
+            stripe->slot_size != view.slot_size || stripe->slot_size == 0 ||
+            !endpoints_distinct(*stripe)) {
+            return false;
+        }
+        uint8_t actual = 0;
+        for (uint8_t shard = 0; shard < kShardCount; ++shard) {
+            if (stripe->shard_base[shard] != view.original_base[shard] ||
+                stripe->shard_endpoint[shard] != view.endpoint[shard]) {
+                return false;
+            }
+            const uint32_t endpoint = stripe->shard_endpoint[shard];
+            if (endpoint >= endpoint_count || endpoint >= 64) return false;
+            const uint8_t bit = static_cast<uint8_t>(1u << shard);
+            if ((view.missing_mask & bit) != 0) {
+                if (endpoint_is_alive(endpoint)) return false;
+                actual = static_cast<uint8_t>(actual | bit);
+            } else if (!endpoint_is_alive(endpoint) ||
+                       !config.validate_mapping(stripe->shard_base[shard],
+                                                 view.shard_bytes)) {
+                return false;
+            }
+            if (stripe->rebuilt_base[shard].load(
+                    std::memory_order_acquire) != kInvalidRemoteAddr) {
+                return false;
+            }
+        }
+        if (actual != view.missing_mask) return false;
+
+        std::array<uint32_t, kSmallObjectStripeShardCount> target_endpoint{};
+        target_endpoint.fill(std::numeric_limits<uint32_t>::max());
+        for (uint8_t shard = 0; shard < kShardCount; ++shard) {
+            const uint8_t bit = static_cast<uint8_t>(1u << shard);
+            if ((view.missing_mask & bit) == 0) continue;
+            const uint64_t target = targets[shard];
+            if (target == kInvalidRemoteAddr ||
+                target % view.shard_bytes != 0 ||
+                !config.validate_mapping(target, view.shard_bytes)) {
+                return false;
+            }
+            const auto mapped = config.map_remote_addr(target);
+            if (mapped.first >= endpoint_count ||
+                !endpoint_is_alive(mapped.first)) {
+                return false;
+            }
+            if (missing_count == 1 &&
+                config.ft_background_rebuild_failures != 2 &&
+                (config.ft_standby_endpoint < 0 ||
+                 mapped.first != static_cast<size_t>(config.ft_standby_endpoint))) {
+                return false;
+            }
+            for (uint8_t prior = 0; prior < kShardCount; ++prior) {
+                if (stripe->shard_base[prior] == target) return false;
+                if ((view.missing_mask &
+                     static_cast<uint8_t>(1u << prior)) != 0) {
+                    if (prior < shard &&
+                        target_endpoint[prior] == mapped.first) {
+                        return false;
+                    }
+                } else if (stripe->shard_endpoint[prior] == mapped.first) {
+                    return false;
+                }
+            }
+            target_endpoint[shard] = static_cast<uint32_t>(mapped.first);
+        }
+        uint64_t live_groups = 0, live_objects = 0;
+        std::vector<uint32_t> slots;
+        bool busy = false;
+        if (!background_live_groups_locked(*stripe, &live_groups, &live_objects,
+                                            &slots, &busy) ||
+            busy || live_groups > view.live_groups ||
+            live_objects > view.live_objects ||
+            !std::is_sorted(view.live_slot_ids.begin(), view.live_slot_ids.end())) {
+            return false;
+        }
+        for (size_t i = 0; i < view.live_slot_ids.size(); ++i) {
+            if (view.live_slot_ids[i] >= stripe->slots_per_shard ||
+                (i != 0 && view.live_slot_ids[i] == view.live_slot_ids[i - 1])) {
+                return false;
+            }
+        }
+        for (uint32_t slot : slots)
+            if (!std::binary_search(view.live_slot_ids.begin(),
+                                    view.live_slot_ids.end(), slot)) {
+                return false;
+            }
+        if (view.live_groups == 0) {
+            if (stripe->live_count != 0 || stripe->shadow_quarantined ||
+                stripe->shadow_regions_released) {
+                return false;
+            }
+            for (uint32_t slot = 0; slot < stripe->slots_per_shard; ++slot) {
+                if (group_compaction_claimed_locked(*stripe, slot) ||
+                    stripe->group_live_mask[slot] != 0 ||
+                    stripe->group_live_objects[slot] != 0) {
+                    return false;
+                }
+            }
+        }
+        for (uint8_t shard = 0; shard < kShardCount; ++shard)
+            if ((view.missing_mask & static_cast<uint8_t>(1u << shard)) != 0)
+                stripe->rebuilt_base[shard].store(
+                    targets[shard], std::memory_order_release);
+        if (stripe->shadow_only) stripe->in_group_pool = false;
+        const bool requeue =
+            config.is_carbink_mode() &&
+            mark_group_queued_if_has_space_locked(*stripe);
+        lock.unlock();
+        if (requeue) push_group_candidate(stripe->bin, stripe->stripe_id);
+        return true;
+    }
+    uint64_t resolve_rebuilt_addr(uint64_t stripe_id, uint8_t shard_idx,
+                                  uint64_t logical_addr) const {
+        if (shard_idx >= kShardCount) return logical_addr;
+        const Stripe *stripe = stripe_by_id(stripe_id);
+        if (stripe == nullptr) return logical_addr;
+        const uint64_t base = stripe->shard_base[shard_idx];
+        if (base == kInvalidRemoteAddr || logical_addr < base ||
+            logical_addr - base >= shard_table_.shard_size()) {
+            return logical_addr;
+        }
+        const uint64_t target =
+            stripe->rebuilt_base[shard_idx].load(std::memory_order_acquire);
+        return target == kInvalidRemoteAddr
+                   ? logical_addr
+                   : target + (logical_addr - base);
+    }
+
+    uint64_t resolve_rebuilt_addr(uint64_t logical_addr) const {
+        DecodedBinding binding;
+        if (binding_for_addr(logical_addr, &binding) &&
+            binding.shard_idx < kDataShards) {
+            return resolve_rebuilt_addr(binding.stripe_id, binding.shard_idx,
+                                        logical_addr);
+        }
+        const uint64_t count = stripe_count_.load(std::memory_order_acquire);
+        for (uint64_t id = 0; id < count; id++) {
+            const Stripe *stripe = stripe_by_id(id);
+            if (stripe == nullptr) continue;
+            for (uint8_t shard = kDataShards; shard < kShardCount; shard++) {
+                const uint64_t base = stripe->shard_base[shard];
+                if (base != kInvalidRemoteAddr && logical_addr >= base &&
+                    logical_addr - base < shard_table_.shard_size()) {
+                    return resolve_rebuilt_addr(id, shard, logical_addr);
+                }
+            }
+        }
+        return logical_addr;
+    }
+
+    bool physical_compaction_layout(
+        const CompactionGroupView &view,
+        std::array<uint32_t, kShardCount> *layout_out) const {
+        if (layout_out == nullptr) return false;
+        const auto &config = ::FarLib::get_config();
+        std::array<uint32_t, kShardCount> layout{};
+        for (uint8_t shard = 0; shard < kShardCount; shard++) {
+            const uint64_t physical = resolve_rebuilt_addr(
+                view.id.stripe_id, shard, view.group.segments[shard].addr);
+            if (!config.validate_mapping(physical, shard_table_.shard_size())) {
+                return false;
+            }
+            layout[shard] = static_cast<uint32_t>(
+                config.map_remote_addr(physical).first);
+            if (!endpoint_is_alive(layout[shard])) return false;
+            for (uint8_t prior = 0; prior < shard; prior++) {
+                if (layout[prior] == layout[shard]) return false;
+            }
+        }
+        *layout_out = layout;
+        return true;
+    }
+
+    // Called only after the owning background worker and quiesced evacuation
+    // have joined.  Individual object release never frees a repaired region.
+    void release_background_targets_for_shutdown() {
+        std::lock_guard<std::mutex> lock(stripes_mutex_);
+        release_published_background_targets_locked();
+    }
+
+    // Quarantined shadow groups retain their claim until this quiescent
+    // shutdown point, so a late RPC cannot race a fresh shadow allocation.
+    void release_quarantined_shadows_for_shutdown() {
+        std::lock_guard<std::mutex> lock(stripes_mutex_);
+        for (auto &owned : stripe_storage_) {
+            Stripe *stripe = owned.get();
+            if (stripe == nullptr || !stripe->shadow_only ||
+                !stripe->shadow_quarantined ||
+                stripe->shadow_regions_released) {
+                continue;
+            }
+            const auto bases = stripe->shard_base;
+            release_allocated_shards(bases);
+            for (uint8_t shard = 0; shard < kShardCount; shard++) {
+                if (shard < kDataShards &&
+                    bases[shard] != kInvalidRemoteAddr) {
+                    const uint64_t region_id =
+                        bases[shard] / shard_table_.shard_size();
+                    if (region_id < shard_binding_count_) {
+                        shard_bindings_[region_id].store(
+                            kInvalidBinding, std::memory_order_release);
+                    }
+                }
+                stripe->shard_base[shard] = kInvalidRemoteAddr;
+            }
+            std::fill(stripe->group_compaction_claimed.begin(),
+                      stripe->group_compaction_claimed.end(), 0);
+            stripe->shadow_regions_released = true;
+        }
     }
 
     // Read-only liveness diagnostics used by recovery/self-check code.
@@ -1391,13 +2382,17 @@ public:
                                      slot_id, group_out);
         }
 
-        Stripe *stripe = create_stripe(bin, true);
-        if (stripe == nullptr) return false;
         uint32_t slot_id = 0;
+        const bool reserved_first =
+            ::FarLib::get_config().ft_background_rebuild;
+        Stripe *stripe = create_stripe(
+            bin, true, reserved_first ? &slot_id : nullptr);
+        if (stripe == nullptr) return false;
         bool should_enqueue = false;
         {
             std::lock_guard<std::mutex> lock(stripe->mutex);
-            if (!allocate_group_from_stripe_locked(*stripe, &slot_id)) {
+            if (!reserved_first &&
+                !allocate_group_from_stripe_locked(*stripe, &slot_id)) {
                 return false;
             }
             should_enqueue = mark_group_queued_if_has_space_locked(*stripe);
@@ -1521,6 +2516,218 @@ public:
             push_group_candidate(stripe.bin, stripe.stripe_id);
         }
     }
+
+    bool finish_background_write(const SlotGroupId &id) {
+        if (!::FarLib::get_config().ft_background_rebuild) return false;
+        Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || id.slot_id >= stripe->slots_per_shard) {
+            return false;
+        }
+        bool should_enqueue = false;
+        {
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            if (id.slot_id >= stripe->group_pending_write.size() ||
+                stripe->group_pending_write[id.slot_id] == 0) {
+                return false;
+            }
+            stripe->group_pending_write[id.slot_id] = 0;
+            if (group_state_locked(*stripe, id.slot_id) == kSlotGroupDead &&
+                !group_compaction_claimed_locked(*stripe, id.slot_id) &&
+                stripe_eligible_for_new_group(*stripe)) {
+                should_enqueue = mark_group_queued_if_has_space_locked(*stripe);
+            }
+        }
+        if (should_enqueue) push_group_candidate(stripe->bin, stripe->stripe_id);
+        return true;
+    }
+
+    bool cancel_background_write(const SlotGroupId &id) {
+        if (!::FarLib::get_config().ft_background_rebuild) return false;
+        Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || id.slot_id >= stripe->slots_per_shard) {
+            return false;
+        }
+        bool should_enqueue = false;
+        {
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            if (id.slot_id >= stripe->group_pending_write.size() ||
+                stripe->group_pending_write[id.slot_id] == 0) {
+                return false;
+            }
+            stripe->group_pending_write[id.slot_id] = 0;
+            if (group_state_locked(*stripe, id.slot_id) == kSlotGroupDead &&
+                !group_compaction_claimed_locked(*stripe, id.slot_id) &&
+                stripe_eligible_for_new_group(*stripe)) {
+                should_enqueue = mark_group_queued_if_has_space_locked(*stripe);
+            }
+        }
+        if (should_enqueue) push_group_candidate(stripe->bin, stripe->stripe_id);
+        return true;
+    }
+
+    bool allocate_compaction_shadow(
+        const std::array<uint32_t, kShardCount> &physical_layout,
+        CompactionGroupView *view_out) {
+        if (view_out == nullptr ||
+            !::FarLib::get_config().ft_background_rebuild) {
+            return false;
+        }
+        const size_t bin = bin_from_size(8192);
+        if (::FarLib::allocator::get_bin_size(bin) != 8192) return false;
+        ShadowLayoutPool *pool =
+            shadow_layout_pool_for(physical_layout, true);
+        if (pool == nullptr) return false;
+
+        auto fill_shadow_view = [&](Stripe *stripe, uint32_t slot) {
+            SlotGroupHandle handle;
+            if (stripe == nullptr ||
+                !fill_group_handle(*stripe, static_cast<uint16_t>(bin), slot,
+                                   &handle)) {
+                return false;
+            }
+            if (slot >= stripe->group_compaction_claimed.size()) return false;
+            set_group_compaction_claimed_locked(*stripe, slot, true);
+            view_out->id = handle.id;
+            view_out->group = handle;
+            view_out->handle = handle;
+            view_out->live_mask = 0;
+            view_out->live_count = 0;
+            view_out->generation = handle.generation;
+            view_out->owners.fill(0);
+            view_out->shadow_only = true;
+            return true;
+        };
+
+        while (true) {
+            const uint64_t stripe_id = pop_shadow_candidate(physical_layout);
+            if (stripe_id == kInvalidStripeId) break;
+            Stripe *stripe = stripe_by_id(stripe_id);
+            if (stripe == nullptr) continue;
+            uint32_t slot_id = 0;
+            bool should_enqueue = false;
+            {
+                std::lock_guard<std::mutex> lock(stripe->mutex);
+                if (!stripe->shadow_only ||
+                    stripe->shadow_regions_released ||
+                    stripe->shadow_quarantined ||
+                    effective_shadow_layout(*stripe) != physical_layout ||
+                    !stripe->in_group_pool) {
+                    continue;
+                }
+                stripe->in_group_pool = false;
+                if (!stripe_eligible_for_new_group(*stripe)) continue;
+                if (!allocate_group_from_stripe_locked(*stripe, &slot_id) ||
+                    !fill_shadow_view(stripe, slot_id)) {
+                    continue;
+                }
+                should_enqueue =
+                    mark_group_queued_if_has_space_locked(*stripe);
+            }
+            if (should_enqueue) {
+                push_group_candidate(static_cast<uint16_t>(bin), stripe_id);
+            }
+            return true;
+        }
+
+        uint32_t slot_id = 0;
+        Stripe *stripe =
+            create_shadow_stripe(static_cast<uint16_t>(bin), physical_layout,
+                                 &slot_id);
+        if (stripe == nullptr) return false;
+        {
+            std::lock_guard<std::mutex> lock(pool->groups.mutex);
+            ++pool->created_stripes;
+        }
+        bool should_enqueue = false;
+        {
+            std::lock_guard<std::mutex> lock(stripe->mutex);
+            if (!fill_shadow_view(stripe, slot_id)) return false;
+            should_enqueue =
+                mark_group_queued_if_has_space_locked(*stripe);
+        }
+        if (should_enqueue) {
+            push_group_candidate(static_cast<uint16_t>(bin), stripe->stripe_id);
+        }
+        return true;
+    }
+
+    bool mark_compaction_shadow_durable(
+        const CompactionGroupView &expected) {
+        if (!::FarLib::get_config().ft_background_rebuild) return false;
+        const SlotGroupId id =
+            expected.id.valid() ? expected.id : expected.group.id;
+        const uint64_t generation =
+            expected.generation != 0 ? expected.generation
+                                     : expected.group.generation;
+        if (!id.valid() || generation == 0) return false;
+        Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || id.slot_id >= stripe->slots_per_shard) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        if (!stripe->shadow_only ||
+            !group_compaction_claimed_locked(*stripe, id.slot_id) ||
+            group_state_locked(*stripe, id.slot_id) != kSlotGroupInProgress ||
+            id.slot_id >= stripe->group_generation.size() ||
+            stripe->group_generation[id.slot_id] != generation ||
+            id.slot_id >= stripe->group_pending_write.size() ||
+            stripe->group_pending_write[id.slot_id] == 0) {
+            return false;
+        }
+        assert(stripe->live_count >= kDataShards);
+        stripe->live_count -= kDataShards;
+        stripe->group_live_mask[id.slot_id] = 0;
+        stripe->group_live_objects[id.slot_id] = 0;
+        stripe->group_ready_after_write[id.slot_id] = 1;
+        stripe->group_owners[id.slot_id].fill(0);
+        stripe->group_is_split[id.slot_id] = 0;
+        set_group_state_locked(*stripe, id.slot_id, kSlotGroupSealed);
+        return true;
+    }
+
+    bool quarantine_compaction_shadow(
+        const CompactionGroupView &expected) {
+        if (!::FarLib::get_config().ft_background_rebuild) return false;
+        const SlotGroupId id =
+            expected.id.valid() ? expected.id : expected.group.id;
+        const uint64_t generation =
+            expected.generation != 0 ? expected.generation
+                                     : expected.group.generation;
+        if (!id.valid() || generation == 0) return false;
+        Stripe *stripe = stripe_by_id(id.stripe_id);
+        if (stripe == nullptr || id.slot_id >= stripe->slots_per_shard) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(stripe->mutex);
+        if (!stripe->shadow_only ||
+            !group_compaction_claimed_locked(*stripe, id.slot_id) ||
+            id.slot_id >= stripe->group_generation.size() ||
+            stripe->group_generation[id.slot_id] != generation) {
+            return false;
+        }
+        const uint8_t state = group_state_locked(*stripe, id.slot_id);
+        if (state != kSlotGroupInProgress &&
+            state != kSlotGroupSealed) {
+            return false;
+        }
+        if (id.slot_id >= stripe->group_live_mask.size() ||
+            stripe->group_live_mask[id.slot_id] != 0) {
+            // A shadow is quarantinable only before any owner has been
+            // published into it; never erase a live destination's metadata.
+            return false;
+        }
+        if (!mark_dead_group_locked(*stripe, id)) return false;
+        stripe->group_pending_write[id.slot_id] = 0;
+        stripe->group_ready_after_write[id.slot_id] = 0;
+        stripe->group_owners[id.slot_id].fill(0);
+        stripe->shadow_quarantined = true;
+        stripe->group_shadow_quarantined[id.slot_id] = 1;
+        stripe->in_group_pool = false;
+        // The claim intentionally remains set until the quiescent shutdown
+        // release; a late RPC can no longer make this slot reusable.
+        return true;
+    }
+
     // ------------------------------------------------- per-object release --
     // Result of an address-based per-object release.
     enum GroupReleaseResult : uint8_t {
@@ -1803,13 +3010,16 @@ public:
             bool stopped_inside = false;
             if (stripe != nullptr && stripe->slots_per_shard != 0) {
                 std::lock_guard<std::mutex> lock(stripe->mutex);
+                const bool physically_healthy =
+                    stripe_effectively_healthy_locked(*stripe);
                 const size_t slots = stripe->slots_per_shard;
                 const size_t begin =
                     (current == origin ? next_slot : 0) % slots;
                 for (size_t n = 0; n < slots && out.size() < budget; n++) {
                     const uint32_t slot =
                         static_cast<uint32_t>((begin + n) % slots);
-                    if (group_state_locked(*stripe, slot) ==
+                    if (physically_healthy &&
+                        group_state_locked(*stripe, slot) ==
                             kSlotGroupSealed &&
                         stripe->slot_size == 8192 &&
                         slot < stripe->group_ready_after_write.size() &&
@@ -1833,6 +3043,7 @@ public:
                                 view.generation =
                                     stripe->group_generation[slot];
                                 view.owners = stripe->group_owners[slot];
+                                view.shadow_only = stripe->shadow_only;
                                 out.push_back(view);
                             }
                         }
@@ -1872,7 +3083,8 @@ public:
             return false;
         }
         std::lock_guard<std::mutex> lock(stripe->mutex);
-        if (group_state_locked(*stripe, id.slot_id) != kSlotGroupSealed ||
+        if (!stripe_effectively_healthy_locked(*stripe) ||
+            group_state_locked(*stripe, id.slot_id) != kSlotGroupSealed ||
             stripe->slot_size != 8192 ||
             id.slot_id >= stripe->group_generation.size() ||
             (!wildcard_generation &&
@@ -1890,7 +3102,7 @@ public:
         if (!fill_group_handle(*stripe, stripe->bin, id.slot_id, &handle)) {
             return false;
         }
-        stripe->group_compaction_claimed[id.slot_id] = 1;
+        set_group_compaction_claimed_locked(*stripe, id.slot_id, true);
         if (view_out != nullptr) {
             view_out->id = id;
             view_out->group = handle;
@@ -1899,6 +3111,7 @@ public:
                 __builtin_popcount(static_cast<unsigned>(expected.live_mask)));
             view_out->generation = stripe->group_generation[id.slot_id];
             view_out->owners = stripe->group_owners[id.slot_id];
+            view_out->shadow_only = stripe->shadow_only;
         }
         return true;
     }
@@ -1937,13 +3150,14 @@ public:
                 stripe->group_generation[id.slot_id] != generation) {
                 return false;
             }
+            if (stripe->group_shadow_quarantined[id.slot_id]) return false;
             if (group_state_locked(*stripe, id.slot_id) ==
                     kSlotGroupSealed &&
                 id.slot_id < stripe->group_live_mask.size() &&
                 stripe->group_live_mask[id.slot_id] == 0) {
                 (void)mark_dead_group_locked(*stripe, id);
             }
-            stripe->group_compaction_claimed[id.slot_id] = 0;
+            set_group_compaction_claimed_locked(*stripe, id.slot_id, false);
             should_enqueue = mark_group_queued_if_has_space_locked(*stripe);
             bin = stripe->bin;
         }
@@ -1966,7 +3180,13 @@ public:
             if (!group_compaction_claimed_locked(*stripe, id.slot_id)) {
                 return false;
             }
-            stripe->group_compaction_claimed[id.slot_id] = 0;
+            if (stripe->group_shadow_quarantined[id.slot_id]) return false;
+            if (group_state_locked(*stripe, id.slot_id) ==
+                    kSlotGroupSealed &&
+                stripe->group_live_mask[id.slot_id] == 0) {
+                (void)mark_dead_group_locked(*stripe, id);
+            }
+            set_group_compaction_claimed_locked(*stripe, id.slot_id, false);
             should_enqueue = mark_group_queued_if_has_space_locked(*stripe);
             bin = stripe->bin;
         }
@@ -2123,7 +3343,8 @@ public:
         if (!fill_group_handle(*stripe, stripe->bin, id.slot_id, &handle)) {
             return false;
         }
-        *addr_out = handle.segments[data_slot].addr;
+        *addr_out = resolve_rebuilt_addr(
+            id.stripe_id, data_slot, handle.segments[data_slot].addr);
         return true;
     }
     bool slot_group_is_split(uint64_t addr) const {

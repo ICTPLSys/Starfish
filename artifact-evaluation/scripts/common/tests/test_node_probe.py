@@ -39,6 +39,23 @@ class NodeProbe(unittest.TestCase):
             node_probe._classify(record("/usr/bin/python3", ["python3", "/x/scripts/figure10/run.py"])),
             "launcher",
         )
+        for script in (
+            "scripts/figure9/run.sh",
+            "scripts/figure10/run.py",
+            "scripts/figure11/run.py",
+            "scripts/figure12/run.py",
+            "scripts/figure13/run.py",
+        ):
+            self.assertEqual(
+                node_probe._classify(
+                    record("/usr/bin/python3", ["python3", "/x/" + script])
+                ),
+                "launcher",
+            )
+        self.assertIsNone(node_probe._classify(
+            record("/usr/bin/python3",
+                   ["python3", "/x/scripts/common/check_nodes.py"])
+        ))
         self.assertIsNone(
             node_probe._classify(record("/tmp/not-mg-wrapper", ["not-mg-wrapper", "mg"])),
         )

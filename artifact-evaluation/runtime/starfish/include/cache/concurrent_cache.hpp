@@ -547,6 +547,7 @@ private:
     void start_background_rebuild();
     void stop_background_rebuild();
     void background_rebuild_work();
+    void background_rebuild_work_dual();
     bool handle_background_rebuild_complete(const ibv_wc &wc);
     size_t evacuate_thread_cnt;
     std::atomic_flag flag;
@@ -3735,12 +3736,55 @@ public:
             ibv_send_wr wrs[EvictBatchSize];
             size_t count = 0;
         };
+        // Optional worker-private FIFO for large split objects.  Each record
+        // already owns an encoded snapshot and a staging lease; the sender
+        // consumes it only after acquiring its completion token.  Capacity is
+        // the largest supported FARLIB_EC_SPLIT_WRITE_BATCH setting.
+        struct EcSplitPendingBuilder {
+            static constexpr size_t kCapacity = 32;
+            using Record = ec_batch::EcGroupSendRecord;
+            std::array<Record, kCapacity> records{};
+            size_t head = 0;
+            size_t count = 0;
+
+            size_t pending_count() const { return count; }
+            const Record *peek_private_pending() const {
+                return count == 0 ? nullptr : &records[head];
+            }
+            bool push(const Record &record) {
+                if (count >= kCapacity) return false;
+                records[(head + count) % kCapacity] = record;
+                ++count;
+                return true;
+            }
+            bool commit_pending(uint64_t sequence) {
+                if (count == 0 || records[head].sequence != sequence)
+                    return false;
+                head = (head + 1) % kCapacity;
+                --count;
+                return true;
+            }
+        };
+        struct EcSplitGroupBatch {
+            static constexpr size_t kCapacity = 8;
+            std::array<SmallObjectStripeManager::SlotGroupHandle, kCapacity>
+                groups{};
+            size_t count = 0;
+
+            void clear() {
+                for (auto &group : groups)
+                    group = SmallObjectStripeManager::SlotGroupHandle{};
+                count = 0;
+            }
+        };
         std::unique_ptr<EvictBuffer[]> buffers;
         std::unique_ptr<SpongeEvictBuffer[]> sponge_buffers;
         // Invocation/worker owned, never OS-thread-local: fibres may migrate.
         // Only this worker can construct, seal or consume these EC groups.
         std::unique_ptr<ec_batch::EcGroupBuilder> ec_builder;
         std::unique_ptr<ec_batch::EcSizeClassBuilder> size_class_builder;
+        std::unique_ptr<EcSplitPendingBuilder> ec_split_builder;
+        EcSplitGroupBatch ec_split_group_batch;
         std::unique_ptr<ec_batch::EcDirectGroupBuilder> direct_builder;
         std::unique_ptr<EcEndpointWrites[]> ec_writes;
         ConcurrentArrayCache *ec_cache = nullptr;
@@ -3754,6 +3798,13 @@ public:
         uint64_t direct_reported_alloc_failed = 0, direct_reported_objects = 0;
         uint64_t direct_reported_bytes = 0;
         std::array<uint64_t, ec_batch::kEcBatchBehaviorGroupCount> direct_reported_by_group{};
+        // Worker-local accounting for the bounded fresh split-group batch.
+        // These are folded into sharded diagnostics once the batch leftovers
+        // are retired at the round boundary; no per-object global RMW occurs.
+        uint64_t ec_split_group_batch_refills = 0;
+        uint64_t ec_split_group_batch_groups = 0;
+        uint64_t ec_split_group_batch_consumed = 0;
+        uint64_t ec_split_group_batch_released = 0;
         size_t server_count;
         size_t direct_owner = static_cast<size_t>(-1);
         // True when the most recent one-sided incremental stage retained the
@@ -3775,6 +3826,12 @@ public:
             }
             ASSERT(!direct_builder || (!direct_builder->group_open() && direct_builder->pending_count() == 0));
             ASSERT(!size_class_builder || (!size_class_builder->group_open() && size_class_builder->pending_count() == 0));
+            ASSERT(!ec_split_builder || ec_split_builder->pending_count() == 0);
+            ASSERT(ec_split_group_batch.count == 0);
+            ASSERT(ec_split_group_batch_refills == 0 &&
+                   ec_split_group_batch_groups == 0 &&
+                   ec_split_group_batch_consumed == 0 &&
+                   ec_split_group_batch_released == 0);
         }
         
         void init(size_t count) {
@@ -3838,6 +3895,12 @@ public:
             if (size_class_builder) {
                 total += size_class_builder->pending_count();
                 total += size_class_builder->group_open() ? 1 : 0;
+            }
+            if (ec_split::mg_optimizations_enabled) {
+                if (ec_split_builder) total += ec_split_builder->pending_count();
+                // Also flush accounting for an exactly consumed group batch.
+                total += ec_split_group_batch.count;
+                if (ec_split_group_batch_refills != 0) ++total;
             }
             return total;
         }
@@ -4583,10 +4646,30 @@ private:
             std::make_unique<::FarLib::benchmark_memory::Sampler>(
                 ::FarLib::get_config().server_count, "allocator_occupied_bytes",
                 "remote_global_heap", [this] {
-                    return ::FarLib::allocator::remote::remote_global_heap
-                        .get_endpoint_used_bytes();
+                    auto result =
+                        ::FarLib::allocator::remote::remote_global_heap
+                            .get_endpoint_used_bytes_observer();
+                    const auto ec = remote_allocator.small_object_stripe_manager()
+                                         .snapshot_group_endpoint_bytes_observer();
+                    if (ec.size() != result.size())
+                        throw std::runtime_error(
+                            "Starfish observer endpoint count mismatch");
+                    for (size_t i = 0; i < result.size(); ++i) result[i] += ec[i];
+                    return result;
                 });
-        benchmark_memory_sampler_->start();
+        ::FarLib::profile::benchmark_memory_observer_context =
+            benchmark_memory_sampler_.get();
+        ::FarLib::profile::benchmark_memory_begin_observer =
+            &::FarLib::benchmark_memory::Sampler::begin_work_callback;
+        ::FarLib::profile::benchmark_memory_end_observer =
+            &::FarLib::benchmark_memory::Sampler::end_work_callback;
+        ::FarLib::benchmark_memory::explicit_work_origin_context =
+            benchmark_memory_sampler_.get();
+        ::FarLib::benchmark_memory::explicit_work_begin_observer =
+            &::FarLib::benchmark_memory::Sampler::begin_work_at_callback;
+        ::FarLib::benchmark_memory::explicit_work_end_observer =
+            &::FarLib::benchmark_memory::Sampler::end_work_at_callback;
+        benchmark_memory_sampler_->arm();
     }
 
 public:
@@ -4957,11 +5040,36 @@ public:
     ~ConcurrentArrayCache() {
         // Print the saved final Work-boundary snapshot, never post-cleanup zero.
         runtime_metadata_reporter_.reset();
-        if (benchmark_memory_sampler_) benchmark_memory_sampler_->stop();
+        if (benchmark_memory_sampler_) {
+            if (::FarLib::profile::benchmark_memory_observer_context ==
+                benchmark_memory_sampler_.get()) {
+                ::FarLib::profile::benchmark_memory_begin_observer = nullptr;
+                ::FarLib::profile::benchmark_memory_end_observer = nullptr;
+                ::FarLib::profile::benchmark_memory_observer_context = nullptr;
+            }
+            if (::FarLib::benchmark_memory::explicit_work_origin_context ==
+                benchmark_memory_sampler_.get()) {
+                ::FarLib::benchmark_memory::explicit_work_begin_observer = nullptr;
+                ::FarLib::benchmark_memory::explicit_work_end_observer = nullptr;
+                ::FarLib::benchmark_memory::explicit_work_origin_context = nullptr;
+            }
+            benchmark_memory_sampler_->shutdown();
+        }
         ::FarLib::simple_region_heat::end_work();
         ec_batch_diag_report("cache_dtor_begin");
         ec_read_recovery_diag_report("cache_dtor_begin");
         quiesce_background_evacuation();
+        if (ec_split::mg_optimizations_enabled &&
+            ::FarLib::get_config().is_ec_batch_mode()) {
+            const auto groups = ec_split_group_batch_groups_.load(std::memory_order_relaxed);
+            const auto consumed = ec_split_group_batch_consumed_.load(std::memory_order_relaxed);
+            const auto released = ec_split_group_batch_released_.load(std::memory_order_relaxed);
+            ASSERT(groups == consumed + released);
+            std::cout << "ec_split group_batch_closed refills="
+                      << ec_split_group_batch_refills_.load(std::memory_order_relaxed)
+                      << " groups=" << groups << " consumed=" << consumed
+                      << " released=" << released << std::endl;
+        }
         // Report native logical-worker intervals only after every producer
         // has joined; Work clipping excludes shutdown drain and logging.
         profile::evict_breakdown::report();
@@ -5725,8 +5833,11 @@ public:
                              bool *token_backpressure = nullptr);
     size_t post_ec_batch_pending(EvictBufferSet &buffers,
                                  size_t client_idx, size_t qp_idx);
+    size_t post_ec_split_pending(EvictBufferSet &buffers,
+                                 size_t client_idx, size_t qp_idx);
     template <class Builder, class Pool>
-    size_t post_ec_pending_impl(EvictBufferSet &, Builder &, Pool &, size_t, size_t);
+    size_t post_ec_pending_impl(EvictBufferSet &, Builder &, Pool &, size_t, size_t,
+                                bool split_batch_observe = false);
     void account_ec_worker_builder(EvictBufferSet &buffers);
     // Segment completion of one group write; called from
     // handle_rdma_write_complete() when the wr_id carries the ec_batch tag.
@@ -5736,7 +5847,8 @@ public:
     // completion tokens retain posted leases after the invocation returns.
     bool ec_batch_staging_ready();
     bool stage_ec_batch_object(EvictBufferSet &buffers, void *local_addr, size_t size,
-                              FarObjectEntry *entry, uint32_t behavior_group = 0);
+                              FarObjectEntry *entry, uint32_t behavior_group = 0,
+                              bool direct_split_write = false);
     static bool ec_batch_uses_split(size_t size) {
         // A permissive cutoff (e.g. legacy 8192) must not send >4 KiB objects
         // into the fixed-size small-object staging buffers.
@@ -5744,14 +5856,16 @@ public:
                       ec_batch::kEcBatchStagingMaxSlotSize);
         return ::FarLib::get_config().ec_object_uses_split(size);
     }
-    bool stage_ec_split_object(void *local_addr, size_t size,
-                               FarObjectEntry *entry, uint32_t behavior_group = 0);
+    bool stage_ec_split_object(EvictBufferSet &, void *local_addr, size_t size,
+                               FarObjectEntry *entry, uint32_t behavior_group = 0,
+                               bool direct_split_write = false);
     bool stage_ec_size_class_object(EvictBufferSet &, void *, size_t,
                                     FarObjectEntry *, uint32_t);
     // Flush point of the group path: seals the partly filled group (holes zero
     // filled) and posts every sealed group.  Called from
     // EvictBufferSet::flush_all().
     void flush_ec_batch_groups(size_t client_idx, EvictBufferSet *buffers = nullptr);
+    void release_ec_split_group_batch(EvictBufferSet &buffers);
 
     // --- EC (ft_method=ec_batch) degraded READ path (read-side recovery) ----
     // All of these are inert while ft_method != ec_batch: the scratch range is
@@ -5975,6 +6089,11 @@ private:
     size_t ec_staging_slot_size_ = 0;
     profile::ShardedDiagnosticCounter ec_batch_groups_posted_{};
     profile::ShardedDiagnosticCounter ec_batch_groups_completed_{};
+    std::atomic<uint64_t> ec_split_batch_flushes_{0};
+    std::atomic<uint64_t> ec_split_batch_groups_{0};
+    std::atomic<uint64_t> ec_split_batch_max_groups_{0};
+    std::atomic<uint64_t> ec_split_batch_endpoint_chains_{0};
+    std::atomic<uint64_t> ec_split_batch_accepted_wrs_{0};
     std::atomic<uint64_t> ec_batch_post_rejects_{0};
     std::atomic<uint64_t> ec_batch_staging_release_failures_{0};
     // Last value returned by ec_batch_poll_all_cqs_once() from the ref_cnt
@@ -6082,6 +6201,22 @@ private:
     std::atomic<uint64_t> ec_split_read_posts_{0};
     std::atomic<uint64_t> ec_split_read_completions_{0};
     std::atomic<uint64_t> ec_split_degraded_read_completions_{0};
+    // Opt-in direct split-write telemetry.  OFF performs no per-object update.
+    profile::ShardedDiagnosticCounter ec_split_direct_write_staged_{};
+    profile::ShardedDiagnosticCounter ec_split_direct_write_completed_{};
+    profile::ShardedDiagnosticCounter ec_split_direct_write_bytes_{};
+    std::atomic<uint64_t> ec_split_direct_write_borrowed_{0};
+    // Telemetry only: direct split reads retain the existing context/pin
+    // lifecycle; these counters never participate in publication decisions.
+    profile::ShardedDiagnosticCounter ec_split_direct_read_posts_{};
+    profile::ShardedDiagnosticCounter ec_split_direct_read_completions_{};
+    profile::ShardedDiagnosticCounter ec_split_direct_read_bytes_{};
+    // Bounded fresh split-group batching telemetry.  Updates happen once per
+    // refill/drain, never once per cache hit.
+    profile::ShardedDiagnosticCounter ec_split_group_batch_refills_{};
+    profile::ShardedDiagnosticCounter ec_split_group_batch_groups_{};
+    profile::ShardedDiagnosticCounter ec_split_group_batch_consumed_{};
+    profile::ShardedDiagnosticCounter ec_split_group_batch_released_{};
 };
 
 }  // namespace cache
@@ -6101,5 +6236,6 @@ private:
 #include "cache/core/rdma/ec_direct_path.ipp"
 #include "recovery/ec_read_recovery.ipp"
 #include "recovery/ec_background_rebuild.ipp"
+#include "recovery/ec_background_rebuild_dual.ipp"
 #include "recovery/recompute_recipe_path.ipp"
 #include "cache/core/common/common_path.ipp"

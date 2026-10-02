@@ -668,6 +668,16 @@ public:
         return state.compare_exchange_strong(expected, desired);
     }
 
+    // A failed CAS may refresh expected with a compaction-owned reference.
+    // Never let a retry retire its remote storage before that reference drains.
+    bool try_free_unreferenced_remote(EntryStateBits &expected) {
+        if (expected.state != REMOTE || expected.invalid || expected.ref_cnt != 0)
+            return false;
+        auto desired = expected;
+        desired.state = FREE;
+        return cas_state_weak(expected, desired);
+    }
+
     bool is_local() const { return load_state().state <= EVICTING; }
 
     template <bool Lite>

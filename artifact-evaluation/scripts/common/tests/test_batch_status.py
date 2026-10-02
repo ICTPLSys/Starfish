@@ -70,6 +70,34 @@ class BatchStatus(unittest.TestCase):
             self.record(status="failed", exit_status=124, timed_out=True, endpoints=[state])
             self.assertFalse(classify_case(self.root, 1)["safe_to_continue"])
 
+    def test_staging_failure_before_launch_is_safe_with_explicit_false(self):
+        self.record(
+            status="failed", correctness="fail", exit_status=1,
+            endpoints=[{"status": "not_started", "pid": None,
+                         "remote_dir_created": True, "launch_attempted": False}])
+        self.assertTrue(classify_case(self.root, 1)["safe_to_continue"])
+
+    def test_unknown_launch_with_pid_none_is_unsafe(self):
+        self.record(
+            status="failed", correctness="fail", exit_status=1,
+            endpoints=[{"status": "not_started", "pid": None,
+                         "remote_dir_created": True, "launch_attempted": True}])
+        self.assertFalse(classify_case(self.root, 1)["safe_to_continue"])
+
+    def test_legacy_created_directory_without_launch_flag_is_unsafe(self):
+        self.record(
+            status="failed", correctness="fail", exit_status=1,
+            endpoints=[{"status": "not_started", "pid": None,
+                         "remote_dir_created": True}])
+        self.assertFalse(classify_case(self.root, 1)["safe_to_continue"])
+
+    def test_known_pid_cleanup_failure_is_unsafe(self):
+        self.record(
+            status="failed", correctness="fail", exit_status=1,
+            endpoints=[{"status": "cleanup_failed", "pid": 456,
+                         "remote_dir_created": True, "launch_attempted": True}])
+        self.assertFalse(classify_case(self.root, 1)["safe_to_continue"])
+
     def test_incomplete_or_corrupt_runner_record_stops_batch(self):
         path = self.root / "manifest.json"
         path.write_text(json.dumps({"status": "running"}))

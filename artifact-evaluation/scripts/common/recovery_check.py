@@ -34,24 +34,23 @@ def validate_request(app, system, endpoint, endpoint_count, method, standby):
 
 
 def run_client(command, *, stdin, stdout, env, timeout, capture, inject, evidence,
-               execution_state=None, benchmark_start_env=False):
+               execution_state=None, record_launch_time=False):
     """A captured answer byte, not initialization or a prompt, arms injection."""
     deadline = time.monotonic() + timeout
     child_env = None if env is None else dict(env)
-    benchmark_start_ns = None
-    if (benchmark_start_env
-            or (child_env is not None
-                and child_env.get("FARLIB_REMOTE_MEMORY_SAMPLES") == "1")):
-        if child_env is None:
-            child_env = os.environ.copy()
-        benchmark_start_ns = time.monotonic_ns()
-        child_env["FARLIB_BENCHMARK_START_MONOTONIC_NS"] = str(benchmark_start_ns)
+    # Process launch is useful for service-CPU accounting, but it is not the
+    # benchmark Work boundary. Runtime profiling hooks own memory sampling.
+    if child_env is None and "FARLIB_BENCHMARK_START_MONOTONIC_NS" in os.environ:
+        child_env = os.environ.copy()
+    if child_env is not None:
+        child_env.pop("FARLIB_BENCHMARK_START_MONOTONIC_NS", None)
+    client_launch_ns = time.monotonic_ns() if record_launch_time else None
     process = subprocess.Popen(command, stdin=stdin, stdout=stdout,
                                stderr=subprocess.STDOUT, env=child_env)
     if execution_state is not None:
         execution_state.update(pid=process.pid, reaped=False)
-        if benchmark_start_ns is not None:
-            execution_state["benchmark_start_monotonic_ns"] = benchmark_start_ns
+        if client_launch_ns is not None:
+            execution_state["client_launch_monotonic_ns"] = client_launch_ns
     try:
         while process.poll() is None:
             if time.monotonic() >= deadline:

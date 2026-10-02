@@ -7,6 +7,7 @@ import re
 import subprocess
 
 SCHEMA = 1
+DEFAULT_MAX_QUEUE_DELAY_US = 500
 PHASES = ("warmup", "measurement")
 HISTOGRAMS = ("total", "service", "dispatch")
 
@@ -32,7 +33,7 @@ def specification(args):
         raise ValueError("latency window exceeds the nanosecond clock range")
     if rate > 2**63 - 1:
         raise ValueError("offered load exceeds the integer range")
-    queue_us = 0 if queue_us is None else queue_us
+    queue_us = DEFAULT_MAX_QUEUE_DELAY_US if queue_us is None else queue_us
     if type(queue_us) is not int or not 0 <= queue_us <= 60_000_000:
         raise ValueError("queue deadline must be 0..60000000 microseconds")
     return {"schema": SCHEMA, "offered_load_ops": rate, "warmup_ms": warmup,
@@ -56,7 +57,8 @@ def environment(base, spec):
         "FARLIB_KVS_LATENCY_MEASURE_MS": str(spec["measure_ms"]),
         "FARLIB_KVS_DRAIN_TIMEOUT_MS": str(spec["drain_ms"]),
         "FARLIB_KVS_LATENCY_OUTPUT_DIR": spec["histogram_dir"],
-        "FARLIB_KVS_MAX_QUEUE_DELAY_US": str(spec.get("max_queue_delay_us", 0)),
+        "FARLIB_KVS_MAX_QUEUE_DELAY_US": str(spec.get(
+            "max_queue_delay_us", DEFAULT_MAX_QUEUE_DELAY_US)),
         "FARLIB_KVS_FIXED_REQUEST_COUNT": "0",
         "FARLIB_KVS_DRAIN_ALL_REQUESTS": "1",
         "FARLIB_KVS_HIST_SAMPLE_PERIOD": "1",

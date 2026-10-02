@@ -55,6 +55,10 @@ struct EcRecoveryGroupView {
     SmallObjectStripeManager::SlotGroupHandle group;
     uint8_t own_shard_idx = 0;
     uint8_t alive_mask = 0;
+    // Bit s is set only when the physical address of segment s was actually
+    // redirected to a published replacement; logical==physical is not a
+    // background-rebuild read.
+    uint8_t rebuilt_mask = 0;
     ec_read_recovery::EcReadPlan plan;
     // EC-split stores one large object as four data fragments plus two parity
     // fragments.  For this mode byte_count in the read context is the
@@ -94,18 +98,14 @@ inline int ConcurrentArrayCache::ec_recovery_endpoint_for_qp_num(
     uint32_t qp_num) const {
     auto *control = rdma::ClientControl::get_default();
     if (control == nullptr) return -1;
-    // One endpoint owns a contiguous array of data QPs (one per thread and
-    // qp_count); its length is the one ClientControl built it with.  The
-    // accessor for it is private, so it is recomputed from the same config
-    // fields (client.cpp: data_qp_count).
-    const auto &config = ::FarLib::get_config();
-    size_t qp_total = config.max_thread_cnt + 1;
-    if (config.enable_eager_evict) qp_total += config.evacuate_thread_cnt;
-    qp_total *= static_cast<size_t>(config.qp_count);
+    // Use the actual connection array length. Carbink has extra logical
+    // clients for compaction and eviction; the old max_thread+evacuate
+    // formula omitted their QPs and silently missed write-side failures.
     const size_t endpoints = control->get_server_count();
     for (size_t endpoint = 0; endpoint < endpoints; endpoint++) {
         rdma::QueuePair *qps = control->get_endpoint_data_qps_ptr(endpoint);
         if (qps == nullptr) continue;
+        const size_t qp_total = control->endpoint_data_qp_count(endpoint);
         for (size_t qp = 0; qp < qp_total; qp++) {
             if (qps[qp].queue_pair == nullptr) continue;
             if (qps[qp].queue_pair->qp_num == qp_num) {
@@ -137,11 +137,19 @@ inline void ConcurrentArrayCache::note_ec_recovery_error_wc(const ibv_wc &wc) {
             remote_allocator.small_object_stripe_manager().mark_endpoint_dead(
                 static_cast<size_t>(endpoint_idx));
             ec_recovery_dead_endpoints_.fetch_add(1, std::memory_order_relaxed);
-            std::cerr << "INFO: ec_recovery endpoint_dead endpoint="
-                      << endpoint_idx << " qp_num=" << wc.qp_num
-                      << " wc_status=" << wc.status << " wr_id=" << wc.wr_id
-                      << " monotonic_ns=" << endpoint_dead_ns
-                      << std::endl;
+            if (::FarLib::get_config().ft_background_rebuild) {
+                int none = -1;
+                background_rebuild_failed_endpoint_.compare_exchange_strong(
+                    none, endpoint_idx, std::memory_order_acq_rel);
+                uthread::notify_all(&background_rebuild_cond_,
+                                    &background_rebuild_mutex_);
+            }
+            std::ostringstream endpoint_line;
+            endpoint_line << "INFO: ec_recovery endpoint_dead endpoint="
+                          << endpoint_idx << " qp_num=" << wc.qp_num
+                          << " wc_status=" << wc.status << " wr_id=" << wc.wr_id
+                          << " monotonic_ns=" << endpoint_dead_ns;
+            std::cerr << endpoint_line.str() << std::endl;
         }
     } else if (endpoint_idx < 0) {
         static std::atomic<int> unmapped_qp_log{0};
@@ -249,6 +257,19 @@ inline bool ConcurrentArrayCache::ec_recovery_group_view(
          view.group.segments[0].addr != remote_addr)) {
         return false;  // split identity is always the data-0 anchor
     }
+    if (config.ft_background_rebuild) {
+        // Logical identities were checked above. Only the physical I/O view
+        // changes; object pointers and allocator reverse bindings stay fixed.
+        for (size_t s = 0; s < ec_read_recovery::kEcReadSegmentCount; ++s) {
+            auto &seg = view.group.segments[s];
+            const auto physical = stripe_manager.resolve_rebuilt_addr(
+                view.group.id.stripe_id, static_cast<uint8_t>(s), seg.addr);
+            if (physical == seg.addr) continue;
+            seg.addr = physical;
+            seg.endpoint_idx = config.map_remote_addr(physical).first;
+            view.rebuilt_mask |= static_cast<uint8_t>(1u << s);
+        }
+    }
     uint32_t endpoints[ec_read_recovery::kEcReadSegmentCount];
     for (size_t segment = 0; segment < ec_read_recovery::kEcReadSegmentCount;
          segment++) {
@@ -269,6 +290,13 @@ inline bool ConcurrentArrayCache::ec_recovery_group_view(
         });
     view.plan = ec_read_recovery::make_ec_read_plan(
         view.alive_mask, split_object ? static_cast<uint8_t>(0) : own_shard);
+    if ((view.rebuilt_mask & static_cast<uint8_t>(1u << own_shard)) != 0 &&
+        !split_object && view.plan.own_shard_alive) {
+        // Read the published replacement directly. Keep the recovery token
+        // and logical entry address unchanged; only the physical segment is
+        // redirected.
+        view.plan.read_mask = static_cast<uint8_t>(1u << own_shard);
+    }
     view.split_object = split_object;
     view.fragment_bytes = fragment_bytes;
     view.object_bytes = byte_count;
@@ -277,7 +305,9 @@ inline bool ConcurrentArrayCache::ec_recovery_group_view(
     // reconstructed into its logical payload even when data-0 is healthy, so
     // its four-read plan is valid for every recoverable survivor set.
     view.valid = view.plan.usable &&
-                 (split_object || view.plan.own_shard_missing);
+                 (split_object || view.plan.own_shard_missing ||
+                  (view.rebuilt_mask &
+                   static_cast<uint8_t>(1u << own_shard)) != 0);
     *view_out = view;
     return view.valid;
 }
@@ -503,8 +533,10 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
     bool all_posted = true;
     constexpr uint8_t kAllSegments = static_cast<uint8_t>(
         (1u << ec_read_recovery::kEcReadSegmentCount) - 1u);
+    const bool repaired_read = !view.split_object &&
+        view.plan.read_mask == static_cast<uint8_t>(1u << view.own_shard_idx);
     const bool degraded_round =
-        !view.split_object || view.alive_mask != kAllSegments;
+        !repaired_read && (!view.split_object || view.alive_mask != kAllSegments);
     {
         EcRecoveryProfile::ScopedTimer timer(
             ec_recovery_profile(), EcRecoveryProfile::Stage::kSegmentPostMark);
@@ -540,6 +572,12 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
                 uthread::yield();
             }
             if (!all_posted) break;
+            if ((view.rebuilt_mask & static_cast<uint8_t>(1u << segment)) != 0) {
+                // Count only an accepted RDMA READ, never spare allocation or
+                // a logical address whose physical address was unchanged.
+                background_rebuild_redirected_reads_.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             if (degraded_round) {
                 ec_recovery_profile().note_accepted_survivor_segment(read_bytes);
             }
@@ -568,7 +606,7 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
         // remains the authoritative count for this path.
         profile_post_attempt.set_outcome(
             degraded_round ? Outcome::kPosted : Outcome::kUnknown);
-        if (!view.split_object) {
+        if (!repaired_read && !view.split_object) {
             ec_recovery_report_degraded_read(entry, view);
         }
     }
@@ -653,6 +691,8 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
     const uint32_t byte_count = token->byte_count;
     const uint8_t alive_mask = token->alive_mask;
     const uint8_t own_shard = token->own_shard_idx;
+    const bool repaired_read = !split_object &&
+        alive_mask == static_cast<uint8_t>(1u << own_shard);
     const uint64_t target = token->target_local_addr;
     const ec_batch::EcStagingGroupSlot scratch = token->scratch;
     void *dst = reinterpret_cast<void *>(static_cast<uintptr_t>(target));
@@ -737,7 +777,7 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
         // Runtime self-check of the rebuilt shard, after the safe publication
         // point; observation only, the bytes below are handed over whether it
         // passes or fails.
-        if (!split_object) ec_recovery_verify_rebuild(*token);
+        if (!split_object && !repaired_read) ec_recovery_verify_rebuild(*token);
     }
     // Return the scratch segment first; the token still pins the target, so no
     // second read of this object can start in between.
@@ -770,7 +810,7 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
             owner_entry->load_state(std::memory_order_acquire);
         const bool published = published_state.state == EntryState::LOCAL &&
                                owner_entry->local_addr() == dst;
-        if (published && (!split_object || split_degraded)) {
+        if (published && !repaired_read && (!split_object || split_degraded)) {
             ec_recovery_rebuilds_.fetch_add(1, std::memory_order_relaxed);
             ec_recovery_profile().note_winner(event.profile_acquire_ns,
                                               byte_count);
@@ -785,7 +825,7 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
         // A healthy split read is a normal four-fragment fetch, not a fault
         // recovery event. Keep it out of the recovery window and recovered-
         // object counters; only a missing physical endpoint is degraded.
-        if (published && (!split_object || split_degraded)) {
+        if (published && !repaired_read && (!split_object || split_degraded)) {
             ec_recovery_profile().note_recovered_object(object_bytes);
         }
     }

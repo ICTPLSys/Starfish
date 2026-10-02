@@ -308,10 +308,12 @@ retry:
             // The object is staged only after the EVICTING transition, so the
             // entry already owns its write reference before the group that
             // contains it can be posted.
+            bool snapshot_canceled = false;
             const bool ec_batch_grouped =
                 ec_batch_candidate &&
                 stage_ec_batch_object(block->get_object_ptr(), obj.size, entry,
-                                      behavior_group, buffer_set.hydra_owner_id);
+                                      behavior_group, buffer_set.hydra_owner_id,
+                                      &snapshot_canceled);
             // Diagnostics only: candidate true, but staging/grouping failed.
             if (ec_batch_candidate && !ec_batch_grouped) {
                 ec_diag_stage_failed_.fetch_add(1, std::memory_order_relaxed);
@@ -325,7 +327,8 @@ retry:
                 // through the allocator, exactly as in the dirty branch below; a
                 // candidate never allocates a flat slot before this point, so
                 // remote_addr is either that old copy or unset.
-                if (remote_addr != FarObjectEntry::RemoteAddrInvalid48) {
+                if (!snapshot_canceled &&
+                    remote_addr != FarObjectEntry::RemoteAddrInvalid48) {
                     remote_allocator.deallocate(remote_addr);
                 }
             } else if (!ec_batch_candidate &&
@@ -451,10 +454,12 @@ retry:
                     ec_candidate_true_.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            bool snapshot_canceled = false;
             const bool ec_batch_grouped =
                 ec_batch_candidate &&
                 stage_ec_batch_object(block->get_object_ptr(), obj.size, entry,
-                                      behavior_group, buffer_set.hydra_owner_id);
+                                      behavior_group, buffer_set.hydra_owner_id,
+                                      &snapshot_canceled);
             if (ec_batch_candidate && !ec_batch_grouped) {
                 ec_diag_stage_failed_.fetch_add(1, std::memory_order_relaxed);
                 ERROR("ec_batch: candidate staging failed; refusing flat fallback");
@@ -468,7 +473,8 @@ retry:
                 // goes back only once its last live object is gone), a plain
                 // slot goes through mark_dead().  No allocator metadata is
                 // touched here.
-                if (remote_addr != FarObjectEntry::RemoteAddrInvalid48) {
+                if (!snapshot_canceled &&
+                    remote_addr != FarObjectEntry::RemoteAddrInvalid48) {
                     remote_allocator.deallocate(remote_addr);
                 }
             } else if (!ec_batch_candidate &&

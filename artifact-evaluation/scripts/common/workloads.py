@@ -175,6 +175,40 @@ def client_environment(app: str, site: dict, system: str = "nonft") -> dict[str,
             "FARLIB_FIBRE_HEAP": "1",
             "FARLIB_ALLOC_SCOPE_CHECKPOINT": "1",
         })
+        phase_metrics = site.get("mg_evac_phase_metrics", False)
+        if not isinstance(phase_metrics, bool):
+            raise ValueError("mg_evac_phase_metrics must be a boolean")
+        if phase_metrics:
+            env["FARLIB_EVAC_PHASE_METRICS"] = "1"
+        if "mg_evict_breakdown" in site:
+            breakdown = site["mg_evict_breakdown"]
+            if not isinstance(breakdown, bool):
+                raise ValueError("mg_evict_breakdown must be a boolean")
+            env["FARLIB_EVAC_BREAKDOWN"] = "1" if breakdown else "0"
+        # MG-only, explicit site overrides; no shared recipe defaults.
+        if system == "starfish":
+            env.update({
+                "FARLIB_EC_SPLIT_DIRECT_READ": "1",
+                "FARLIB_EC_SPLIT_DIRECT_WRITE": "1",
+                "FARLIB_EC_SPLIT_WRITE_BATCH": "32",
+                "FARLIB_EC_SPLIT_GROUP_BATCH": "8",
+            })
+        for suffix in ("DIRECT_READ", "DIRECT_WRITE", "GROUP_BATCH", "WRITE_BATCH"):
+            key = "mg_split_" + suffix.lower()
+            if key not in site:
+                continue
+            value = site[key]
+            if system != "starfish":
+                raise ValueError(f"{key} is only supported by Starfish")
+            if suffix.startswith("DIRECT_"):
+                if not isinstance(value, bool):
+                    raise ValueError(f"{key} must be a boolean")
+                value = int(value)
+            else:
+                maximum = 8 if suffix == "GROUP_BATCH" else 32
+                if type(value) is not int or value not in (0, maximum):
+                    raise ValueError(f"{key} must be 0 or {maximum}")
+            env["FARLIB_EC_SPLIT_" + suffix] = str(value)
     elif app == "wordcount":
         env.update({
             "FARLIB_WORDCOUNT_GLOBAL_MAP_SHIFT": "25",
@@ -233,6 +267,22 @@ def client_environment(app: str, site: dict, system: str = "nonft") -> dict[str,
             })
         if app in ("kv-b", "kv-a", "kv-s"):
             env["FARLIB_EC_BENCHMARK_PHASED"] = "1"
+            policy = site.get("starfish_kv_backup_policy", {
+                "backup_credits": True, "all_nonresident_backup": True,
+            })
+            if policy is not None:
+                fields = {"backup_credits", "all_nonresident_backup"}
+                if (not isinstance(policy, dict) or set(policy) != fields
+                        or any(type(value) is not bool for value in policy.values())):
+                    raise ValueError(
+                        "starfish_kv_backup_policy requires backup_credits and "
+                        "all_nonresident_backup booleans")
+                env.update({
+                    "FARLIB_EC_BEHAVIOR_ROUTING": "1",
+                    "FARLIB_BACKUP_COUNTER_BYPASS": "0",
+                    "FARLIB_BACKUP_CREDITS": str(int(policy["backup_credits"])),
+                    "FARLIB_ALL_NONRESIDENT_BACKUP": str(int(policy["all_nonresident_backup"])),
+                })
     elif system == "hydra":
         env.update(HYDRA_ENV)
         if app == "mg":
@@ -295,6 +345,16 @@ def client_environment(app: str, site: dict, system: str = "nonft") -> dict[str,
                 "remote_memory_observer_cpu must be a non-negative integer CPU index")
         env["FARLIB_REMOTE_MEMORY_SAMPLES"] = "1"
         env["FARLIB_REMOTE_MEMORY_OBSERVER_CPU"] = str(int(observer_cpu))
+        env["FARLIB_REMOTE_MEMORY_SAMPLING_PROFILE"] = (
+            "bfs_work_3s" if app == "bfs" else "work_10_20_30_40_50s")
+        origin = site.get("remote_memory_work_origin",
+                          "kvs_request_start" if app in ("kv-b", "kv-a", "kv-s")
+                          else "profile_start_work")
+        if origin not in ("profile_start_work", "kvs_request_start"):
+            raise ValueError("unsupported remote-memory Work origin")
+        if origin == "kvs_request_start" and app not in ("kv-b", "kv-a", "kv-s"):
+            raise ValueError("kvs_request_start is only valid for KV workloads")
+        env["FARLIB_REMOTE_MEMORY_WORK_ORIGIN"] = origin
     return env
 
 
@@ -572,6 +632,73 @@ def _count(fields: dict[str, str], name: str) -> int:
     return value
 
 
+_ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_STARTUP_MARKER = "kvs_lock_wait_scope_yield"
+_STARTUP_NORMAL = re.compile(
+    r"^(?:1)?" + re.escape(_STARTUP_MARKER)
+    + r"[ \t]+enabled=([0-9]+)"
+    + r"(?:[ \t]+mark_workers=[0-9]+[ \t]+evict_workers=[0-9]+)?"
+    + r"[ \t]*$")
+_STARTUP_SPLIT = re.compile(
+    r"^(?:1)?" + re.escape(_STARTUP_MARKER)
+    + r"[ \t]+enabled=runtime\.exclusive_owned_batch=1[ \t]*$")
+_STARTUP_SPLIT_CONTINUATION = re.compile(
+    r"^1[ \t]+mark_workers=[0-9]+[ \t]+evict_workers=[0-9]+[ \t]*$")
+
+
+def _localized_startup_line(line: str) -> str:
+    """Remove only CSI escapes from one startup-diagnostic line."""
+    return _ANSI_CSI.sub("", line).strip()
+
+
+def _validate_nonft_kv_startup(log: str) -> None:
+    """Require one unambiguous enabled=1 startup diagnostic.
+
+    The runtime's stdout can prefix the marker with one numeric character or
+    split the known exclusive-owned-batch record across two lines. Treat every
+    line containing the marker as evidence: malformed, disabled, duplicate,
+    or contradictory records must not be hidden by a later valid record.
+    """
+    evidence = 0
+    disabled = 0
+    malformed = 0
+    lines = log.splitlines()
+    index = 0
+    while index < len(lines):
+        line = _localized_startup_line(lines[index])
+        if _STARTUP_MARKER not in line:
+            index += 1
+            continue
+        normal = _STARTUP_NORMAL.fullmatch(line)
+        if normal is not None:
+            evidence += 1
+            if normal.group(1) != "1":
+                disabled += 1
+            index += 1
+            continue
+        split = _STARTUP_SPLIT.fullmatch(line)
+        if split is not None:
+            continuation = (_localized_startup_line(lines[index + 1])
+                            if index + 1 < len(lines) else "")
+            if _STARTUP_SPLIT_CONTINUATION.fullmatch(continuation) is None:
+                malformed += 1
+                index += 1
+                continue
+            evidence += 1
+            index += 2
+            continue
+        malformed += 1
+        index += 1
+
+    label = "Non-FT KV lock-wait scope handoff"
+    if malformed:
+        raise ValueError(f"{label}: malformed marker")
+    if disabled:
+        raise ValueError(f"{label}: enabled value must be exactly 1")
+    if evidence != 1:
+        raise ValueError(f"{label}: expected exactly one marker, found {evidence}")
+
+
 def validate_nonft_kv(log: str, *, expected_workers: int) -> dict:
     # Only an enabled runtime prints the shutdown scope inventory. This also
     # tolerates startup messages interleaved with the background worker log.
@@ -580,10 +707,7 @@ def validate_nonft_kv(log: str, *, expected_workers: int) -> dict:
     registered, v0, v1 = map(int, end.groups())
     if registered != expected_workers or v0 != 0 or v1 != 0:
         raise ValueError("Non-FT KV scope inventory or cleanup differs")
-    _one(log, r"\bkvs_lock_wait_scope_yield enabled="
-         r"(?:1(?=\s|$)|runtime\.exclusive_owned_batch=1\n"
-         r"1 mark_workers=\d+ evict_workers=\d+)",
-         "Non-FT KV lock-wait scope handoff")
+    _validate_nonft_kv_startup(log)
     if re.search(r"\bkvs_scope_shards\b[^\n]*\bsupported=0\b", log):
         raise ValueError("Non-FT KV binary lacks scope-counter sharding")
     return {"status": "passed", "scope_counter_shards": True,

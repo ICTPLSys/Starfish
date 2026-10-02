@@ -685,6 +685,12 @@ retry:
 }
 
 inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
+    // Dispatch private repair tags before any ordinary pointer/WR handler.
+    if (ec_background::is_wr_id(wc.wr_id)) [[unlikely]] {
+        if (!handle_background_rebuild_complete(wc))
+            ERROR("ec_background_rebuild: unowned completion");
+        return;
+    }
     if (wc.status != IBV_WC_SUCCESS) {
         // EC (ft_method=ec_batch) read-side recovery: a failed completion is
         // how an endpoint that went away announces itself.  Remember it before

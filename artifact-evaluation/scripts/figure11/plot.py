@@ -103,6 +103,14 @@ def prepare_logs(logs_root: Path, *, pattern="*.log", ratio=25, repeat=1,
 
 
 def _validate_measured(row, system, component):
+    if system == "nonft" and (
+            row.get("off_policy") != "backup_and_resident_off"
+            or str(row.get("local_resident_budget_bytes")) != "0"):
+        raise ValueError("formal Figure 11 NonFT requires verified backup+resident OFF")
+    if component != "remote_cpu_cores" and (
+            row.get("normalizer_off_policy") != "backup_and_resident_off"
+            or str(row.get("normalizer_resident_budget_bytes")) != "0"):
+        raise ValueError("formal Figure 11 normalization requires backup+resident OFF")
     if system == "nonft":
         if (row.get("baseline_variant") != "nonft-backup-off"
                 or log_contract.backup_flag(row.get("backup_enabled"))):
@@ -121,20 +129,75 @@ def _validate_measured(row, system, component):
     if row.get("aggregation") != expected_aggregation:
         raise ValueError(f"{component} requires aggregation={expected_aggregation}")
     if component == "remote_memory":
-        if (str(row.get("samples")) not in ("1", "2", "3", "4", "5")
-                or row.get("sampling") != log_contract.REMOTE_MEMORY_SAMPLING
+        workload_key = log_contract.ALIASES.get(
+            str(row.get("workload", "")).lower(),
+            str(row.get("workload", "")).lower(),
+        )
+        profile = log_contract.memory_profile(workload_key)
+        if (str(row.get("samples")) not in
+                {str(index) for index in range(1, profile["expected_samples"] + 1)}
+                or row.get("sampling") != profile["sampling"]
+                or row.get("window") != log_contract.REMOTE_MEMORY_WINDOW
+                or row.get("origin") != profile["origin"]
                 or row.get("metric") != log_contract.MEMORY_METRICS[system]):
-            raise ValueError("remote memory requires 1..5 benchmark-time samples")
+            raise ValueError(
+                "remote memory requires Work-start samples for the workload profile"
+            )
+        for field in (
+                "work_window_id", "end_monotonic_ns", "scheduled_samples",
+                "missing_samples", "expected_samples", "work_duration_ns"):
+            if field not in row or row[field] in (None, ""):
+                raise ValueError(f"remote memory is missing {field}")
+        scheduled_count = int(row["scheduled_samples"])
+        missing_count = int(row["missing_samples"])
+        expected_count = int(row["expected_samples"])
+        sample_count = int(row["samples"])
+        end_status = row.get("end_status")
+        if end_status in log_contract.REMOTE_MEMORY_REJECTED_END_STATUSES:
+            raise ValueError(
+                f"remote memory end_status={end_status} cannot enter formal Figure 11"
+            )
+        if end_status not in log_contract.REMOTE_MEMORY_GOOD_END_STATUSES:
+            raise ValueError("remote memory requires a supported end_status")
+        if (expected_count != profile["expected_samples"]
+                or sample_count + missing_count != scheduled_count
+                or scheduled_count > expected_count
+                or int(row["work_duration_ns"]) <= 0):
+            raise ValueError("remote memory Work sample/missing counts do not close")
+        duration_ns = int(row["work_duration_ns"])
+        due = sum(point * 1_000_000_000 <= duration_ns
+                  for point in profile["points"])
+        if scheduled_count != due:
+            raise ValueError("remote memory scheduled points disagree with Work duration")
+        if end_status == "complete":
+            if scheduled_count != expected_count or sample_count != expected_count:
+                raise ValueError(
+                    "remote memory end_status=complete disagrees with profile counts"
+                )
+        elif scheduled_count <= 0 or sample_count >= expected_count:
+            raise ValueError(
+                "remote memory end_status=partial-work disagrees with profile counts"
+            )
         scheduled = log_contract._sample_times(
             row.get("scheduled_times_s"), "scheduled_times_s")
         observed = log_contract._sample_times(
             row.get("sample_times_s"), "sample_times_s")
-        if (len(scheduled) != int(row["samples"]) or len(observed) != int(row["samples"])
-                or scheduled != sorted(set(scheduled))
-                or any(t not in (10, 20, 30, 40, 50) for t in scheduled)
+        missing_value = row.get("missing_times_s", "")
+        missing = (log_contract._sample_times(missing_value, "missing_times_s")
+                   if missing_count else [])
+        allowed = profile["points"][:scheduled_count]
+        successful_targets = [target for target in allowed if target not in missing]
+        if (len(scheduled) != scheduled_count
+                or len(observed) != sample_count
+                or len(missing) != missing_count
+                or scheduled != list(allowed)
+                or any(value not in allowed for value in missing)
+                or len(set(missing)) != len(missing)
                 or observed != sorted(set(observed))
-                or any(actual < target for actual, target in zip(observed, scheduled))):
-            raise ValueError("invalid scheduled/observed memory sample times")
+                or any(actual > duration_ns / 1e9 + 1e-6 for actual in observed)
+                or any(actual < target
+                       for actual, target in zip(observed, successful_targets))):
+            raise ValueError("invalid Work-start memory sample/missing times")
     for key in ("run_id", "environment", "workload_id"):
         if not row.get(key):
             raise ValueError(f"measured row is missing {key}")
@@ -211,7 +274,7 @@ def panel_axis(max_value):
     if max_value <= 2:
         return (0, 2), [0, 1, 2]
     if max_value <= 3:
-        return (0, 3), [0, 1.5, 3]
+        return (0, 3), [0, 1, 2, 3]
     if max_value <= 4:
         return (0, 4), [0, 2, 4]
     if max_value <= 8:
@@ -220,7 +283,8 @@ def panel_axis(max_value):
         return (0, 16), [0, 8, 16]
     if max_value <= 45:
         return (0, 45), [0, 20, 40]
-    return (0, max_value * 1.15), [0, max_value * 0.5, max_value]
+    upper = int(math.ceil(max_value / 10.0) * 10)
+    return (0, upper), [0, upper // 2, upper]
 
 
 def blend_color(color, amount=0.62):

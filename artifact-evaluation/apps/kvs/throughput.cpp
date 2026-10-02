@@ -24,6 +24,9 @@
 #include <vector>
 
 #include "latency_mode.hpp"
+#include "logging.hpp"
+#include "../../runtime/common/benchmark_memory.hpp"
+#include "completion_series.hpp"
 #include "async/stream_runner.hpp"
 #include "cache/cache.hpp"
 #include "data_structure/concurrent_hashmap.hpp"
@@ -47,7 +50,6 @@ using namespace FarLib;
 using namespace FarLib::rdma;
 using namespace std::chrono_literals;
 
-#define DISPLAY_PROGRESS
 #define ENABLE_BENCHMARK
 
 #ifndef FARLIB_KVS_OBJECT_BYTES
@@ -249,9 +251,9 @@ public:
           remote_hash_table(DataSizeShift) {
         const auto audit = rank_to_id->audit();
         ASSERT(audit.valid() && audit.unique_count == initial_data_count());
-        std::cout << "kvs_rank_permutation size=" << rank_to_id->size()
-                  << " seed=" << KVSDefaultSeed
-                  << " checksum=" << audit.checksum << std::endl;
+        kvs_logging::write_record(stdout, "kvs_rank_permutation size=",
+                                  rank_to_id->size(), " seed=", KVSDefaultSeed,
+                                  " checksum=", audit.checksum);
         init_data();
     }
 
@@ -272,15 +274,11 @@ public:
     }
 
     void print_phase_counts(const char* name, const Receipt& receipt) const {
-        std::cout << "kvs_hotset_phases name="
-                  << (name == nullptr ? "unknown" : name)
-                  << " phase_a_requests="
-                  << receipt.phase_a
-                  << " phase_b_requests="
-                  << receipt.phase_b
-                  << " request_fingerprint="
-                  << receipt.fingerprint
-                  << std::endl;
+        kvs_logging::write_record(
+            stdout, "kvs_hotset_phases name=",
+            (name == nullptr ? "unknown" : name), " phase_a_requests=",
+            receipt.phase_a, " phase_b_requests=", receipt.phase_b,
+            " request_fingerprint=", receipt.fingerprint);
     }
 
     void verify_mutating_values(size_t requested_samples) {
@@ -293,8 +291,8 @@ public:
             ASSERT(remote_hash_table.get(data[idx].first, &value, scope));
             ASSERT(valid_versioned_value(value, data[idx].second));
         }
-        std::cout << "kvs_post_verify checked=" << samples
-                  << " failures=0" << std::endl;
+        kvs_logging::write_record(stdout, "kvs_post_verify checked=", samples,
+                                  " failures=0");
     }
 
     uint64_t gen_requests(Server& server, const Config& config, size_t qi);
@@ -304,6 +302,8 @@ public:
                                    size_t qi_end);
 
     void run_direct(const Config& config, size_t fibres, bool miss_yield);
+    template<bool RecordCompletions>
+    void run_direct_observed(const Config& config, size_t fibres, bool miss_yield);
 
     bool run_latency(const Config& config, size_t fibres,
                      const LatencyOptions& options);
@@ -314,14 +314,17 @@ public:
 private:
     void init_data() {
         const size_t initial_count = initial_data_count();
-        std::cout << "Initialize: loading " << initial_count << " K-V pairs"
-                  << std::endl;
+        const bool verbose = kvs_logging::verbose_enabled();
+        if (verbose)
+            kvs_logging::write_record(stdout, "Initialize: loading ",
+                                      initial_count, " K-V pairs");
         data.reserve(initial_count);
         local_hash_table.reserve(initial_count);
-#ifdef DISPLAY_PROGRESS
-        std::cout << "Loading Data..." << std::endl;
-        boost::timer::progress_display progress(initial_count);
-#endif
+        std::optional<boost::timer::progress_display> progress;
+        if (verbose) {
+            kvs_logging::write_record(stdout, "Loading Data...");
+            progress.emplace(initial_count);
+        }
         RootDereferenceScope scope;
         for (size_t i = 0; i < initial_count; i++) {
             str_key_t key = str_key_t::random();
@@ -335,9 +338,7 @@ private:
             if constexpr (EnableLocalBench) {
                 local_hash_table[key] = stored_value;
             }
-#ifdef DISPLAY_PROGRESS
-            ++progress;
-#endif
+            if (progress) ++*progress;
         }
     }
 
@@ -852,8 +853,8 @@ uint64_t Workload::gen_requests(Server& server, const Config& config,
         if (phase_b) {
             idx = (idx + config.hotset_shift_offset) % data.size();
             if (!phase_b_announced.test_and_set(std::memory_order_relaxed)) {
-                std::cout << "kvs_hotset_shift phase=B offset="
-                          << config.hotset_shift_offset << std::endl;
+                kvs_logging::write_record(stdout, "kvs_hotset_shift phase=B offset=",
+                                          config.hotset_shift_offset);
             }
         }
         ASSERT(idx >= 0 && idx < data.size());
@@ -923,8 +924,8 @@ Workload::Receipt Workload::gen_requests_max_speed(
             idx = (idx + config.hotset_shift_offset) % data.size();
             ++receipt.phase_b;
             if (!phase_b_announced.test_and_set(std::memory_order_relaxed)) {
-                std::cout << "kvs_hotset_shift phase=B offset="
-                          << config.hotset_shift_offset << std::endl;
+                kvs_logging::write_record(stdout, "kvs_hotset_shift phase=B offset=",
+                                          config.hotset_shift_offset);
             }
         } else {
             ++receipt.phase_a;
@@ -1020,16 +1021,16 @@ void run(const char* name, Server* server, Workload* workload,
                     break;
                 }
                 Cache::get_default()->publish_resident_group_plan_now();
-                std::cout << "kvs_manual_replan tick=" << ++tick
-                          << std::endl;
+                kvs_logging::write_verbose_record(stdout, "kvs_manual_replan tick=",
+                                                  ++tick);
             }
         });
     }
     const uint64_t request_start_ns = steady_time_ns();
-    std::cout << "kvs_phase name=" << (name == nullptr ? "unknown" : name)
-              << " event=request_start monotonic_ns=" << request_start_ns
-              << " runtime_limit_ns=" << config.max_runtime.count()
-              << std::endl;
+    kvs_logging::write_record(
+        stdout, "kvs_phase name=", (name == nullptr ? "unknown" : name),
+        " event=request_start monotonic_ns=", request_start_ns,
+        " runtime_limit_ns=", config.max_runtime.count());
     auto perf_result = perf_profile([&] {
         uthread::fork_join(config.n_client_thread, gen_fn);
     });
@@ -1044,11 +1045,11 @@ void run(const char* name, Server* server, Workload* workload,
         total_receipt.fingerprint ^= receipt.fingerprint;
     }
     const uint64_t request_end_ns = steady_time_ns();
-    std::cout << "kvs_phase name=" << (name == nullptr ? "unknown" : name)
-              << " event=request_generation_end monotonic_ns="
-              << request_end_ns << " generated="
-              << total_receipt.total_generated() << " accepted="
-              << total_receipt.total_accepted() << std::endl;
+    kvs_logging::write_record(
+        stdout, "kvs_phase name=", (name == nullptr ? "unknown" : name),
+        " event=request_generation_end monotonic_ns=", request_end_ns,
+        " generated=", total_receipt.total_generated(), " accepted=",
+        total_receipt.total_accepted());
     replan_done.store(true, std::memory_order_release);
     if (replan_thread.joinable()) {
         replan_thread.join();
@@ -1060,24 +1061,23 @@ void run(const char* name, Server* server, Workload* workload,
     const auto completed = server->completed_counts();
     const uint64_t completed_total = server->completed_total();
     const uint64_t drain_end_ns = steady_time_ns();
-    std::cout << "kvs_phase name=" << (name == nullptr ? "unknown" : name)
-              << " event=request_drain_end monotonic_ns=" << drain_end_ns
-              << " completed=" << completed_total << std::endl;
-    std::cout << "kvs_receipt name="
-              << (name == nullptr ? "unknown" : name)
-              << " generated_get=" << total_receipt.generated[Workload::GET]
-              << " generated_put=" << total_receipt.generated[Workload::PUT]
-              << " generated_remove=" << total_receipt.generated[Workload::REMOVE]
-              << " accepted_get=" << total_receipt.accepted[Workload::GET]
-              << " accepted_put=" << total_receipt.accepted[Workload::PUT]
-              << " accepted_remove=" << total_receipt.accepted[Workload::REMOVE]
-              << " completed_get=" << completed[Workload::GET]
-              << " completed_put=" << completed[Workload::PUT]
-              << " completed_remove=" << completed[Workload::REMOVE]
-              << " accepted_equals_completed="
-              << (total_receipt.total_accepted() == completed_total)
-              << " request_fingerprint=" << total_receipt.fingerprint
-              << std::endl;
+    kvs_logging::write_record(
+        stdout, "kvs_phase name=", (name == nullptr ? "unknown" : name),
+        " event=request_drain_end monotonic_ns=", drain_end_ns,
+        " completed=", completed_total);
+    kvs_logging::write_record(
+        stdout, "kvs_receipt name=", (name == nullptr ? "unknown" : name),
+        " generated_get=", total_receipt.generated[Workload::GET],
+        " generated_put=", total_receipt.generated[Workload::PUT],
+        " generated_remove=", total_receipt.generated[Workload::REMOVE],
+        " accepted_get=", total_receipt.accepted[Workload::GET],
+        " accepted_put=", total_receipt.accepted[Workload::PUT],
+        " accepted_remove=", total_receipt.accepted[Workload::REMOVE],
+        " completed_get=", completed[Workload::GET], " completed_put=",
+        completed[Workload::PUT], " completed_remove=", completed[Workload::REMOVE],
+        " accepted_equals_completed=",
+        (total_receipt.total_accepted() == completed_total),
+        " request_fingerprint=", total_receipt.fingerprint);
     ASSERT(!config.drain_all_requests ||
            total_receipt.total_accepted() == completed_total);
     if (mutating_values_enabled() && config.remove_ratio == 0.0) {
@@ -1089,41 +1089,55 @@ void run(const char* name, Server* server, Workload* workload,
     workload->print_phase_counts(name, total_receipt);
     print_hist();
     if (name) {
-        std::cout << std::setw(ColumnWidth) << name;
-        std::cout << std::setw(ColumnWidth) << "max";
-        std::cout << std::setw(ColumnWidth) << perf_result.runtime_ms / 1e3;
-        std::cout << std::setw(ColumnWidth) << total_receipt.total_accepted();
-        std::cout << std::setw(ColumnWidth) << completed_total;
-        std::cout << std::setw(ColumnWidth) << perf_result.instructions;
-        std::cout << std::setw(ColumnWidth) << perf_result.l2_cache_miss;
-        std::cout << std::setw(ColumnWidth) << perf_result.l3_cache_miss;
-        std::cout << std::setw(ColumnWidth)
-                  << async::StreamRunnerProfiler::get_total_cycles();
-        std::cout << std::setw(ColumnWidth)
-                  << async::StreamRunnerProfiler::get_sched_cycles();
-        std::cout << std::setw(ColumnWidth) << profile::collect_mark_cycles();
-        std::cout << std::setw(ColumnWidth) << profile::collect_evict_cycles();
-        std::cout << std::endl;
+        std::ostringstream line;
+        // PerfResult::print() intentionally leaves cout's fixed formatting in
+        // place; preserve that state when moving this row to one fwrite.
+        line.copyfmt(std::cout);
+        line << std::setw(ColumnWidth) << name;
+        line << std::setw(ColumnWidth) << "max";
+        line << std::setw(ColumnWidth) << perf_result.runtime_ms / 1e3;
+        line << std::setw(ColumnWidth) << total_receipt.total_accepted();
+        line << std::setw(ColumnWidth) << completed_total;
+        line << std::setw(ColumnWidth) << perf_result.instructions;
+        line << std::setw(ColumnWidth) << perf_result.l2_cache_miss;
+        line << std::setw(ColumnWidth) << perf_result.l3_cache_miss;
+        line << std::setw(ColumnWidth)
+             << async::StreamRunnerProfiler::get_total_cycles();
+        line << std::setw(ColumnWidth)
+             << async::StreamRunnerProfiler::get_sched_cycles();
+        line << std::setw(ColumnWidth) << profile::collect_mark_cycles();
+        line << std::setw(ColumnWidth) << profile::collect_evict_cycles();
+        kvs_logging::write_record(stdout, line.str());
     }
 }
 
 void Workload::run_direct(const Config& config, size_t fibres, bool miss_yield) {
+    const bool record = kvs_observation::completion_series_enabled(
+        std::getenv("FARLIB_KVS_COMPLETION_SERIES"));
+    if (record) return run_direct_observed<true>(config, fibres, miss_yield);
+    return run_direct_observed<false>(config, fibres, miss_yield);
+}
+
+template<bool RecordCompletions>
+void Workload::run_direct_observed(const Config& config, size_t fibres, bool miss_yield) {
     ASSERT(fibres > 0 && fibres < (1ULL << 15));
     const char* lock_env = std::getenv("FARLIB_KVS_DEBUG_LOCKED_GET");
     const bool shared_get_lock = lock_env != nullptr && std::strtoull(lock_env, nullptr, 10) != 0;
-    std::cout << "kvs_get_lock enabled=" << shared_get_lock << std::endl;
-    std::cout << "kvs_deref_stats enabled=" << RemoteHashTable::deref_stats_enabled() << std::endl;
+    kvs_logging::write_record(stdout, "kvs_get_lock enabled=", shared_get_lock);
+    kvs_logging::write_record(stdout, "kvs_deref_stats enabled=",
+                              RemoteHashTable::deref_stats_enabled());
     RemoteHashTable::reset_deref_counts();
     const char* validate_env = std::getenv("FARLIB_KVS_VALIDATE_GET");
     const bool validate_get = validate_env == nullptr ||
         std::strtoull(validate_env, nullptr, 10) != 0;
-    std::cout << "kvs_validation_config get_content=" << validate_get
-              << " real_put=" << mutating_values_enabled() << std::endl;
+    kvs_logging::write_record(stdout, "kvs_validation_config get_content=",
+                              validate_get, " real_put=", mutating_values_enabled());
     const char* hist_env = std::getenv("FARLIB_KVS_HIST_SAMPLE_PERIOD");
     const uint64_t hist_period = hist_env == nullptr ? 1024 : std::strtoull(hist_env, nullptr, 10);
     ASSERT(hist_period == 1 || hist_period == 1024);
-    std::cout << "kvs_hist_sampling period=" << hist_period
-              << " selector=one_per_block_rotating_offset timestamps_only_when_selected=1" << std::endl;
+    kvs_logging::write_record(
+        stdout, "kvs_hist_sampling period=", hist_period,
+        " selector=one_per_block_rotating_offset timestamps_only_when_selected=1");
     init_hist();
     reset_phase_counts();
     std::vector<Receipt> receipts(fibres);
@@ -1133,12 +1147,24 @@ void Workload::run_direct(const Config& config, size_t fibres, bool miss_yield) 
     std::atomic_bool go{false};
     std::atomic<uint64_t> shared_start{0};
     std::atomic<uint64_t> shared_deadline{0};
-    std::cout << "kvs_direct_config fibres=" << fibres
-              << " miss_yield=" << miss_yield
-              << " fairness_yield_every=64 shared_deadline=1"
-              << " object_bytes=" << KVSObjectBytes
-              << " initial_count=" << data.size()
-              << " put_ratio=" << config.put_ratio << std::endl;
+    std::unique_ptr<kvs_observation::CompletionSeries> completion_series;
+    if constexpr (RecordCompletions) {
+        const char *cpu = std::getenv("FARLIB_KVS_COMPLETION_SERIES_CPU");
+        if (!cpu || !*cpu) ERROR("completion series requires an explicit observer CPU");
+        char *end = nullptr;
+        long number = std::strtol(cpu, &end, 10);
+        if (*end || number < 0 || number >= CPU_SETSIZE)
+            ERROR("invalid completion series CPU");
+        completion_series = std::make_unique<kvs_observation::CompletionSeries>(
+            fibres, static_cast<int>(number));
+        kvs_logging::write_record(
+            stdout, "kvs_completion_series enabled=1 interval_ms=100 collector_cpu=",
+            number, " file=kvs.completed-100ms.csv");
+    }
+    kvs_logging::write_record(
+        stdout, "kvs_direct_config fibres=", fibres, " miss_yield=", miss_yield,
+        " fairness_yield_every=64 shared_deadline=1 object_bytes=", KVSObjectBytes,
+        " initial_count=", data.size(), " put_ratio=", config.put_ratio);
     auto worker = [&](size_t tid) {
         auto random_engine = make_request_random_engine(config, tid);
         auto operation_engine = make_operation_random_engine(config, tid);
@@ -1160,9 +1186,11 @@ void Workload::run_direct(const Config& config, size_t fibres, bool miss_yield) 
             shared_start.store(start, std::memory_order_relaxed);
             shared_deadline.store(start + config.max_runtime.count(),
                                   std::memory_order_relaxed);
-            std::cout << "kvs_phase name=direct event=request_start monotonic_ns="
-                      << start << " runtime_limit_ns=" << config.max_runtime.count()
-                      << std::endl;
+            benchmark_memory::begin_work_at(start, "kvs_request_start");
+            if constexpr (RecordCompletions) completion_series->start(start);
+            kvs_logging::write_record(
+                stdout, "kvs_phase name=direct event=request_start monotonic_ns=",
+                start, " runtime_limit_ns=", config.max_runtime.count());
             go.store(true, std::memory_order_release);
         }
         while (!go.load(std::memory_order_acquire)) uthread::yield();
@@ -1235,6 +1263,8 @@ void Workload::run_direct(const Config& config, size_t fibres, bool miss_yield) 
             }
             ++done[op];
             ++operations;
+            if constexpr (RecordCompletions)
+                completion_series->publish(tid, operations);
             // Bound non-yielding local-hit streaks without retaining a scope.
             if ((operations & 63) == 0) uthread::yield();
         }
@@ -1243,6 +1273,7 @@ void Workload::run_direct(const Config& config, size_t fibres, bool miss_yield) 
     };
     uthread::fork_join(fibres, worker, "kvs_direct");
     const uint64_t end = steady_time_ns();
+    benchmark_memory::end_work_at(end, "kvs_request_start");
     Receipt total;
     std::array<uint64_t, 3> done{};
     uint64_t hist_selected_total = 0, hist_retained_total = 0;
@@ -1258,39 +1289,48 @@ void Workload::run_direct(const Config& config, size_t fibres, bool miss_yield) 
         total.fingerprint ^= receipts[tid].fingerprint;
         hist_selected_total += hist_counts[tid][0];
         hist_retained_total += hist_counts[tid][1];
-        std::cout << "kvs_hist_fibre id=" << tid << " operations=" << receipts[tid].total_accepted()
-                  << " selected=" << hist_counts[tid][0] << " retained=" << hist_counts[tid][1]
-                  << " dropped=" << hist_counts[tid][0] - hist_counts[tid][1] << std::endl;
-        std::cout << "kvs_direct_fibre id=" << tid
-                  << " completed=" << receipts[tid].total_accepted()
-                  << " completed_get=" << completed[tid][GET]
-                  << " completed_put=" << completed[tid][PUT] << std::endl;
+        kvs_logging::write_verbose_record(
+            stdout, "kvs_hist_fibre id=", tid, " operations=",
+            receipts[tid].total_accepted(), " selected=", hist_counts[tid][0],
+            " retained=", hist_counts[tid][1], " dropped=",
+            hist_counts[tid][0] - hist_counts[tid][1]);
+        kvs_logging::write_verbose_record(
+            stdout, "kvs_direct_fibre id=", tid, " completed=",
+            receipts[tid].total_accepted(), " completed_get=", completed[tid][GET],
+            " completed_put=", completed[tid][PUT]);
     }
     const uint64_t completed_total = done[GET] + done[PUT] + done[REMOVE];
-    std::cout << "kvs_phase name=direct event=request_generation_end monotonic_ns="
-              << end << " generated=" << total.total_generated()
-              << " accepted=" << total.total_accepted() << std::endl;
-    std::cout << "kvs_phase name=direct event=request_drain_end monotonic_ns="
-              << end << " completed=" << completed_total << std::endl;
-    std::cout << "kvs_receipt name=direct generated_get=" << total.generated[GET]
-              << " generated_put=" << total.generated[PUT]
-              << " generated_remove=" << total.generated[REMOVE]
-              << " accepted_get=" << total.accepted[GET]
-              << " accepted_put=" << total.accepted[PUT]
-              << " accepted_remove=" << total.accepted[REMOVE]
-              << " completed_get=" << done[GET] << " completed_put=" << done[PUT]
-              << " completed_remove=" << done[REMOVE]
-              << " accepted_equals_completed=" << (total.total_accepted() == completed_total)
-              << " request_fingerprint=" << total.fingerprint << std::endl;
+    if constexpr (RecordCompletions) {
+        completion_series->finish(end, completed_total);
+        completion_series->write("kvs.completed-100ms");
+    }
+    kvs_logging::write_record(
+        stdout, "kvs_phase name=direct event=request_generation_end monotonic_ns=",
+        end, " generated=", total.total_generated(), " accepted=",
+        total.total_accepted());
+    kvs_logging::write_record(
+        stdout, "kvs_phase name=direct event=request_drain_end monotonic_ns=", end,
+        " completed=", completed_total);
+    kvs_logging::write_record(
+        stdout, "kvs_receipt name=direct generated_get=", total.generated[GET],
+        " generated_put=", total.generated[PUT], " generated_remove=",
+        total.generated[REMOVE], " accepted_get=", total.accepted[GET],
+        " accepted_put=", total.accepted[PUT], " accepted_remove=",
+        total.accepted[REMOVE], " completed_get=", done[GET], " completed_put=",
+        done[PUT], " completed_remove=", done[REMOVE],
+        " accepted_equals_completed=", (total.total_accepted() == completed_total),
+        " request_fingerprint=", total.fingerprint);
     ASSERT(total.total_generated() == completed_total);
     ASSERT(!config.fixed_request_count || completed_total == config.max_serve_count);
     ASSERT(static_cast<uint64_t>(hist->total_count) == hist_retained_total);
-    std::cout << "kvs_hist_receipt period=" << hist_period << " operations=" << completed_total
-              << " selected=" << hist_selected_total << " retained=" << hist_retained_total
-              << " dropped=" << hist_selected_total - hist_retained_total
-              << " histogram_total=" << hist->total_count << std::endl;
-    std::cout << "kvs_deref_receipt local=" << RemoteHashTable::local_deref_count()
-              << " remote=" << RemoteHashTable::remote_deref_count() << std::endl;
+    kvs_logging::write_record(
+        stdout, "kvs_hist_receipt period=", hist_period, " operations=",
+        completed_total, " selected=", hist_selected_total, " retained=",
+        hist_retained_total, " dropped=", hist_selected_total - hist_retained_total,
+        " histogram_total=", hist->total_count);
+    kvs_logging::write_record(stdout, "kvs_deref_receipt local=",
+                              RemoteHashTable::local_deref_count(), " remote=",
+                              RemoteHashTable::remote_deref_count());
     if (mutating_values_enabled() && config.remove_ratio == 0.0) {
         const char* env = std::getenv("FARLIB_KVS_POST_VERIFY_SAMPLES");
         verify_mutating_values(env == nullptr ? 4096 : std::strtoull(env, nullptr, 0));
@@ -1659,48 +1699,52 @@ bool run(size_t n_server_core, const std::optional<LatencyOptions>& latency_opti
                          std::strcmp(execution_mode, "direct") == 0);
 
     if (!direct) {
-    std::cout << "setup: " << config.n_server_thread << " server cores; "
-              << config.n_client_thread << " clients" << std::endl;
+    kvs_logging::write_record(stdout, "setup: ", config.n_server_thread,
+                              " server cores; ", config.n_client_thread,
+                              " clients");
     } else if (latency_options) {
         latency_log("setup: open-loop KV; 48 independent FIFO logical lanes; "
                     "implicit backlog; no cross-lane stealing");
     } else {
-        std::cout << "setup: self-generated direct KV operations; no request queues"
-                  << std::endl;
+        kvs_logging::write_record(
+            stdout, "setup: self-generated direct KV operations; no request queues");
     }
-    std::cout << "kvs.object_bytes: " << KVSObjectBytes << std::endl;
-    std::cout << "kvs.put_ratio: " << config.put_ratio << std::endl;
-    std::cout << "kvs.remove_ratio: " << config.remove_ratio << std::endl;
-    std::cout << "kvs.zipfian: " << config.zipfian_constant << std::endl;
-    std::cout << "kvs.hotset_shift_ns: " << config.hotset_shift_ns
-              << " offset=" << config.hotset_shift_offset << std::endl;
-    std::cout << "kvs.random_seed: "
-              << (config.deterministic_random
-                      ? std::to_string(config.random_seed)
-                      : std::string("random_device"))
-              << std::endl;
-    std::cout << "kvs.fixed_request_count: "
-              << config.fixed_request_count << std::endl;
-    std::cout << "kvs.drain_all_requests: " << config.drain_all_requests
-              << " timeout_ns=" << config.drain_timeout_ns << std::endl;
-    std::cout << "kvs.mutating_values: " << mutating_values_enabled()
-              << " post_verify_default=4096" << std::endl;
+    kvs_logging::write_record(stdout, "kvs.object_bytes: ", KVSObjectBytes);
+    kvs_logging::write_record(stdout, "kvs.put_ratio: ", config.put_ratio);
+    kvs_logging::write_record(stdout, "kvs.remove_ratio: ", config.remove_ratio);
+    kvs_logging::write_record(stdout, "kvs.zipfian: ", config.zipfian_constant);
+    kvs_logging::write_record(stdout, "kvs.hotset_shift_ns: ", config.hotset_shift_ns,
+                              " offset=", config.hotset_shift_offset);
+    kvs_logging::write_record(
+        stdout, "kvs.random_seed: ",
+        (config.deterministic_random ? std::to_string(config.random_seed)
+                                     : std::string("random_device")));
+    kvs_logging::write_record(stdout, "kvs.fixed_request_count: ",
+                              config.fixed_request_count);
+    kvs_logging::write_record(stdout, "kvs.drain_all_requests: ",
+                              config.drain_all_requests,
+                              " timeout_ns=", config.drain_timeout_ns);
+    kvs_logging::write_record(stdout, "kvs.mutating_values: ",
+                              mutating_values_enabled(), " post_verify_default=4096");
     if (!direct) {
-    std::cout << "kvs.workers: total=" << config.n_server_thread +
-                     config.n_client_thread
-              << " generators=" << config.n_client_thread
-              << " sync_service_fibres=" << config.n_server_thread
-              << std::endl;
+    kvs_logging::write_record(
+        stdout, "kvs.workers: total=",
+        config.n_server_thread + config.n_client_thread,
+        " generators=", config.n_client_thread, " sync_service_fibres=",
+        config.n_server_thread);
     } else {
-        std::cout << "kvs.workers: scheduler=" << uthread::get_worker_count()
-                  << " generators=0 sync_service_fibres=0"
-                  << " operation_fibres_reported_in=kvs_direct_config" << std::endl;
+        kvs_logging::write_record(
+            stdout, "kvs.workers: scheduler=", uthread::get_worker_count(),
+            " generators=0 sync_service_fibres=0"
+            " operation_fibres_reported_in=kvs_direct_config");
     }
 
+    std::ostringstream column_header;
+    column_header.copyfmt(std::cout);
     for (auto name : ColumnNames) {
-        std::cout << std::setw(ColumnWidth) << name;
+        column_header << std::setw(ColumnWidth) << name;
     }
-    std::cout << std::endl;
+    kvs_logging::write_record(stdout, column_header.str());
 
     // warm up
 
@@ -1801,26 +1845,32 @@ int main(int argc, char* argv[]) {
     ASSERT(local_mem > 0);
     size_t n_server_core = config.max_thread_cnt / 3 * 2;
     config.client_buffer_size = local_mem * (1LL << 30);
-    std::cout << "config: client buffer size = " << config.client_buffer_size
-              << std::endl;
+    kvs_logging::write_record(stdout, "config: client buffer size = ",
+                              config.client_buffer_size);
     runtime_init(config);
 #ifndef FARLIB_KVS_NONFT_COMPAT
-    std::cout << "kvs_scope_shards enabled=" << Cache::get_default()->scope_counter_shards_enabled
-              << " max_shards=" << cache::ShardedScopeCounters::MaxShards
-              << " bytes_per_shard=" << sizeof(cache::ShardedScopeCounters::Shard) << std::endl;
-    std::cout << "kvs_lock_wait_scope_yield enabled="
-              << FarLib::detail::lock_wait_scope_yield_enabled() << std::endl;
+    kvs_logging::write_record(
+        stdout, "kvs_scope_shards enabled=",
+        Cache::get_default()->scope_counter_shards_enabled,
+        " max_shards=", cache::ShardedScopeCounters::MaxShards,
+        " bytes_per_shard=", sizeof(cache::ShardedScopeCounters::Shard));
+    kvs_logging::write_record(
+        stdout, "kvs_lock_wait_scope_yield enabled=",
+        FarLib::detail::lock_wait_scope_yield_enabled());
 #else
-    std::cout << "kvs_scope_shards enabled=0 supported=0" << std::endl;
-    std::cout << "kvs_lock_wait_scope_yield supported=0 legacy_check_memory_low=1" << std::endl;
+    kvs_logging::write_record(stdout, "kvs_scope_shards enabled=0 supported=0");
+    kvs_logging::write_record(
+        stdout, "kvs_lock_wait_scope_yield supported=0 legacy_check_memory_low=1");
 #endif
     const bool successful = run(n_server_core, latency_options);
 #ifndef FARLIB_KVS_NONFT_COMPAT
     if (Cache::get_default()->scope_counter_shards_enabled) {
         const auto v0 = Cache::get_default()->scope_counters.old_count(1);
         const auto v1 = Cache::get_default()->scope_counters.old_count(2);
-        std::cout << "kvs_scope_shards_end registered=" << cache::ShardedScopeCounters::registered_shards()
-                  << " v0=" << v0 << " v1=" << v1 << std::endl;
+        kvs_logging::write_record(
+            stdout, "kvs_scope_shards_end registered=",
+            cache::ShardedScopeCounters::registered_shards(), " v0=", v0,
+            " v1=", v1);
         ASSERT(v0 == 0 && v1 == 0);
     }
 #endif

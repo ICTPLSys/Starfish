@@ -259,6 +259,7 @@ void ClientControl::init_carbink_compact_transport() {
             payload_lkey);
     if (!carbink_compact_transport_->ready())
         ERROR("Carbink transport initial registration/ACK receives failed");
+    carbink_compact_transport_->enable_failure_recovery(config.ft_background_rebuild);
 }
 
 void ClientControl::release_sponge_rpc_resources() {

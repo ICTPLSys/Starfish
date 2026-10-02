@@ -853,8 +853,14 @@ inline bool suspend_work() {
     }
     return false;
 }
+
+inline void *benchmark_memory_observer_context = nullptr;
+inline void (*benchmark_memory_begin_observer)(void *) = nullptr;
+inline void (*benchmark_memory_end_observer)(void *) = nullptr;
 inline void start_work() {
     assert(!working);
+    if (benchmark_memory_begin_observer)
+        benchmark_memory_begin_observer(benchmark_memory_observer_context);
     ::FarLib::object_group_trace::phase_start();
     work_traffic::begin();
     runtime_ec_cpu::begin_work("carbink");
@@ -869,6 +875,8 @@ inline void end_work() {
     work_phase_active.store(false, std::memory_order_release);
     working = false;
     global_cycles = get_cycles() - global_start_cycles;
+    if (benchmark_memory_end_observer)
+        benchmark_memory_end_observer(benchmark_memory_observer_context);
     runtime_ec_cpu::end_work();
     work_traffic::print(work_traffic::end());
     ::FarLib::object_group_trace::phase_end();

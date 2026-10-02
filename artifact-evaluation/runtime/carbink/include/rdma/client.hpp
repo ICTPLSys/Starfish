@@ -440,6 +440,10 @@ public:
         return endpoint_qps[endpoint_idx].data_qps.get();
     }
 
+    size_t endpoint_data_qp_count(size_t endpoint_idx) const {
+        return get_endpoint_data_qp_count(endpoint_idx);
+    }
+
     CompleteQueue *get_endpoint_data_cqs_ptr(size_t endpoint_idx) const {
         if (endpoint_idx >= endpoint_qps.size()) {
             return nullptr;
@@ -483,8 +487,11 @@ public:
     }
 
     void mark_endpoint_dead(size_t endpoint_idx) {
-        if (endpoint_idx < server_count)
+        if (endpoint_idx < server_count) {
             endpoint_dead_[endpoint_idx].store(true, std::memory_order_release);
+            if (config.ft_background_rebuild && carbink_compact_transport_)
+                carbink_compact_transport_->mark_endpoint_failed(endpoint_idx);
+        }
     }
     
     const EndpointControl& get_endpoint(size_t idx) const {
@@ -1344,7 +1351,12 @@ public:
             return count;
         size_t out = 0;
         for (size_t i = 0; i < count; ++i)
-            if (!consume_carbink_completion(wc[i]))
+            // Recovery must observe the endpoint failure before transport
+            // retirement. The cache dispatch marks the endpoint and then
+            // consumes this hardware completion exactly once.
+            if ((control->config.ft_background_rebuild &&
+                 wc[i].status != IBV_WC_SUCCESS) ||
+                !consume_carbink_completion(wc[i]))
                 wc[out++] = wc[i];
         return out;
     }

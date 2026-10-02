@@ -762,6 +762,7 @@ private:
     // its live bitmap/objects remain valid for later deallocation.
     size_t endpoint_count_ = 0;
     int standby_endpoint_ = -1;
+    int standby_endpoint2_ = -1;
     bool endpoint_liveness_enabled_ = false;
     std::atomic<bool> endpoint_failure_seen_{false};
     std::unique_ptr<std::atomic<uint8_t>[]> endpoint_alive_;
@@ -849,6 +850,10 @@ public:
     // mode the methods intentionally report the legacy all-endpoints policy.
     size_t endpoint_count() const { return endpoint_count_; }
     int standby_endpoint() const { return standby_endpoint_; }
+    bool endpoint_is_standby(size_t endpoint) const {
+        return (standby_endpoint_ >= 0 && endpoint == static_cast<size_t>(standby_endpoint_)) ||
+               (standby_endpoint2_ >= 0 && endpoint == static_cast<size_t>(standby_endpoint2_));
+    }
     bool endpoint_liveness_enabled() const {
         return endpoint_liveness_enabled_;
     }
@@ -876,18 +881,15 @@ public:
         }
         if (!endpoint_is_alive(endpoint_idx)) return false;
         if (!endpoint_failure_seen_.load(std::memory_order_acquire) &&
-            standby_endpoint_ >= 0 &&
-            endpoint_idx == static_cast<size_t>(standby_endpoint_)) {
+            endpoint_is_standby(endpoint_idx)) {
             return false;
         }
         return true;
     }
 
     bool endpoint_waiting_for_activation(size_t endpoint_idx) const {
-        return endpoint_liveness_enabled_ && standby_endpoint_ >= 0 &&
-               static_cast<size_t>(standby_endpoint_) < endpoint_count_ &&
+        return endpoint_liveness_enabled_ && endpoint_is_standby(endpoint_idx) &&
                !endpoint_failure_seen_.load(std::memory_order_acquire) &&
-               endpoint_idx == static_cast<size_t>(standby_endpoint_) &&
                endpoint_is_alive(endpoint_idx);
     }
 
@@ -946,8 +948,7 @@ public:
     }
 
     void record_standby_allocation(size_t endpoint_idx, const char *path) {
-        if (!endpoint_liveness_enabled_ || standby_endpoint_ < 0 ||
-            endpoint_idx != static_cast<size_t>(standby_endpoint_)) {
+        if (!endpoint_liveness_enabled_ || !endpoint_is_standby(endpoint_idx)) {
             return;
         }
         const uint64_t count = standby_allocation_count_.fetch_add(
@@ -1030,6 +1031,16 @@ public:
         return server_used_bytes[endpoint_idx].load(std::memory_order::relaxed);
     }
 
+    std::vector<uint64_t> get_server_used_bytes_observer() const {
+        const size_t count = static_cast<size_t>(FarLib::get_config().server_count);
+        if (sharded_usage) return sharded_usage->snapshot_observer();
+        std::vector<uint64_t> result(count, 0);
+        if (server_used_bytes)
+            for (size_t i = 0; i < count; ++i)
+                result[i] = server_used_bytes[i].load(std::memory_order_relaxed);
+        return result;
+    }
+
     // init function
     // call only once per remote allocator
     void register_remote(size_t size) {
@@ -1050,6 +1061,7 @@ public:
         standby_endpoint_ = endpoint_liveness_enabled_
                                 ? config.ft_standby_endpoint
                                 : -1;
+        standby_endpoint2_ = endpoint_liveness_enabled_ ? config.ft_standby_endpoint2 : -1;
         endpoint_failure_seen_.store(false, std::memory_order_relaxed);
         standby_allocation_count_.store(0, std::memory_order_relaxed);
         standby_flat_allocation_count_.store(0, std::memory_order_relaxed);
@@ -1323,6 +1335,16 @@ public:
         }
         // 2) claim a fresh remote region and take one of its two shard units
         for (size_t tries = 0; tries < regions_size; tries++) {
+            // Recovery shares this mutex with compaction. Claims are
+            // monotonic for the lifetime of this heap; released shards go
+            // through ec_free_units above, never back to an unclaimed region.
+            // Once a Carbink endpoint has scanned the table, retrying an
+            // exhausted allocation must not rescan it while holding the
+            // global mutex and starve repair allocations on the spare.
+            if (config.ft_background_rebuild && config.is_carbink_mode() &&
+                ec_endpoint_cursor[endpoint_idx].load(
+                    std::memory_order_relaxed) >= regions_size)
+                return InvalidRemoteAddr;
             size_t cursor = ec_endpoint_cursor[endpoint_idx].fetch_add(
                 1, std::memory_order_relaxed);
             size_t idx = cursor % regions_size;

@@ -1,8 +1,8 @@
-"""Fail-closed adapter for historical Figure 11 run directories.
+"""Fail-closed adapter for Figure 11 run directories.
 
-The formal memory evidence is timed ``runtime_remote_memory`` (10/20/30/40/50
-seconds from benchmark start).  Legacy ``kvs_remote_memory`` request-progress
-records are rejected and never converted into the timed contract.
+The formal memory evidence is schema-v3 runtime_remote_memory sampled at
+10/20/30/40/50 seconds from the explicit profile Work start.  Program-start
+schema-v2 and legacy request-progress records are rejected and never converted.
 """
 
 from __future__ import annotations
@@ -24,8 +24,26 @@ except ImportError:
         import log_contract
 
 
-TIMED_SAMPLING = "benchmark_start_10_20_30_40_50s"
+TIMED_SCHEMA_VERSION = 3
+TIMED_SAMPLING = "work_start_10_20_30_40_50s"
 TIMED_POINTS = (10, 20, 30, 40, 50)
+TIMED_ORIGIN = "profile_start_work"
+TIMED_PROFILES = {
+    "bfs": {
+        "sampling": "work_start_3s",
+        "points": (3,),
+        "origin": "profile_start_work",
+    },
+    "default": {
+        "sampling": TIMED_SAMPLING,
+        "points": TIMED_POINTS,
+        "origin": "profile_start_work",
+    },
+}
+KVS_WORKLOADS = frozenset(("kv-a", "kv-b", "kv-s"))
+TIMED_GOOD_END_STATUSES = frozenset(("complete", "partial-work"))
+TIMED_REJECTED_END_STATUSES = frozenset(
+    ("short-work", "unsupported", "work-end-missing"))
 MEMORY_RESULTS = ("remote-memory-result.json", "memory-result.json")
 METADATA_NAMES = ("analysis.json", "result.json", "run-result.json",
                   "manifest.json", "plan.json")
@@ -37,6 +55,13 @@ FAILURE = frozenset(("fail", "failed", "failure", "error", "aborted",
 
 class _SkipRun(Exception):
     """A known failed attempt which should not poison a retry selection."""
+
+
+def _timed_profile(workload):
+    profile = TIMED_PROFILES["bfs" if workload == "bfs" else "default"]
+    if workload in KVS_WORKLOADS:
+        return {**profile, "origin": "kvs_request_start"}
+    return profile
 
 
 def _load(path: Path):
@@ -109,6 +134,74 @@ def _layers(documents):
         if isinstance(document.get("plan"), dict):
             result.append(document["plan"])
     return result
+
+
+def _named_documents(documents, files):
+    """Associate loaded metadata documents with their canonical filenames."""
+    # _documents() appends documents in the same fixed filename order used to
+    # populate ``files``.  Keeping the names here lets repeat provenance use
+    # only authoritative analysis/manifest/plan fields rather than arbitrary
+    # workload metadata layers.
+    return {name: document for name, document in zip(files, documents)}
+
+
+def _repeat_suffix(value, source):
+    """Return a positive trailing ``-rN`` index, or None if unindexed."""
+    if value is None:
+        return None
+    match = re.search(r"-r([0-9]+)$", str(value).strip())
+    if match is None:
+        return None
+    return _int(match.group(1), source, positive=True)
+
+
+def _observed_repeat(documents, files, layers, run_dir):
+    """Resolve the batch repeat without confusing workload repetitions.
+
+    New common-run metadata records an explicit positive ``repeat`` in the
+    analysis, manifest, and plan.  Older records have no such field, so their
+    anchored run-id/directory ``-rN`` suffix is the only safe inference.  A
+    legacy unindexed directory remains repeat one.  Application-level
+    ``repetitions`` and ``measured_repetitions`` are deliberately excluded.
+    """
+    named = _named_documents(documents, files)
+    candidates = []
+
+    def add(document, source):
+        if isinstance(document, dict) and "repeat" in document:
+            candidates.append((source, _int(
+                document["repeat"], source + ".repeat", positive=True)))
+
+    add(named.get("analysis.json"), "analysis.json")
+    manifest = named.get("manifest.json")
+    add(manifest, "manifest.json")
+    if isinstance(manifest, dict):
+        add(manifest.get("plan"), "manifest.plan")
+    add(named.get("plan.json"), "plan.json")
+
+    explicit_values = {value for _, value in candidates}
+    if len(explicit_values) > 1:
+        detail = ", ".join(f"{source}={value}" for source, value in candidates)
+        raise ValueError(f"repeat metadata disagrees: {run_dir} ({detail})")
+    explicit = next(iter(explicit_values), None)
+
+    run_id = _first(layers, "run_id", "run_name")
+    run_id_repeat = _repeat_suffix(run_id, "run_id repeat suffix")
+    directory_repeat = _repeat_suffix(run_dir.name, "directory repeat suffix")
+    if (run_id_repeat is not None and directory_repeat is not None
+            and run_id_repeat != directory_repeat):
+        raise ValueError(
+            f"run-id and directory repeat suffixes disagree: {run_dir} "
+            f"(run_id={run_id_repeat}, directory={directory_repeat})")
+    suffix_repeat = (run_id_repeat if run_id_repeat is not None
+                     else directory_repeat)
+    if explicit is not None:
+        if suffix_repeat is not None and explicit != suffix_repeat:
+            raise ValueError(
+                f"explicit repeat disagrees with run-id/directory suffix: {run_dir} "
+                f"(explicit={explicit}, suffix={suffix_repeat})")
+        return explicit
+    return 1 if suffix_repeat is None else suffix_repeat
 
 
 def _workload(value):
@@ -417,132 +510,341 @@ def _endpoint_sum(value, source, endpoint_count=None):
     return total
 
 
-def _timed_samples(samples, metric, system, source, endpoint_count=None,
-                   expected_origin=None, expected_end_metric=None):
-    if not isinstance(samples, list) or not 1 <= len(samples) <= 5:
-        raise ValueError(f"timed remote memory requires 1..5 samples: {source}")
+def _validate_end_status(status, scheduled_count, sample_count,
+                         missing_count, expected_count, source):
+    if status is None or not str(status).strip():
+        raise ValueError(f"runtime memory end status is missing: {source}")
+    status = str(status)
+    if status in TIMED_REJECTED_END_STATUSES:
+        raise ValueError(
+            f"runtime memory end status={status} cannot enter formal Figure 11: {source}"
+        )
+    if status not in TIMED_GOOD_END_STATUSES:
+        raise ValueError(
+            f"unsupported runtime memory end status={status}: {source}"
+        )
+    if status == "complete":
+        if (scheduled_count != expected_count or sample_count != expected_count):
+            raise ValueError(
+                f"runtime memory status=complete disagrees with scheduled/sample counts: {source}"
+            )
+    elif scheduled_count <= 0 or sample_count >= expected_count:
+        raise ValueError(
+            f"runtime memory status=partial-work disagrees with Work profile counts: {source}"
+        )
+    return status
+
+
+def _timed_samples(samples, missing, metric, system, source, endpoint_count,
+                   expected_origin, expected_end_metric, expected_window_id,
+                   end_ns, points, scheduled_count, expected_sampling,
+                   expected_origin_label):
+    if not isinstance(samples, list) or not 1 <= len(samples) <= len(points):
+        raise ValueError(
+            f"timed Work memory requires at least one successful sample: {source}"
+        )
     expected_metric = log_contract.MEMORY_METRICS[system]
     if metric != expected_metric:
         raise ValueError(f"{system} memory metric must be {expected_metric}: {source}")
-    normalized, scheduled, observed = [], [], []
-    previous_index = -1
-    for item in samples:
+    if expected_end_metric != expected_metric:
+        raise ValueError(f"timed memory end metric mismatch: {source}")
+    if not isinstance(missing, list):
+        raise ValueError(f"timed Work missing records are malformed: {source}")
+    if scheduled_count < 0 or scheduled_count > len(points):
+        raise ValueError(f"scheduled sample count is outside the profile: {source}")
+    if len(samples) + len(missing) != scheduled_count:
+        raise ValueError(
+            f"sample/missing count does not close scheduled Work points: {source}"
+        )
+    seen = set()
+    normalized, observed = [], []
+    duration_ns = end_ns - expected_origin
+    if duration_ns < 0:
+        raise ValueError(f"Work end precedes Work origin: {source}")
+
+    def common(item, label):
         if not isinstance(item, dict):
-            raise ValueError(f"malformed timed memory sample: {source}")
-        if str(item.get("schema_version")) != "2":
-            raise ValueError(f"timed memory sample schema is not 2: {source}")
-        if item.get("window") != TIMED_SAMPLING:
-            raise ValueError(f"timed memory sample window is wrong: {source}")
-        origin = _int(item.get("start_monotonic_ns"), "start_monotonic_ns")
-        if expected_origin is None:
-            expected_origin = origin
+            raise ValueError(f"malformed {label}: {source}")
+        if str(item.get("schema_version")) != str(TIMED_SCHEMA_VERSION):
+            raise ValueError(f"{label} schema is not 3; old program-start data is rejected: {source}")
+        if item.get("origin") != expected_origin_label:
+            raise ValueError(
+                f"{label} origin is not {expected_origin_label}: {source}"
+            )
+        if item.get("window") != expected_sampling:
+            raise ValueError(f"{label} Work window is wrong: {source}")
+        if item.get("sampling") != expected_sampling:
+            raise ValueError(f"{label} Work sampling is wrong: {source}")
+        origin = _int(item.get("start_monotonic_ns"), f"{label}.start_monotonic_ns")
         if origin != expected_origin:
-            raise ValueError(f"timed memory origins disagree: {source}")
+            raise ValueError(f"timed Work origins disagree: {source}")
+        window_id = _int(item.get("work_window_id"), f"{label}.work_window_id",
+                         positive=True)
+        if window_id != expected_window_id:
+            raise ValueError(f"multiple or inconsistent Work window ids: {source}")
+        index = _int(item.get("sample"), f"{label}.sample")
+        if index >= scheduled_count or index >= len(points):
+            raise ValueError(f"{label} sample is outside scheduled Work points: {source}")
+        point = _int(item.get("scheduled_elapsed_s"),
+                     f"{label}.scheduled_elapsed_s")
+        if point != points[index]:
+            raise ValueError(f"{label} schedule is wrong: {source}")
+        observed_elapsed = _float(item.get("observed_elapsed_s"),
+                                  f"{label}.observed_elapsed_s")
+        if observed_elapsed > duration_ns / 1e9 + 1e-6:
+            raise ValueError(f"{label} occurs after the true Work end: {source}")
+        if index in seen:
+            raise ValueError(f"duplicate sample/missing index: {source}")
+        seen.add(index)
+        return index, observed_elapsed
+
+    for item in samples:
+        index, actual = common(item, "timed sample")
+        if str(item.get("metric")) != expected_metric:
+            raise ValueError(f"timed memory sample metric mismatch: {source}")
         snapshot_start = _int(item.get("snapshot_start_monotonic_ns"),
                               "snapshot_start_monotonic_ns")
         snapshot_ns = _int(item.get("snapshot_ns"), "snapshot_ns")
-        if snapshot_start < origin:
-            raise ValueError(f"timed memory snapshot precedes benchmark start: {source}")
-        index = _int(item.get("sample"), "sample")
-        if index <= previous_index or index >= len(TIMED_POINTS):
-            raise ValueError(f"timed memory sample indexes are not increasing: {source}")
-        previous_index = index
-        point = _int(item.get("scheduled_elapsed_s"), "scheduled_elapsed_s")
-        if point != TIMED_POINTS[index]:
-            raise ValueError(f"timed memory schedule is wrong: {source}")
-        actual = _float(item.get("observed_elapsed_s"), "observed_elapsed_s")
-        if actual < point or (observed and actual < observed[-1]):
-            raise ValueError(f"timed memory observations are not monotonic: {source}")
-        elapsed_from_clock = (snapshot_start - origin) / 1e9
+        if snapshot_start < expected_origin or snapshot_start + snapshot_ns > end_ns:
+            raise ValueError(f"timed memory snapshot crosses Work end: {source}")
+        elapsed_from_clock = (snapshot_start - expected_origin) / 1e9
         if not math.isclose(actual, elapsed_from_clock, rel_tol=0.0, abs_tol=1e-6):
             raise ValueError(f"timed memory observed time disagrees with clock: {source}")
-        if str(item.get("metric")) != expected_metric:
-            raise ValueError(f"timed memory sample metric mismatch: {source}")
-        if expected_end_metric is not None and expected_end_metric != expected_metric:
-            raise ValueError(f"timed memory end metric mismatch: {source}")
         occupied = _int(item.get("occupied_bytes"), "occupied_bytes")
-        item_endpoint_count = _int(item.get("endpoint_count"), "endpoint_count", positive=True)
+        item_endpoint_count = _int(item.get("endpoint_count"), "endpoint_count",
+                                   positive=True)
         if endpoint_count is not None and item_endpoint_count != endpoint_count:
             raise ValueError(f"endpoint count disagrees with manifest: {source}")
         endpoint_total = _endpoint_sum(item.get("endpoint_bytes"), source,
                                        item_endpoint_count)
-        if endpoint_total is not None and endpoint_total != occupied:
+        if endpoint_total != occupied:
             raise ValueError(f"timed memory endpoint sum mismatch: {source}")
         normalized.append({"sample": index, "occupied_bytes": occupied})
-        scheduled.append(point)
-        observed.append(actual)
-    return (sum(item["occupied_bytes"] for item in normalized) / len(normalized),
-            scheduled, observed, normalized)
+        observed.append((index, actual))
+    for item in missing:
+        common(item, "timed missing")
+        status = str(item.get("status", ""))
+        if not status or status == "observer-error":
+            raise ValueError(f"timed Work missing record has invalid status: {source}")
+    if seen != set(range(scheduled_count)):
+        raise ValueError(f"scheduled Work points are not closed by samples/missing: {source}")
+    if not normalized:
+        raise ValueError(
+            f"work window shorter than first sample; missing data (samples=0, "
+            f"scheduled_samples={scheduled_count}): {source}"
+        )
+    normalized.sort(key=lambda item: item["sample"])
+    observed.sort()
+    return (
+        sum(item["occupied_bytes"] for item in normalized) / len(normalized),
+        [points[index] for index in range(scheduled_count)],
+        [actual for _, actual in observed],
+        normalized,
+        {
+            "origin": expected_origin_label,
+            "work_window_id": expected_window_id,
+            "end_monotonic_ns": end_ns,
+            "scheduled_samples": scheduled_count,
+            "samples": len(normalized),
+            "missing_samples": len(missing),
+            "expected_samples": len(points),
+            "work_duration_ns": duration_ns,
+            "missing_times_s": [
+                points[_int(item.get("sample"), "timed missing.sample")]
+                for item in missing
+            ],
+        },
+    )
 
 
-def _timed_log(log: str, system: str, run_dir: Path, endpoint_count=None):
+def _timed_log(log: str, system: str, run_dir: Path, endpoint_count=None,
+               workload=None):
+    profile = _timed_profile(workload)
+    points = profile["points"]
+    sampling = profile["sampling"]
+    origin_label = profile["origin"]
+    if re.search(r"^runtime_remote_memory(?:_end|_missing)?\b.*schema_version=2",
+                 log, re.M):
+        raise ValueError(
+            f"old program-start schema-v2 memory evidence is rejected; "
+            f"require schema-v3 Work-start data: {run_dir}"
+        )
     if re.search(r"^kvs_remote_memory(?:_end)?\b", log, re.M):
         raise ValueError(f"legacy request-progress memory evidence is not timed: {run_dir}")
-    for missing in re.findall(r"^runtime_remote_memory_missing\b.*$", log, re.M):
-        fields = _fields(missing)
-        if fields.get("status") not in ("missed-notready", "missed-late"):
-            raise ValueError(f"runtime memory observer failed: {run_dir}")
+    missing = re.findall(r"^runtime_remote_memory_missing\b.*$", log, re.M)
+    for line in missing:
+        fields = _fields(line)
+        if fields.get("schema_version") != str(TIMED_SCHEMA_VERSION):
+            raise ValueError(f"unsupported runtime memory missing schema: {run_dir}")
     lines = re.findall(r"^runtime_remote_memory\b.*$", log, re.M)
     ends = re.findall(r"^runtime_remote_memory_end\b.*$", log, re.M)
-    if not lines:
+    if not lines and not ends:
+        if "runtime_remote_memory" in log:
+            raise ValueError(
+                f"runtime Work memory records are not standalone lines or are missing: "
+                f"{run_dir}"
+            )
         return None
     if len(ends) != 1:
         raise ValueError(f"missing or duplicated timed memory end marker: {run_dir}")
     end = _fields(ends[0])
-    if end.get("schema_version") != "2" or end.get("sampling") != TIMED_SAMPLING:
-        raise ValueError(f"unsupported timed memory end marker: {run_dir}")
+    if (end.get("schema_version") != str(TIMED_SCHEMA_VERSION)
+            or end.get("sampling") != sampling
+            or end.get("window") != sampling
+            or end.get("origin") != origin_label):
+        raise ValueError(
+            f"unsupported program-start/schema-v2 or wrong Work memory profile: {run_dir}"
+        )
     end_metric = end.get("metric")
     if end_metric is None:
         raise ValueError(f"timed memory end metric is missing: {run_dir}")
     end_origin = _int(end.get("start_monotonic_ns"),
                       "remote_memory_end.start_monotonic_ns")
+    end_ns = _int(end.get("end_monotonic_ns"),
+                  "remote_memory_end.end_monotonic_ns")
+    if workload in KVS_WORKLOADS:
+        starts = re.findall(
+            r"^kvs_phase name=direct event=request_start\b.*$", log, re.M
+        )
+        drains = re.findall(
+            r"^kvs_phase name=direct event=request_drain_end\b.*$", log, re.M
+        )
+        if len(starts) != 1 or len(drains) != 1:
+            raise ValueError(
+                f"KVS Work memory requires one request_start and request_drain_end: "
+                f"{run_dir}"
+            )
+        request_start = _int(
+            _fields(starts[0]).get("monotonic_ns"),
+            "kvs request_start.monotonic_ns",
+        )
+        request_end = _int(
+            _fields(drains[0]).get("monotonic_ns"),
+            "kvs request_drain_end.monotonic_ns",
+        )
+        if end_origin != request_start or end_ns != request_end:
+            raise ValueError(
+                f"KVS Work memory origin/end do not match request Work bounds: "
+                f"{run_dir}"
+            )
+    work_window_id = _int(end.get("work_window_id"),
+                          "remote_memory_end.work_window_id", positive=True)
+    expected = _int(end.get("expected_samples"),
+                    "remote_memory_end.expected_samples")
+    if expected != len(points):
+        raise ValueError(f"runtime memory expected_samples does not match workload profile: {run_dir}")
+    scheduled_count = _int(end.get("scheduled_samples"),
+                           "remote_memory_end.scheduled_samples")
     count = _int(end.get("samples"), "remote_memory_end.samples")
-    if count == 0 or count != len(lines) or count > 5:
-        raise ValueError(f"timed memory sample count mismatch: {run_dir}")
+    missing_count = _int(end.get("missing"), "remote_memory_end.missing")
+    duration_ns = end_ns - end_origin
+    if duration_ns < 0:
+        raise ValueError(f"runtime memory Work end precedes Work origin: {run_dir}")
+    expected_due = sum(point * 1_000_000_000 <= duration_ns for point in points)
+    if scheduled_count != expected_due:
+        raise ValueError(
+            f"scheduled_samples disagrees with true Work duration: {run_dir}"
+        )
+    if count != len(lines) or missing_count != len(missing):
+        raise ValueError(f"timed Work sample/missing count mismatch: {run_dir}")
+    if count + missing_count != scheduled_count:
+        raise ValueError(f"timed Work samples do not close scheduled points: {run_dir}")
+    end_status = _validate_end_status(
+        end.get("status"), scheduled_count, count, missing_count,
+        expected, str(run_dir / "client.log"))
+    if scheduled_count == 0 and count == 0:
+        raise ValueError(
+            f"work window shorter than first sample; missing data: {run_dir}"
+        )
     samples = [_fields(line) for line in lines]
+    missing_records = [_fields(line) for line in missing]
     metric_values = {str(item.get("metric")) for item in samples}
+    if not metric_values:
+        metric_values = {end_metric}
     if len(metric_values) != 1:
         raise ValueError(f"timed memory metric is missing or inconsistent: {run_dir}")
-    mean, scheduled, observed, normalized = _timed_samples(
-        samples, metric_values.pop(), system, str(run_dir / "client.log"),
-        endpoint_count, end_origin, end_metric)
-    return mean, scheduled, observed, normalized
+    mean, scheduled, observed, normalized, metadata = _timed_samples(
+        samples, missing_records, metric_values.pop(), system,
+        str(run_dir / "client.log"), endpoint_count, end_origin,
+        end_metric, work_window_id, end_ns, points, scheduled_count, sampling,
+        origin_label)
+    metadata["end_status"] = end_status
+    return mean, scheduled, observed, normalized, metadata
 
 
-def _timed_json(run_dir: Path, system: str, endpoint_count=None):
+def _timed_json(run_dir: Path, system: str, endpoint_count=None,
+                workload=None):
+    profile = _timed_profile(workload)
     for name in MEMORY_RESULTS:
         path = run_dir / name
         if not path.is_file():
             continue
         document = _load(path)
+        if (document.get("schema_version") != TIMED_SCHEMA_VERSION
+                or document.get("sampling") != profile["sampling"]
+                or document.get("window") != profile["sampling"]
+                or document.get("origin") != profile["origin"]):
+            raise ValueError(
+                f"old program-start or unsupported runtime memory JSON is rejected: {path}"
+            )
         samples = document.get("samples")
         if not isinstance(samples, list) or not samples:
-            continue
+            raise ValueError(f"runtime memory JSON has no successful Work samples: {path}")
         if not all(isinstance(item, dict) and "scheduled_elapsed_s" in item
                    for item in samples):
-            continue
-        sampling = document.get("sampling", TIMED_SAMPLING)
-        if sampling != TIMED_SAMPLING:
-            raise ValueError(f"timed memory JSON has wrong sampling: {path}")
+            raise ValueError(f"runtime memory JSON samples are malformed: {path}")
+        missing = document.get("missing_records", document.get("missing", []))
+        if not isinstance(missing, list):
+            raise ValueError(f"runtime memory JSON missing records are malformed: {path}")
         metric = document.get("metric")
         if metric is None:
             metric_values = {str(item.get("metric")) for item in samples}
             if len(metric_values) != 1:
                 raise ValueError(f"timed memory JSON metric is missing: {path}")
             metric = metric_values.pop()
-        mean, scheduled, observed, normalized = _timed_samples(
-            samples, str(metric), system, str(path), endpoint_count)
+        end = document.get("end", document)
+        end_origin = _int(end.get("start_monotonic_ns"),
+                          "runtime memory JSON start_monotonic_ns")
+        end_ns = _int(end.get("end_monotonic_ns"),
+                      "runtime memory JSON end_monotonic_ns")
+        work_window_id = _int(end.get("work_window_id"),
+                              "runtime memory JSON work_window_id", positive=True)
+        scheduled_count = _int(end.get("scheduled_samples"),
+                               "runtime memory JSON scheduled_samples")
+        expected_count = _int(end.get("expected_samples"),
+                              "runtime memory JSON expected_samples")
+        if expected_count != len(profile["points"]):
+            raise ValueError(
+                f"runtime memory JSON expected_samples does not match workload profile: {path}"
+            )
+        end_count = _int(end.get("samples"), "runtime memory JSON samples")
+        end_missing_count = _int(end.get("missing"),
+                                 "runtime memory JSON missing")
+        if end_count != len(samples) or end_missing_count != len(missing):
+            raise ValueError(
+                f"runtime memory JSON sample/missing count mismatch: {path}"
+            )
+        end_status = _validate_end_status(
+            end.get("status"), scheduled_count, end_count,
+            end_missing_count, expected_count, str(path))
+        mean, scheduled, observed, normalized, metadata = _timed_samples(
+            samples, missing, str(metric), system, str(path), endpoint_count,
+            end_origin, str(metric), work_window_id, end_ns,
+            profile["points"], scheduled_count, profile["sampling"],
+            profile["origin"])
+        metadata["end_status"] = end_status
         if document.get("sample_mean_bytes") is not None and not math.isclose(
                 _float(document["sample_mean_bytes"], "sample_mean_bytes"),
                 mean, rel_tol=1e-12, abs_tol=0.5):
             raise ValueError(f"timed memory JSON mean disagrees with samples: {path}")
-        return mean, scheduled, observed, normalized
+        return mean, scheduled, observed, normalized, metadata
     return None
 
 
-def _memory_evidence(log: str, run_dir: Path, system: str, endpoint_count=None):
-    from_log = _timed_log(log, system, run_dir, endpoint_count)
-    from_json = _timed_json(run_dir, system, endpoint_count)
+def _memory_evidence(log: str, run_dir: Path, system: str,
+                     endpoint_count=None, workload=None):
+    from_log = _timed_log(log, system, run_dir, endpoint_count, workload)
+    from_json = _timed_json(run_dir, system, endpoint_count, workload)
     if from_log is None:
         raise ValueError(f"timed runtime memory log is missing: {run_dir}")
     if from_json is not None and from_log[1:] != from_json[1:]:
@@ -633,16 +935,22 @@ def _workload_id(layers, request, workload, ratio, workers, repeat):
     return json.dumps(values, sort_keys=True, separators=(",", ":"))
 
 
-def _nonft_backup_off(layers, run_dir):
+def _nonft_backup_off(layers, run_dir, *, include_regular_nonft=False):
     variants = {str(layer["baseline_variant"]) for layer in layers
                 if layer.get("baseline_variant") is not None}
     if len(variants) > 1:
         raise ValueError(f"NonFT variant metadata disagrees: {run_dir}")
     variant = next(iter(variants), "nonft")
-    if variant != "nonft-backup-off":
+    if variant not in ("nonft", "nonft-backup-off"):
+        raise ValueError(f"unknown NonFT variant: {run_dir}")
+    if variant == "nonft" and not include_regular_nonft:
         raise _SkipRun(f"Figure 11 excludes the regular NonFT variant: {run_dir}")
     states = [log_contract.backup_flag(layer["backup_enabled"]) for layer in layers
               if "backup_enabled" in layer]
+    if variant == "nonft":
+        if not states or len(set(states)) != 1:
+            raise ValueError(f"NonFT requires consistent explicit backup_enabled: {run_dir}")
+        return variant
     if not states or any(states):
         raise ValueError(f"NonFT backup-off requires explicit backup_enabled=false: {run_dir}")
     path = run_dir / "effective.config"
@@ -662,12 +970,33 @@ def _nonft_backup_off(layers, run_dir):
     return variant
 
 
-def _parse_run(run_dir: Path, paths: dict, selected, ratio: int, repeat: int):
+def _resident_provenance(run_dir):
+    keys = ("local_resident_budget_bytes", "enable_region_resident_placement",
+            "enable_resident_profile_planner", "resident_profile_apply_plan",
+            "enable_region_hotness_placement", "enable_region_fetch_hotness_placement",
+            "region_placement_bind_groups", "enable_logical_object_profile")
+    values = {}
+    for line in (run_dir / "effective.config").read_text(encoding="utf-8").splitlines():
+        parts = line.split("#", 1)[0].split()
+        if parts and parts[0] in keys:
+            if len(parts) != 2 or parts[0] in values:
+                raise ValueError(f"ambiguous resident configuration: {run_dir}")
+            values[parts[0]] = _int(parts[1], parts[0])
+    policy = ("backup_and_resident_off" if len(values) == len(keys)
+              and not any(values.values()) else "backup_only_off"
+              if any(values.values()) else "resident_unverified")
+    return {"off_policy": policy, "resident_config": values,
+            "local_resident_budget_bytes": values.get("local_resident_budget_bytes")}
+
+
+def _parse_run(run_dir: Path, paths: dict, selected, ratio: int, repeat: int,
+               *, include_regular_nonft=False):
     documents, files = _documents(run_dir, paths)
     layers = _layers(documents)
     nonft_variant = None
     if _system(_first(layers, "system", "runtime")) == "nonft":
-        nonft_variant = _nonft_backup_off(layers, run_dir)
+        nonft_variant = _nonft_backup_off(
+            layers, run_dir, include_regular_nonft=include_regular_nonft)
     _eligibility(layers, run_dir)
     log_path = run_dir / "client.log" if (run_dir / "client.log").is_file() else paths["logs"][0]
     try:
@@ -709,8 +1038,7 @@ def _parse_run(run_dir: Path, paths: dict, selected, ratio: int, repeat: int):
     if workers is None:
         raise ValueError(f"app_workers metadata is missing: {run_dir}")
     workers = _int(workers, "app_workers", positive=True)
-    observed_repeat = _first(layers, "repeat", "repetitions", "measured_repetitions")
-    observed_repeat = 1 if observed_repeat is None else _int(observed_repeat, "repeat", positive=True)
+    observed_repeat = _observed_repeat(documents, files, layers, run_dir)
     if observed_repeat != repeat:
         raise _SkipRun(f"different repeat: {run_dir}")
     elapsed = _first(layers, "elapsed_s", "request_seconds", "work_elapsed_s")
@@ -730,8 +1058,13 @@ def _parse_run(run_dir: Path, paths: dict, selected, ratio: int, repeat: int):
               "source_type": "measured"}
     if system == "nonft":
         if nonft_variant is None:
-            nonft_variant = _nonft_backup_off(layers, run_dir)
-        record.update(baseline_variant=nonft_variant, backup_enabled=False)
+            nonft_variant = _nonft_backup_off(
+                layers, run_dir, include_regular_nonft=include_regular_nonft)
+        record.update(baseline_variant=nonft_variant,
+                      backup_enabled=log_contract.backup_flag(
+                          _first(layers, "backup_enabled")))
+        if nonft_variant == "nonft-backup-off":
+            record.update(_resident_provenance(run_dir))
     if "fetch_traffic" in selected or "eviction_traffic" in selected:
         traffic = _traffic_log(log, run_dir)
         metadata_traffic = _traffic_docs(documents, run_dir)
@@ -747,8 +1080,8 @@ def _parse_run(run_dir: Path, paths: dict, selected, ratio: int, repeat: int):
             record["eviction_bytes"] = traffic["eviction_bytes"]
     if "remote_memory" in selected:
         endpoint_count = _manifest_endpoint_count(documents)
-        mean, scheduled, observed, _ = _memory_evidence(
-            log, run_dir, system, endpoint_count)
+        mean, scheduled, observed, _, memory_meta = _memory_evidence(
+            log, run_dir, system, endpoint_count, workload)
         metric = None
         for line in re.findall(r"^runtime_remote_memory\b.*$", log, re.M):
             metric = _fields(line).get("metric")
@@ -757,10 +1090,24 @@ def _parse_run(run_dir: Path, paths: dict, selected, ratio: int, repeat: int):
         metric = metric or _memory_metric(documents)
         if metric is None:
             raise ValueError(f"timed memory metric is missing: {run_dir}")
-        record.update(remote_memory_mean_bytes=mean, remote_memory_samples=len(scheduled),
-                      remote_memory_sampling=TIMED_SAMPLING, remote_memory_window="benchmark",
-                      remote_memory_scheduled_times_s=scheduled,
-                      remote_memory_sample_times_s=observed, remote_memory_metric=metric)
+        record.update(
+            remote_memory_mean_bytes=mean,
+            remote_memory_samples=memory_meta["samples"],
+            remote_memory_sampling=_timed_profile(workload)["sampling"],
+            remote_memory_window="work",
+            remote_memory_origin=memory_meta["origin"],
+            remote_memory_work_window_id=memory_meta["work_window_id"],
+            remote_memory_end_monotonic_ns=memory_meta["end_monotonic_ns"],
+            remote_memory_scheduled_samples=memory_meta["scheduled_samples"],
+            remote_memory_missing_samples=memory_meta["missing_samples"],
+            remote_memory_expected_samples=memory_meta["expected_samples"],
+            remote_memory_work_duration_ns=memory_meta["work_duration_ns"],
+            remote_memory_missing_times_s=memory_meta["missing_times_s"],
+            remote_memory_end_status=memory_meta["end_status"],
+            remote_memory_scheduled_times_s=scheduled,
+            remote_memory_sample_times_s=observed,
+            remote_memory_metric=metric,
+        )
     if "remote_cpu_cores" in selected:
         cpu, _ = _cpu(run_dir, documents)
         record.update(cpu)
@@ -777,7 +1124,8 @@ def _parse_run(run_dir: Path, paths: dict, selected, ratio: int, repeat: int):
     return log_contract.validate_record(record, source=record["_source"])
 
 
-def collect_records(logs_root, *, pattern="*.log", ratio=25, repeat=1, components=None):
+def collect_records(logs_root, *, pattern="*.log", ratio=25, repeat=1, components=None,
+                    include_regular_nonft=False):
     """Collect complete measured records; failed retries are skipped."""
     root = Path(logs_root).resolve()
     if not root.is_dir():
@@ -789,7 +1137,9 @@ def collect_records(logs_root, *, pattern="*.log", ratio=25, repeat=1, component
     records, skipped = [], []
     for run_dir, paths in _discover(root, pattern):
         try:
-            records.append(_parse_run(run_dir, paths, selected, ratio, repeat))
+            records.append(_parse_run(
+                run_dir, paths, selected, ratio, repeat,
+                include_regular_nonft=include_regular_nonft))
         except _SkipRun as exc:
             skipped.append(str(exc))
     if not records:

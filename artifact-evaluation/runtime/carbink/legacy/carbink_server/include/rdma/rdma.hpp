@@ -55,6 +55,9 @@ constexpr uint16_t kEC2PCFlagProbeBypassCompute = 1u << 2;
 constexpr uint16_t kEC2PCFlagProbeBatch = 1u << 3;
 constexpr uint16_t kEC2PCFlagCompactReq = 1u << 4;
 constexpr uint32_t kEC2PCStatusOK = 0;
+// Failure status propagated through the existing EC2PC ACK wire format when a
+// peer is quarantined by the opt-in recovery path.
+constexpr uint32_t kEC2PCStatusPeerDead = 1;
 
 constexpr bool ec2pc_is_client_batch_type(uint16_t type) {
     return type == EC2PC_MSG_DATA_REQ_BATCH ||

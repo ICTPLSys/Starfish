@@ -57,6 +57,8 @@ CONFIG(bool, ft_incremental_one_sided, false)
 CONFIG(bool, ft_rmw_read_failure_fallback, false)
 // Failure-triggered client-side reconstruction. Off outside Figure13.
 CONFIG(bool, ft_background_rebuild, false)
+// Number of failed endpoints in one reconstruction wave; default single fault.
+CONFIG(size_t, ft_background_rebuild_failures, 1)
 // Decimal MB/s cap independently applied to repair READ and WRITE bytes.
 CONFIG(size_t, ft_rebuild_bandwidth_mbps, 2500)
 CONFIG(size_t, ft_small_object_cutoff, 4096)

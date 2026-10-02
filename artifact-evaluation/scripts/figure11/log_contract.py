@@ -21,8 +21,21 @@ COMPONENTS = (
     "remote_memory",
 )
 ALL_COMPONENTS = COMPONENTS
-REMOTE_MEMORY_SAMPLING = "benchmark_start_10_20_30_40_50s"
-REMOTE_MEMORY_WINDOW = "benchmark"
+REMOTE_MEMORY_SAMPLING = "work_start_10_20_30_40_50s"
+REMOTE_MEMORY_WINDOW = "work"
+REMOTE_MEMORY_ORIGIN = "profile_start_work"
+KVS_WORKLOADS = frozenset(("kv-a", "kv-b", "kv-s"))
+REMOTE_MEMORY_GOOD_END_STATUSES = frozenset(("complete", "partial-work"))
+REMOTE_MEMORY_REJECTED_END_STATUSES = frozenset(
+    ("short-work", "unsupported", "work-end-missing"))
+REMOTE_MEMORY_PROFILES = {
+    "bfs": {"sampling": "work_start_3s", "points": (3,), "expected_samples": 1},
+    "default": {
+        "sampling": REMOTE_MEMORY_SAMPLING,
+        "points": (10, 20, 30, 40, 50),
+        "expected_samples": 5,
+    },
+}
 REMOTE_CPU_WINDOW = "initialization_and_requests"
 MEMORY_METRICS = {
     "nonft": "allocator_occupied_bytes",
@@ -95,6 +108,15 @@ COMPONENT_FIELDS = {
         "remote_memory_sampling",
         "remote_memory_metric",
         "remote_memory_window",
+        "remote_memory_origin",
+        "remote_memory_work_window_id",
+        "remote_memory_end_monotonic_ns",
+        "remote_memory_scheduled_samples",
+        "remote_memory_missing_samples",
+        "remote_memory_expected_samples",
+        "remote_memory_work_duration_ns",
+        "remote_memory_missing_times_s",
+        "remote_memory_end_status",
         "remote_memory_scheduled_times_s",
         "remote_memory_sample_times_s",
     ),
@@ -190,6 +212,15 @@ def component_names(record):
     return normalize_components(record.get("components"))
 
 
+def memory_profile(workload):
+    profile = dict(REMOTE_MEMORY_PROFILES["bfs" if workload == "bfs" else "default"])
+    profile["origin"] = (
+        "kvs_request_start" if workload in KVS_WORKLOADS
+        else REMOTE_MEMORY_ORIGIN
+    )
+    return profile
+
+
 def validate_record(record, *, source=None):
     """Validate and normalize a schema-v3 record dictionary."""
     if not isinstance(record, Mapping):
@@ -234,6 +265,16 @@ def validate_record(record, *, source=None):
         if (result["baseline_variant"] == "nonft-backup-off"
                 and result["backup_enabled"]):
             raise ValueError("NonFT backup-off variant has backup enabled")
+        if "off_policy" in result:
+            if result["off_policy"] not in (
+                    "backup_and_resident_off", "backup_only_off", "resident_unverified"):
+                raise ValueError("unknown NonFT off_policy")
+            if result.get("local_resident_budget_bytes") is not None:
+                result["local_resident_budget_bytes"] = _integer(
+                    result["local_resident_budget_bytes"], "local_resident_budget_bytes")
+            if (result["off_policy"] == "backup_and_resident_off"
+                    and result.get("local_resident_budget_bytes") != 0):
+                raise ValueError("double-OFF requires an explicit zero resident budget")
 
     selected = normalize_components(result["components"])
     result["components"] = ",".join(selected)
@@ -255,31 +296,113 @@ def validate_record(record, *, source=None):
         if result["remote_cpu_window"] != REMOTE_CPU_WINDOW:
             raise ValueError("remote_cpu_window must be initialization_and_requests")
     if "remote_memory" in selected:
+        profile = memory_profile(result["workload"])
         result["remote_memory_mean_bytes"] = _number(
             result["remote_memory_mean_bytes"], "remote_memory_mean_bytes")
         result["remote_memory_samples"] = _integer(
             result["remote_memory_samples"], "remote_memory_samples")
-        if not 1 <= result["remote_memory_samples"] <= 5:
-            raise ValueError("remote_memory_samples must be in 1..5; zero samples are missing")
-        if result["remote_memory_sampling"] != REMOTE_MEMORY_SAMPLING:
+        if result["remote_memory_samples"] < 1:
             raise ValueError(
-                "remote_memory_sampling must be "
-                "benchmark_start_10_20_30_40_50s")
+                "Work window has no successful memory samples; short Work is missing data"
+            )
+        if result["remote_memory_samples"] > profile["expected_samples"]:
+            raise ValueError("remote_memory_samples exceeds workload profile")
+        if result["remote_memory_sampling"] != profile["sampling"]:
+            raise ValueError(
+                f"remote_memory_sampling must be {profile['sampling']} for "
+                f"{result['workload']}")
         if result["remote_memory_window"] != REMOTE_MEMORY_WINDOW:
-            raise ValueError("remote_memory_window must be benchmark")
+            raise ValueError("remote_memory_window must be work")
+        if result["remote_memory_origin"] != profile["origin"]:
+            raise ValueError(
+                f"remote_memory_origin must be {profile['origin']} for {result['workload']}"
+            )
+        result["remote_memory_work_window_id"] = _integer(
+            result["remote_memory_work_window_id"], "remote_memory_work_window_id")
+        if result["remote_memory_work_window_id"] < 1:
+            raise ValueError("remote_memory_work_window_id must be positive")
+        result["remote_memory_end_monotonic_ns"] = _integer(
+            result["remote_memory_end_monotonic_ns"],
+            "remote_memory_end_monotonic_ns")
+        result["remote_memory_work_duration_ns"] = _integer(
+            result["remote_memory_work_duration_ns"],
+            "remote_memory_work_duration_ns")
+        if result["remote_memory_work_duration_ns"] <= 0:
+            raise ValueError("remote_memory_work_duration_ns must be positive")
+        result["remote_memory_scheduled_samples"] = _integer(
+            result["remote_memory_scheduled_samples"],
+            "remote_memory_scheduled_samples")
+        result["remote_memory_missing_samples"] = _integer(
+            result["remote_memory_missing_samples"],
+            "remote_memory_missing_samples")
+        result["remote_memory_expected_samples"] = _integer(
+            result["remote_memory_expected_samples"],
+            "remote_memory_expected_samples")
+        if result["remote_memory_expected_samples"] != profile["expected_samples"]:
+            raise ValueError("remote_memory_expected_samples disagrees with workload profile")
+        if result["remote_memory_scheduled_samples"] > result["remote_memory_expected_samples"]:
+            raise ValueError("remote_memory_scheduled_samples exceeds profile")
+        duration_ns = result["remote_memory_work_duration_ns"]
+        due = sum(point * 1_000_000_000 <= duration_ns
+                  for point in profile["points"])
+        if result["remote_memory_scheduled_samples"] != due:
+            raise ValueError("remote memory scheduled points disagree with Work duration")
+        if (result["remote_memory_samples"]
+                + result["remote_memory_missing_samples"]
+                != result["remote_memory_scheduled_samples"]):
+            raise ValueError("remote memory sample/missing counts do not close scheduled points")
+        end_status = result["remote_memory_end_status"]
+        if not isinstance(end_status, str) or not end_status.strip():
+            raise ValueError("remote_memory_end_status must not be blank")
+        if end_status in REMOTE_MEMORY_REJECTED_END_STATUSES:
+            raise ValueError(
+                f"remote_memory_end_status={end_status} cannot enter formal Figure 11"
+            )
+        if end_status not in REMOTE_MEMORY_GOOD_END_STATUSES:
+            raise ValueError(
+                f"unsupported remote_memory_end_status={end_status}"
+            )
+        if end_status == "complete":
+            if (result["remote_memory_scheduled_samples"]
+                    != profile["expected_samples"]
+                    or result["remote_memory_samples"]
+                    != profile["expected_samples"]):
+                raise ValueError(
+                    "remote_memory_end_status=complete disagrees with profile counts"
+                )
+        elif (result["remote_memory_scheduled_samples"] <= 0
+              or result["remote_memory_samples"] >= profile["expected_samples"]):
+            raise ValueError(
+                "remote_memory_end_status=partial-work disagrees with profile counts"
+            )
         scheduled = _sample_times(result["remote_memory_scheduled_times_s"],
                                   "remote_memory_scheduled_times_s")
         observed = _sample_times(result["remote_memory_sample_times_s"],
                                  "remote_memory_sample_times_s")
-        if (len(scheduled) != result["remote_memory_samples"] or
-                len(observed) != result["remote_memory_samples"]):
-            raise ValueError("memory sample times must match remote_memory_samples")
-        if scheduled != sorted(set(scheduled)) or any(
-                value not in (10, 20, 30, 40, 50) for value in scheduled):
-            raise ValueError("scheduled memory times must be an ordered subset of 10..50s")
+        missing_value = result["remote_memory_missing_times_s"]
+        if result["remote_memory_missing_samples"]:
+            missing = _sample_times(missing_value, "remote_memory_missing_times_s")
+            result["remote_memory_missing_times_s"] = missing
+        else:
+            # Direct whitespace-delimited records still need a nonempty token;
+            # normalize the explicit no-missing sentinel for CSV consumers.
+            result["remote_memory_missing_times_s"] = []
+            missing = []
+        allowed = profile["points"][:result["remote_memory_scheduled_samples"]]
+        successful_targets = [target for target in allowed if target not in missing]
+        if (len(scheduled) != result["remote_memory_scheduled_samples"] or
+                len(observed) != result["remote_memory_samples"] or
+                len(missing) != result["remote_memory_missing_samples"] or
+                scheduled != list(allowed) or
+                any(value not in allowed for value in missing) or
+                len(set(missing)) != len(missing)):
+            raise ValueError("memory Work sample/missing times do not match scheduled points")
         if observed != sorted(set(observed)) or any(
-                actual < target for actual, target in zip(observed, scheduled)):
-            raise ValueError("observed memory times must be increasing and not precede targets")
+                actual < target
+                for actual, target in zip(observed, successful_targets)):
+            raise ValueError("observed Work memory times must be increasing and not precede targets")
+        if any(actual > duration_ns / 1e9 + 1e-6 for actual in observed):
+            raise ValueError("observed Work memory times occur after Work end")
         result["remote_memory_scheduled_times_s"] = scheduled
         result["remote_memory_sample_times_s"] = observed
         expected_metric = MEMORY_METRICS[system]

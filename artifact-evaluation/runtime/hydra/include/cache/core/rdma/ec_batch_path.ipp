@@ -872,6 +872,13 @@ inline void ConcurrentArrayCache::handle_ec_batch_write_complete(uint64_t wr_id,
             complete_evict_writeback(const_cast<void *>(record.objects[i]));
         }
     }
+    // All six terminal completions and logical writeback disposition precede
+    // copyability. A rescued zero-copy page may have produced a torn old
+    // codeword; complete_evict_writeback discards that group before this gate.
+    if (::FarLib::get_config().ft_background_rebuild &&
+        !remote_allocator.small_object_stripe_manager()
+             .finish_background_write(record.group.id))
+        ERROR("ec_background_rebuild: lost write reservation");
     // Fixed Hydra parity is part of the completion position itself: releasing
     // that position below makes both reusable together. Other paths retain
     // their existing temporary-buffer ownership contract.
@@ -1191,6 +1198,8 @@ inline bool ConcurrentArrayCache::stage_ec_split_object(
         } else
             (void)split_buffers.release(staging);
         (void)manager.mark_dead_group(group.id);
+        if (::FarLib::get_config().ft_background_rebuild)
+            (void)manager.cancel_background_write(group.id);
         ERROR("ec_split: encode/seal failed; refusing unprotected fallback");
         return false;
     }

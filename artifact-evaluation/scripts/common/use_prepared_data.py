@@ -55,7 +55,8 @@ def inspect_prepared(directory):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path,
-                        default=Path(os.environ.get("AE_PREPARED_DATA_DIR", "/data/starfish-ae")))
+                        default=Path(os.environ.get(
+                            "AE_PREPARED_DATA_DIR", ROOT / "data/inputs")))
     parser.add_argument("--site", type=Path, default=ROOT / "data/site.json")
     args = parser.parse_args(argv)
     inputs = inspect_prepared(args.data_dir)

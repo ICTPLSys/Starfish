@@ -130,7 +130,7 @@ class FastCheck(unittest.TestCase):
                 name + "/chat-output.txt"))
             self.assertNotIn("-n", plan["client_command"])
             if system == "starfish":
-                self.assertTrue(plan["recipe"].endswith("starfish_ec.config"))
+                self.assertTrue(plan["recipe"].endswith("starfish.config"))
                 self.assertEqual(len(plan["memory_endpoints"]), 7)
                 self.assertEqual(plan["client_env"]["FARLIB_EC_RECOVERY_VERIFY"], "1")
             self.assertFalse(args.out.exists())

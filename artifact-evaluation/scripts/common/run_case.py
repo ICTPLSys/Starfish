@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
@@ -31,6 +32,7 @@ import site_defaults
 import topology
 import server_staging
 import carbink_support
+import kv_recovery
 import kv_latency
 import nq_latency
 import remote_cpu
@@ -171,7 +173,7 @@ def site_config(path: Path, *, dry_run: bool,
 
 
 def endpoint_specs(site: Dict[str, Any], system: str,
-                   *, dry_run: bool) -> List[Dict[str, Any]]:
+                   *, dry_run: bool, figure13: bool = False) -> List[Dict[str, Any]]:
     result = []
     inventory = site["memory_endpoints"]
     selections = site.get("memory_endpoint_indices_by_system", {})
@@ -183,7 +185,8 @@ def endpoint_specs(site: Dict[str, Any], system: str,
                        for i in indices)
                 or len(set(indices)) != len(indices)):
             raise ValueError(f"memory endpoint selection for {runtime} must contain unique nonnegative integer indices")
-    selected = selections.get(system, list(range(len(inventory))))
+    selected = (list(range(len(inventory))) if figure13
+               else selections.get(system, list(range(len(inventory)))))
     if any(i >= len(inventory) for i in selected):
         raise ValueError(f"memory endpoint selection for {system} exceeds the inventory")
     # Keep the site inventory intact. In particular, a seven-memory-node site
@@ -214,6 +217,8 @@ def endpoint_specs(site: Dict[str, Any], system: str,
             "memory_ld_library_path": endpoint.get("memory_ld_library_path")
                 or site.get("memory_ld_library_path"),
         })
+    if system == "carbink" and not figure13:
+        result = carbink_support.endpoint_ports(result)
     return result
 
 
@@ -225,6 +230,8 @@ def render_endpoint_records(specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 def server_start_command(state):
     environment = {"SERVER_PORT": str(state["server_port"]),
                    "FARLIB_RDMA_DEVICE": state["memory_ib_device"]}
+    if state.get("figure13") and state.get("system") == "carbink":
+        environment["FARLIB_CARBINK_RECOVERY"] = "1"
     if state.get("memory_ld_library_path"):
         environment["LD_LIBRARY_PATH"] = state["memory_ld_library_path"]
     if state.get("disable_server_pin"):
@@ -402,6 +409,26 @@ def inject_owned_failure(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def run(args: argparse.Namespace) -> int:
+    # Client commands run with cwd=args.out; resolve both paths before command
+    # construction so a relative invocation cannot accidentally double-prefix
+    # effective.config or select a different build after chdir.
+    args.out = args.out.resolve()
+    if getattr(args, "build_root", None) is not None:
+        args.build_root = args.build_root.resolve()
+    repeat_suffix = re.search(r"-r([1-9][0-9]*)$", args.out.name)
+    repeat = getattr(args, "repeat", None)
+    if repeat is None:
+        repeat = (int(repeat_suffix[1]) if repeat_suffix
+                  else getattr(args, "figure13_repeat", None) or 1)
+    if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+        raise ValueError("repeat must be a positive integer")
+    if repeat_suffix and int(repeat_suffix[1]) != repeat:
+        raise ValueError("repeat disagrees with the run directory suffix")
+    if getattr(args, "figure13_scenario", None) is not None:
+        if getattr(args, "figure13_repeat", None) is None:
+            args.figure13_repeat = repeat
+        if args.figure13_repeat != repeat:
+            raise ValueError("Figure13 repeat disagrees with the batch repeat")
     baseline_variant = getattr(args, "baseline_variant", None) or args.system
     if baseline_variant == "nonft-backup-off":
         if args.system != "nonft":
@@ -420,7 +447,37 @@ def run(args: argparse.Namespace) -> int:
     if not 1 <= args.ratio <= 100 or args.timeout <= 0:
         raise ValueError("ratio must be 1..100 and timeout must be positive")
     site = site_config(args.site, dry_run=args.dry_run, system=args.system, app=args.app)
-    specs = endpoint_specs(site, args.system, dry_run=args.dry_run)
+    physical_inventory_count = len(site["memory_endpoints"])
+    physical_host_count = len({str(item["memory_addr"])
+                               for item in site["memory_endpoints"]})
+    figure13 = kv_recovery.prepare(args, physical_count=physical_host_count)
+    if figure13 is not None:
+        # Figure13 needs seven distinct physical memory hosts.  Keep the
+        # inventory count separately because aliases must not be counted as
+        # additional hosts in the topology contract.
+        figure13["physical_inventory_endpoints"] = physical_inventory_count
+        if not site.get("compute_ip"):
+            raise ValueError("Figure13 site must identify compute_ip")
+        if any(item["memory_addr"] == site["compute_ip"]
+               for item in site["memory_endpoints"]):
+            raise ValueError("Figure13 compute and memory hosts must be distinct")
+    specs = endpoint_specs(
+        site, args.system, dry_run=args.dry_run, figure13=figure13 is not None)
+    endpoint_mapping: List[Dict[str, Any]] = []
+    if figure13 is not None:
+        specs, endpoint_mapping = kv_recovery.materialize_specs(specs, figure13)
+        figure13["run_id"] = args.out.name
+        figure13["physical_host_count"] = len({
+            str(spec["memory_addr"]) for spec in specs
+        })
+        if figure13["physical_host_count"] not in (7, 8):
+            raise ValueError("Figure13 requires seven or eight physical memory hosts")
+    client_site = dict(site)
+    if figure13 is not None:
+        client_site["runtime_metadata"] = False
+        client_site["runtime_ec_cpu"] = False
+        client_site["remote_memory_samples"] = False
+        client_site.pop("remote_memory_observer_cpu", None)
     if not specs:
         raise ValueError("at least one memory endpoint is required")
     config = (getattr(args, "recipe", None)
@@ -433,17 +490,15 @@ def run(args: argparse.Namespace) -> int:
                     or reference_chat is not None)
     if capture_chat and args.app != "llama":
         raise ValueError("chat capture is only supported for LLaMA")
-    recovery_check.validate_request(
-        args.app, args.system, recover_endpoint, len(specs),
-        config_value(config_text, "ft_method"), config_value(config_text, "ft_standby_endpoint"))
     capture_path = (args.out / "chat-output.txt").resolve() if capture_chat else None
     ec = config_value(config_text, "ft_method") == "ec_batch"
     hydra = args.system == "hydra"
     carbink = args.system == "carbink"
     if carbink and config_value(config_text, "ft_method") != "carbink":
         raise ValueError("Carbink Figure 9 requires ft_method carbink")
-    if carbink and len(specs) != 6:
-        raise ValueError("Carbink's legacy compaction protocol requires exactly six endpoints")
+    if carbink and ((figure13 is None and len(specs) != 6)
+                     or (figure13 is not None and len(specs) not in (7, 8))):
+        raise ValueError("Carbink endpoint count is incompatible with this run")
     if args.system == "nonft" and config_value(config_text, "ft_method") not in (None, "none"):
         raise ValueError("NonFT recipe must not request a protected FT method")
     if args.system == "starfish" and not ec:
@@ -465,11 +520,20 @@ def run(args: argparse.Namespace) -> int:
     command, stdin_path = client_command(
         args.app, client_bin, args.out / "effective.config", input_path, AE_ROOT, tokenizer,
         local_bytes=FOOTPRINT_BYTES[args.app] * args.ratio // 100)
-    command = topology.memory_binding(site["numa_node"]) + command
+    # Graph loaders need ordinary pages beyond one NUMA node's free capacity.
+    compute_numa_node = None if args.app in ("bfs", "nq") else site["numa_node"]
+    if compute_numa_node is not None:
+        command = topology.memory_binding(compute_numa_node) + command
     batch_id = args.out.parent.parent.name if args.out.parent.name == "runs" else "single"
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", batch_id + args.out.name):
         raise ValueError("batch and run directory names must be simple identifiers")
-    remote_dir = site["remote_run_root"].rstrip("/") + "/" + batch_id + "/" + args.out.name
+    local_batch_root = (args.out.parent.parent if args.out.parent.name == "runs"
+                        else args.out.parent).resolve()
+    remote_namespace = batch_id + "-" + hashlib.sha256(
+        str(local_batch_root).encode("utf-8")).hexdigest()[:12]
+    remote_parts = [site["remote_run_root"].rstrip("/"), remote_namespace,
+                    args.out.name]
+    remote_dir = "/".join(remote_parts)
     if not REMOTE_PATH.fullmatch(remote_dir) or ".." in Path(remote_dir).parts:
         raise ValueError("invalid remote run directory")
     for index, spec in enumerate(specs):
@@ -485,8 +549,16 @@ def run(args: argparse.Namespace) -> int:
             or set(raw_feature_overrides) - {"backup", "resident"}):
         raise ValueError("feature_overrides supports only backup and resident")
     feature_overrides = dict(raw_feature_overrides)
+    if figure13 is not None:
+        # Figure13 uses the frozen policy explicitly.  Do not inherit a
+        # possibly stale site feature override from the normal Figure9-12
+        # profiles, and do not mutate the site object itself.
+        feature_overrides.update({
+            "backup": args.system == "starfish",
+            "resident": args.system == "starfish",
+        })
     if baseline_variant == "nonft-backup-off":
-        feature_overrides["backup"] = False
+        feature_overrides.update(backup=False, resident=False)
     effective = render(config, system=args.system, ratio=args.ratio,
                        footprint_bytes=FOOTPRINT_BYTES[args.app],
                        ib_device=site["ib_device"], ib_port=site["ib_port"],
@@ -498,6 +570,8 @@ def run(args: argparse.Namespace) -> int:
         rendered_lines = effective.splitlines(keepends=True)
         replace(rendered_lines, "remote_backup_budget_pct", "0")
         effective = "".join(rendered_lines)
+    if figure13 is not None:
+        effective = kv_recovery.overlay_config(effective, figure13)
     rendered_backup = config_value(effective, "enable_selective_backup")
     if rendered_backup not in ("0", "1"):
         raise ValueError("rendered config lacks enable_selective_backup=0/1")
@@ -510,6 +584,13 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError(
             "nonft-backup-off did not render enable_selective_backup=0 "
             "and zero remote backup budgets")
+    if baseline_variant == "nonft-backup-off" and any(
+            config_value(effective, key) != "0" for key in (
+                "local_resident_budget_bytes", "enable_region_resident_placement",
+                "enable_resident_profile_planner", "resident_profile_apply_plan",
+                "enable_region_hotness_placement", "enable_region_fetch_hotness_placement",
+                "region_placement_bind_groups", "enable_logical_object_profile")):
+        raise ValueError("nonft-backup-off did not disable Resident and its placement policies")
     if ec or hydra:
         lines = effective.splitlines(keepends=True)
         standby = int(config_value(effective, "ft_standby_endpoint") or "-1")
@@ -519,16 +600,56 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError("EC standby requires six other active memory endpoints")
         replace(lines, "ft_standby_endpoint", str(standby))
         effective = "".join(lines)
+    recovery_check.validate_request(
+        args.app, args.system, recover_endpoint, len(specs),
+        config_value(effective, "ft_method"), config_value(effective, "ft_standby_endpoint"))
+    memory_sampling = None
+    requested_memory = getattr(args, "collect_remote_memory", False)
+    if figure13 is not None and requested_memory:
+        raise ValueError("Figure13 recovery does not combine with steady-state memory sampling")
+    if figure13 is None:
+        site_memory = client_site.get("remote_memory_samples", False)
+        if not isinstance(site_memory, bool):
+            raise ValueError("remote_memory_samples must be a boolean")
+        if requested_memory or site_memory:
+            requested_cpu = getattr(args, "remote_memory_observer_cpu", None)
+            if requested_cpu is None:
+                requested_cpu = client_site.get("remote_memory_observer_cpu")
+            memory_cpu = topology.observer_cpu(site, effective, requested_cpu)
+            memory_origin = ("kvs_request_start"
+                             if args.app in ("kv-b", "kv-a", "kv-s") and latency is None
+                             else "profile_start_work")
+            client_site.update(remote_memory_samples=True,
+                               remote_memory_observer_cpu=memory_cpu,
+                               remote_memory_work_origin=memory_origin)
+            memory_sampling = {"enabled": True, "observer_cpu": memory_cpu,
+                               "schema_version": 3,
+                               "planned_points_s": [3] if args.app == "bfs"
+                                   else [10, 20, 30, 40, 50],
+                               "time_origin": memory_origin,
+                               "window": "work_start_3s" if args.app == "bfs"
+                                   else "work_start_10_20_30_40_50s",
+                               "stop_at": "kvs_request_drain_end"
+                                   if memory_origin == "kvs_request_start"
+                                   else "profile_end_work",
+                               "short_work_policy": "missing_no_scheduled_sample"}
     plan = {
         "app": args.app, "system": args.system, "ratio": args.ratio,
+        "repeat": repeat,
+        "remote_namespace": remote_namespace,
+        "remote_namespace_source": str(local_batch_root),
         "baseline_variant": baseline_variant,
         "backup_enabled": backup_enabled,
         "run_id": args.out.name, "site": site["name"],
-        "compute_ip": site.get("compute_ip"), "numa_node": site["numa_node"],
+        "compute_ip": site.get("compute_ip"), "numa_node": compute_numa_node,
+        "compute_memory_policy": "inherited" if compute_numa_node is None else "bind",
+        "nic_numa_node": site["numa_node"],
         "ib_device": site["ib_device"], "ib_port": site["ib_port"],
         "recipe": str(config), "client_bin": str(client_bin),
         "effective_config": effective,
         "feature_overrides": feature_overrides,
+        "figure13": figure13,
+        "logical_physical_endpoint_map": endpoint_mapping,
         "memory_endpoint_inventory": [
             {"inventory_index": i, "memory_host": item["memory_host"],
              "memory_addr": item["memory_addr"], "server_port": item["server_port"],
@@ -544,6 +665,10 @@ def run(args: argparse.Namespace) -> int:
             {"index": index, "memory_host": spec["memory_host"],
              "inventory_index": spec["inventory_index"],
              "memory_addr": spec["memory_addr"], "server_port": spec["server_port"],
+             **({"requested_server_port": spec["requested_server_port"],
+                 "peer_server_port": spec.get("peer_server_port"),
+                 "port_reason": spec.get("port_reason")}
+                if figure13 is not None or carbink else {}),
              "server_bin": spec["server_bin"],
              "stage_memory_server": spec["stage_memory_server"],
              "start_command": server_start_command(spec),
@@ -556,7 +681,7 @@ def run(args: argparse.Namespace) -> int:
         "input": str(input_path) if input_path is not None else None,
         "client_command": command,
         "client_env": recovery_check.client_env(
-            client_environment(args.app, site, args.system), capture_path, ec),
+            client_environment(args.app, client_site, args.system), capture_path, ec),
         "failure_injection_endpoint": recover_endpoint,
         "reference_chat": str(reference_chat) if reference_chat else None,
         "feature_profile": {"starfish": "resident_local_six", "nonft": "nonft",
@@ -564,6 +689,18 @@ def run(args: argparse.Namespace) -> int:
                             "carbink": "carbink_full_stripe_background_compaction"}[args.system],
         "workload_footprint_bytes": FOOTPRINT_BYTES[args.app],
     }
+    if memory_sampling is not None:
+        plan["remote_memory_sampling"] = memory_sampling
+    if figure13 is not None:
+        plan["feature_profile"] = {
+            "starfish": "figure13_profiled_backup_recovery",
+            "hydra": "figure13_page_recovery",
+            "carbink": "figure13_shadow_compaction_recovery",
+        }[args.system]
+        plan["figure13"]["observer_cpu"] = kv_recovery.resolve_observer_cpu(
+            site, effective, figure13.get("observer_cpu_requested"))
+        plan["client_env"] = kv_recovery.apply_environment(
+            plan["client_env"], figure13)
     if latency is not None:
         plan[latency_key] = latency
         plan["client_env"] = latency_adapter.environment(plan["client_env"], latency)
@@ -576,10 +713,14 @@ def run(args: argparse.Namespace) -> int:
         else None)
     if carbink:
         plan["server_configs"] = [
-            carbink_support.server_config(effective, spec, site) for spec in specs]
+            carbink_support.server_config(
+                effective, spec, site, figure13=figure13 is not None)
+            for spec in specs]
         plan["carbink_server_pin_cores"] = site.get("carbink_server_pin_cores")
         plan["memory_service_reservation"] = carbink_support.memory_lower_bound(
-            effective, plan["worker_profile"])
+            effective, plan["worker_profile"],
+            endpoint_count=len(specs) if figure13 is not None else None,
+            figure13=figure13 is not None)
     if args.dry_run:
         plan["available"] = {
             "recipe": config.is_file(),
@@ -633,8 +774,18 @@ def run(args: argparse.Namespace) -> int:
     rendered_count = config_value(effective, "server_count")
     if rendered_count is None or int(rendered_count) != len(specs):
         raise ValueError("rendered server_count does not match endpoint count")
-    plan["verified_cpu_placement"] = topology.check_compute(site, runtime_config=effective)
-    check_hugepages(FOOTPRINT_BYTES[args.app] * args.ratio // 100, site["numa_node"])
+    plan["verified_cpu_placement"] = topology.check_compute(
+        site, runtime_config=effective)
+    if memory_sampling is not None:
+        memory_sampling["observer_cpu_validation"] = topology.check_observer_cpu(
+            site, effective, memory_sampling["observer_cpu"])
+    if figure13 is not None:
+        plan["figure13"]["observer_cpu"] = kv_recovery.resolve_observer_cpu(
+            site, effective, figure13.get("observer_cpu_requested"))
+        plan["figure13"]["observer_cpu_validation"] = (
+            kv_recovery.observer_cpu_profile(
+                site, effective, plan["figure13"]["observer_cpu"]))
+    check_hugepages(FOOTPRINT_BYTES[args.app] * args.ratio // 100, compute_numa_node)
     if args.check_local:
         print(f"local preflight PASS: {args.app}/{args.system}")
         return 0
@@ -642,7 +793,8 @@ def run(args: argparse.Namespace) -> int:
     server_configs = []
     for spec in specs:
         if carbink:
-            server_configs.append(carbink_support.server_config(effective, spec, site))
+            server_configs.append(carbink_support.server_config(
+                effective, spec, site, figure13=figure13 is not None))
             continue
         rendered = render(
             config, system=args.system, ratio=args.ratio,
@@ -676,15 +828,24 @@ def run(args: argparse.Namespace) -> int:
         state = {
             "index": index, "name": name,
             "memory_host": spec["memory_host"], "memory_addr": spec["memory_addr"],
-            "server_port": spec["server_port"], "memory_ib_device": spec["memory_ib_device"],
+            "server_port": spec["server_port"],
+            "requested_server_port": spec.get("requested_server_port"),
+            "peer_server_port": spec.get("peer_server_port"),
+            "port_reason": spec.get("port_reason"),
+            "memory_ib_device": spec["memory_ib_device"],
             "memory_numa_node": spec["memory_numa_node"],
             "memory_ib_port": spec["memory_ib_port"],
             "memory_ld_library_path": spec.get("memory_ld_library_path"),
             "server_bin": spec["server_bin"], "remote_dir": endpoint_remote_dir,
             "stage_memory_server": spec["stage_memory_server"],
             "disable_server_pin": spec.get("disable_server_pin", False),
+            "figure13": figure13 is not None,
+            "system": args.system,
+            "physical_duplicate": bool(spec.get("physical_duplicate", False)),
+            "physical_source_index": spec.get("physical_source_index"),
             "local_dir": str(local_dir), "status": "planned", "pid": None,
-            "remote_dir_created": False, "server_sha256": None, "error": "",
+            "remote_dir_created": False, "launch_attempted": False,
+            "server_sha256": None, "error": "",
         }
         endpoint_states.append(state)
         write_endpoint_manifest(state)
@@ -695,7 +856,7 @@ def run(args: argparse.Namespace) -> int:
     check_memory_capacity(endpoint_states, required_service_bytes)
     local_server_sha256 = sha256(local_server) if any(
         state["stage_memory_server"] for state in endpoint_states) else None
-    for state in endpoint_states:
+    def preflight_endpoint(state: Dict[str, Any]) -> None:
         if not state["server_bin"]:
             raise ValueError(f"endpoint {state['index']} has no server binary for {args.system}")
         host = state["memory_host"]
@@ -705,16 +866,40 @@ def run(args: argparse.Namespace) -> int:
                                                   state["memory_ld_library_path"]))
         ssh(host, topology.preflight_script(state["memory_ib_device"], state["memory_numa_node"],
                                            state["memory_ib_port"]))
-        ssh(host, "command -v ss >/dev/null; "
-            + "listeners=$(ss -H -ltn " + shlex.quote("sport = :" + str(state["server_port"]))
-            + '); test -z "$listeners"')
+        listener_ports = [state["server_port"]]
+        if state.get("system") == "carbink":
+            listener_ports.append(state["peer_server_port"])
+        for listener_port in listener_ports:
+            ssh(host, "command -v ss >/dev/null; "
+                + "listeners=$(ss -H -ltn "
+                + shlex.quote("sport = :" + str(listener_port))
+                + '); test -z "$listeners"')
         state["server_sha256"] = (local_server_sha256 if state["stage_memory_server"]
             else ssh(host, "sha256sum " + shlex.quote(state["server_bin"])).stdout.split()[0])
         state["status"] = "preflight_pass"
         write_endpoint_manifest(state)
 
+    def run_parallel_endpoint_steps(worker) -> None:
+        """Run independent endpoint setup steps, joining every worker first."""
+        if not endpoint_states:
+            return
+        failures = []
+        with ThreadPoolExecutor(max_workers=len(endpoint_states)) as executor:
+            futures = [executor.submit(worker, state) for state in endpoint_states]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    failures.append(exc)
+        if failures:
+            raise failures[0]
+
+    run_parallel_endpoint_steps(preflight_endpoint)
     manifest = {
         "schema_version": 1, "start_time": now(), "status": "running",
+        "repeat": repeat,
+        "remote_namespace": remote_namespace,
+        "remote_namespace_source": str(local_batch_root),
         "baseline_variant": baseline_variant,
         "backup_enabled": backup_enabled,
         "server_source_sha256": sha256(source_archive) if source_archive.exists() else None,
@@ -761,25 +946,37 @@ def run(args: argparse.Namespace) -> int:
     error = ""
     injection: Dict[str, Any] = {}
     try:
-        for state in endpoint_states:
+        def launch_endpoint(state: Dict[str, Any]) -> None:
             host = state["memory_host"]
             remote_dir_q = shlex.quote(state["remote_dir"])
             bin_q = shlex.quote(state["server_bin"])
-            ssh(host, "mkdir -m 700 -p " + shlex.quote(str(Path(state["remote_dir"]).parent))
-                + "; mkdir -m 700 " + remote_dir_q)
-            state["remote_dir_created"] = True
-            if state["stage_memory_server"]:
-                deployment = server_staging.stage(
-                    host, state["remote_dir"], local_server, private_libraries,
-                    ssh=ssh, scp=scp, source_archive=source_archive, system=args.system)
-                copied_hash = ssh(host, "sha256sum " + bin_q).stdout.split()[0]
-                if not deployment["rebuilt_on_memory_host"] and copied_hash != state["server_sha256"]:
-                    raise ValueError("staged memory server checksum mismatch")
-                state["rebuilt_on_memory_host"] = deployment["rebuilt_on_memory_host"]
-                state["server_sha256"] = copied_hash
-            scp(str(Path(state["local_dir"]) / "server.config"),
-                f"{host}:{state['remote_dir']}/server.config")
-            start = server_start_command(state)
+            try:
+                ssh(host, "mkdir -m 700 -p " + shlex.quote(str(Path(state["remote_dir"]).parent))
+                    + "; mkdir -m 700 " + remote_dir_q)
+                state["remote_dir_created"] = True
+                if state["stage_memory_server"]:
+                    deployment = server_staging.stage(
+                        host, state["remote_dir"], local_server, private_libraries,
+                        ssh=ssh, scp=scp, source_archive=source_archive, system=args.system)
+                    copied_hash = ssh(host, "sha256sum " + bin_q).stdout.split()[0]
+                    if (not deployment["rebuilt_on_memory_host"]
+                            and copied_hash != state["server_sha256"]):
+                        raise ValueError("staged memory server checksum mismatch")
+                    state["rebuilt_on_memory_host"] = deployment["rebuilt_on_memory_host"]
+                    state["server_sha256"] = copied_hash
+                scp(str(Path(state["local_dir"]) / "server.config"),
+                    f"{host}:{state['remote_dir']}/server.config")
+                start = server_start_command(state)
+            except Exception:
+                if (state.get("pid") is None
+                        and state.get("launch_attempted") is False):
+                    state["status"] = "not_started"
+                    write_endpoint_manifest(state)
+                raise
+            # Persist intent before the SSH start call. If the call's outcome
+            # is unknown, cleanup must remain fail-closed even with pid=None.
+            state["launch_attempted"] = True
+            write_endpoint_manifest(state)
             birth_lower_ns = time.monotonic_ns()
             response = ssh(host, start).stdout.strip()
             birth_upper_ns = time.monotonic_ns()
@@ -803,6 +1000,7 @@ def run(args: argparse.Namespace) -> int:
             state["status"] = "running"
             write_endpoint_manifest(state)
 
+        run_parallel_endpoint_steps(launch_endpoint)
         if collect_remote_cpu:
             try:
                 remote_cpu_collector = remote_cpu.RemoteCpuCollector(
@@ -826,9 +1024,12 @@ def run(args: argparse.Namespace) -> int:
                 write_json(args.out / "remote-cpu.json", remote_cpu_result)
                 remote_cpu_finalized = True
                 raise
-        environment = client_process_environment(args.app, site, args.system, os.environ)
+        environment = client_process_environment(
+            args.app, client_site, args.system, os.environ)
         environment = recovery_check.client_env(environment, capture_path, ec)
         environment = latency_adapter.environment(environment, latency)
+        if figure13 is not None:
+            environment = kv_recovery.apply_environment(environment, figure13)
         if site.get("compute_ld_library_path"):
             environment["LD_LIBRARY_PATH"] = site["compute_ld_library_path"]
         client_launch_ns = time.monotonic_ns()
@@ -836,12 +1037,25 @@ def run(args: argparse.Namespace) -> int:
             with (stdin_path.open("r", encoding="utf-8") if stdin_path
                   else open(os.devnull)) as input_stream:
                 try:
-                    if recover_endpoint is None:
+                    if figure13 is not None:
+                        exit_status, injection = kv_recovery.run_client(
+                            command, stdin=input_stream, stdout=output, env=environment,
+                            timeout=args.timeout, cwd=args.out,
+                            failure_states=[
+                                endpoint_states[index]
+                                for index in figure13["failed_endpoints"]
+                            ],
+                            identity_script=process_identity_script, ssh=ssh,
+                            trigger_event=figure13["trigger_event"],
+                            trigger_delay_s=figure13["fault_delay_s"],
+                            execution_state=client_execution)
+                        write_json(args.out / "failure-injection.json", injection)
+                    elif recover_endpoint is None:
                         exit_status = recovery_check.run_client(
                             command, stdin=input_stream, stdout=output, env=environment,
                             timeout=args.timeout, capture=capture_path, inject=None,
                             evidence=injection, execution_state=client_execution,
-                            benchmark_start_env=collect_remote_cpu)
+                            record_launch_time=collect_remote_cpu)
                     else:
                         def inject():
                             proof = inject_owned_failure(endpoint_states[recover_endpoint])
@@ -851,14 +1065,14 @@ def run(args: argparse.Namespace) -> int:
                             command, stdin=input_stream, stdout=output, env=environment,
                             timeout=args.timeout, capture=capture_path, inject=inject,
                             evidence=injection, execution_state=client_execution,
-                            benchmark_start_env=collect_remote_cpu)
+                            record_launch_time=collect_remote_cpu)
                 except subprocess.TimeoutExpired:
                     exit_status = 124
                     timed_out = True
         client_end_ns = time.monotonic_ns()
         if remote_cpu_collector is not None and not remote_cpu_finalized:
             client_launch_ns = int(client_execution.get(
-                "benchmark_start_monotonic_ns") or client_launch_ns)
+                "client_launch_monotonic_ns") or client_launch_ns)
             remote_cpu_result = remote_cpu_collector.finish(
                 client_end_ns=client_end_ns, client_launch_ns=client_launch_ns)
             write_json(args.out / "remote-cpu.json", remote_cpu_result)
@@ -883,7 +1097,7 @@ def run(args: argparse.Namespace) -> int:
                 expected_workers=plan["worker_profile"]["app_workers"])
         if reference_chat is not None:
             check["chat_reference"] = recovery_check.compare_chat(capture_path, reference_chat)
-        if args.system == "starfish":
+        if args.system == "starfish" and figure13 is None:
             check["design2"] = validate_design2(
                 args.out.joinpath("client.log").read_text(encoding="utf-8", errors="replace"),
                 expected_bfs_repetitions=site.get("bfs_repetitions", 1)
@@ -900,7 +1114,10 @@ def run(args: argparse.Namespace) -> int:
                 plan["worker_profile"],
                 expected_resident_bytes=int(config_value(
                     effective, "local_resident_budget_bytes") or "0"))
-        if ec:
+        if figure13 is not None:
+            check["figure13"] = kv_recovery.validate_run(
+                args.out, plan["figure13"], injection)
+        if ec and figure13 is None:
             check["recovery"] = recovery_check.validate_log(
                 args.out.joinpath("client.log").read_text(encoding="utf-8", errors="replace"),
                 injection if recover_endpoint is not None else None,
@@ -911,7 +1128,7 @@ def run(args: argparse.Namespace) -> int:
         if remote_cpu_collector is not None and not remote_cpu_finalized:
             try:
                 launch = client_execution.get(
-                    "benchmark_start_monotonic_ns") or client_launch_ns
+                    "client_launch_monotonic_ns") or client_launch_ns
                 remote_cpu_result = remote_cpu_collector.finish(
                     client_end_ns=None, client_launch_ns=launch)
                 write_json(args.out / "remote-cpu.json", remote_cpu_result)
@@ -929,7 +1146,7 @@ def run(args: argparse.Namespace) -> int:
         if remote_cpu_collector is not None and not remote_cpu_finalized:
             try:
                 launch = client_execution.get(
-                    "benchmark_start_monotonic_ns") or client_launch_ns
+                    "client_launch_monotonic_ns") or client_launch_ns
                 remote_cpu_result = remote_cpu_collector.finish(
                     client_end_ns=None, client_launch_ns=launch)
                 write_json(args.out / "remote-cpu.json", remote_cpu_result)
@@ -944,7 +1161,9 @@ def run(args: argparse.Namespace) -> int:
                     state["status"] = "cleanup_failed"
                     state["error"] = str(exc)
                     error += f"; {state['name']} cleanup check: {exc}"
-            if state.get("remote_dir_created"):
+            if (state.get("remote_dir_created")
+                    and not (state.get("launch_attempted") is False
+                             and state.get("pid") is None)):
                 try:
                     scp(f"{state['memory_host']}:{state['remote_dir']}/server.log",
                         str(Path(state["local_dir"]) / "server.log"))
@@ -964,6 +1183,7 @@ def run(args: argparse.Namespace) -> int:
             check = recovered_measurement
         analysis = {
             "schema_version": 1, "application": args.app,
+            "repeat": repeat,
             "baseline_variant": baseline_variant,
             "backup_enabled": backup_enabled,
             "workload": WORKLOAD_LABEL[args.app],
@@ -990,6 +1210,7 @@ def run(args: argparse.Namespace) -> int:
             "carbink": check.get("carbink"),
             "nonft_kv": check.get("nonft_kv"),
             "recovery": check.get("recovery"),
+            "figure13": check.get("figure13"),
             "chat_reference": check.get("chat_reference"),
             "failure_injection": injection or None,
             "ft_method": config_value(effective, "ft_method") or "none",
@@ -1018,6 +1239,9 @@ def run(args: argparse.Namespace) -> int:
             manifest["remote_cpu"] = remote_cpu_result
             manifest["remote_cpu_sidecar"] = str(args.out / "remote-cpu.json")
         write_json(args.out / "manifest.json", manifest)
+        if figure13 is not None and analysis["status"] == "passed":
+            kv_recovery.write_result(
+                args.out, passed=True, plan=plan["figure13"])
     if analysis["status"] == "passed":
         print(f"PASS {analysis['run_id']}: work {analysis['elapsed_s']:.6f} s "
               f"(details: {args.out / 'analysis.json'})")
@@ -1037,6 +1261,8 @@ def main() -> int:
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--repeat", type=int,
+                        help="batch repetition index; defaults to the run directory suffix or 1")
     parser.add_argument("--baseline-variant",
                         choices=("nonft-backup-off",))
     parser.add_argument("--recipe", type=Path)
@@ -1049,9 +1275,16 @@ def main() -> int:
     parser.add_argument("--capture-chat", action="store_true")
     parser.add_argument("--reference-chat", type=Path)
     parser.add_argument("--recover-endpoint", type=int)
+    parser.add_argument("--figure13-scenario", choices=("1-node", "2-node"))
+    parser.add_argument("--figure13-repeat", type=int)
+    parser.add_argument("--figure13-observer-cpu", type=int)
     parser.add_argument("--collect-remote-cpu", "--remote-cpu",
                         dest="collect_remote_cpu", action="store_true",
                         help="opt in to owned memory-service CPU sidecar sampling")
+    parser.add_argument("--collect-remote-memory", action="store_true",
+                        help="enable timed remote-memory samples for Figure 11")
+    parser.add_argument("--remote-memory-observer-cpu", type=int,
+                        help="override the automatically derived memory observer CPU")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check-local", action="store_true",
                         help="validate local inputs and recipe without writing or using SSH")

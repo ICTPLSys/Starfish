@@ -18,7 +18,7 @@ inline bool ConcurrentArrayCache::post_fetch(far_obj_t obj,
     }
 retry:
     auto old_state = entry.load_state();
-    if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
+    if (old_state.invalid) [[unlikely]] {
         auto spin_start = get_cycles();
         profile::count_excl_move_lock_spin();
         profile::count_excl_move_lock_spin_cycles(get_cycles() - spin_start);
@@ -41,7 +41,7 @@ retry:
         return false;
     case MARKED:
     case EVICTING:
-        if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
+        if (old_state.invalid) [[unlikely]] {
             auto spin_start = get_cycles();
             profile::count_excl_move_lock_spin();
             profile::count_excl_move_lock_spin_cycles(get_cycles() - spin_start);
@@ -63,7 +63,11 @@ retry:
         // A page can have many simultaneous subobject missers. Do not publish
         // FETCHING until its buffer and completion client are initialized.
         new_state.state = entry.hydra_page() ? BUSY : FETCHING;
-        if (!entry.cas_state_weak(old_state, new_state)) {
+        // Keep the existing page BUSY publication protocol. Non-page fetches
+        // need the same metadata protection: local_addr is written in pieces.
+        auto claim_state = new_state;
+        claim_state.invalid = !entry.hydra_page();
+        if (!entry.cas_state_weak(old_state, claim_state)) {
             deallocate_local(local_ptr, entry);
             if (placement.backup_reserved) {
                 release_remote_backup_budget(obj.size);
@@ -91,6 +95,8 @@ retry:
                 // rollback point: another state may already reference this buffer.
                 ERROR("hydra: lost BUSY ownership before fetch publication");
             }
+        } else {
+            ASSERT(entry.cas_state_strong(claim_state, new_state));
         }
         this->post_read_request_with_idx(obj, client_idx,
                                          sync_batch_eligible);
@@ -149,16 +155,18 @@ inline bool ConcurrentArrayCache::post_fetch_lite_slow_path(
     }
     auto old_state = entry.load_state(std::memory_order::relaxed);
 retry:
-    if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
+    if (old_state.invalid) [[unlikely]] {
         auto spin_start = get_cycles();
         profile::count_excl_move_lock_spin();
-        old_state = entry.load_state(std::memory_order::relaxed);
+        old_state = entry.load_state(std::memory_order_acquire);
         profile::count_excl_move_lock_spin_cycles(get_cycles() - spin_start);
         goto retry;
     }
     if constexpr (Mut) {
         if (invalidate_retained_backup_for_write(entry, obj.size)) {
             old_state = entry.load_state(std::memory_order::relaxed);
+            // The helper released its lock; recheck a new publisher's invalid.
+            goto retry;
         }
     }
     auto new_state = old_state;
@@ -197,7 +205,7 @@ retry:
         return false;
     case MARKED:
     case EVICTING:
-        if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
+        if (old_state.invalid) [[unlikely]] {
             auto spin_start = get_cycles();
             profile::count_excl_move_lock_spin();
             old_state = entry.load_state(std::memory_order::relaxed);
@@ -229,7 +237,11 @@ retry:
             local_behavior_group(entry, placement.requested_placement));
         void* local_ptr = allocation.get();
         new_state.state = entry.hydra_page() ? BUSY : FETCHING;
-        if (!entry.cas_state_weak(old_state, new_state)) {
+        // Allocation is complete before claiming publication. No miss handler,
+        // fibre yield or RDMA polling runs before the metadata is released.
+        auto claim_state = new_state;
+        claim_state.invalid = !entry.hydra_page();
+        if (!entry.cas_state_weak(old_state, claim_state)) {
             deallocate_local(local_ptr, entry);
             if (placement.backup_reserved) {
                 release_remote_backup_budget(obj.size);
@@ -257,6 +269,8 @@ retry:
             if (!entry.hydra_publish_fetching()) {
                 ERROR("hydra: lost BUSY ownership before fetch publication");
             }
+        } else {
+            ASSERT(entry.cas_state_strong(claim_state, new_state));
         }
         this->post_read_request_with_idx(obj, client_idx,
                                          sync_batch_eligible);
@@ -286,6 +300,8 @@ retry:
 inline bool ConcurrentArrayCache::check_fetch(FarObjectEntry *entry,
                                               fetch_ddl_t &ddl) {
     entry = entry->hydra_owner();
+    const auto state = entry->load_state(std::memory_order_acquire);
+    if (state.invalid || state.state == BUSY) return false;
     fetch_ddl_t now = __rdtsc();
     auto client_idx = entry->get_client_idx();
     auto *client = rdma::get_client(client_idx);
@@ -313,10 +329,11 @@ inline bool ConcurrentArrayCache::check_fetch(FarObjectEntry *entry,
 inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
     FarObjectEntry *entry, void *wait_local_addr, size_t qp_idx, size_t client_idx,
     size_t endpoint_idx) {
-    // Keep the allocator block as the wait identity.  Accessor moves transfer
+    // Keep the allocator block as a fallback identity. Accessor moves transfer
     // FETCHING and the recipe binding to a new FarObjectEntry, while the
     // original waiter's entry pointer becomes FREE; resolving this metadata
-    // on every round prevents a waiter from spinning on that stale pointer.
+    // only for a FREE old entry retains move support without consulting an
+    // old block during an ordinary stable-entry fetch.
     // Capture the local address before calling the miss handler: the handler
     // may itself move the accessor and clear the old entry's address.
     auto *wait_block = wait_local_addr != nullptr
@@ -327,6 +344,8 @@ inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
         // Page descriptors never relocate. An old allocator block can be
         // reused for another page, so it is not a valid identity for Hydra.
         if (stable_page_owner) return entry;
+        if (entry->load_state(std::memory_order_acquire).state != FREE)
+            return entry;
         if (wait_block == nullptr) return entry;
         const auto current_obj = wait_block->obj_meta_data.load(
             std::memory_order_acquire);
@@ -349,7 +368,9 @@ inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
         uint64_t ec_wait_rounds = 0;
     while (true) {
             entry = resolve_wait_entry();
-            if (entry->is_local()) break;
+            const auto state = entry->load_state(std::memory_order_acquire);
+            if (state.invalid || state.state == BUSY) continue;
+            if (state.state <= EVICTING) break;
             client_idx = entry->get_client_idx();
             if (auto *current_client = rdma::get_client(client_idx)) {
                 qp_idx = current_client->get_qp_idx();

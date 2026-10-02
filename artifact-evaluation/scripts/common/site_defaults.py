@@ -93,6 +93,14 @@ def _placement_named_map(value, label, selector, allowed_names):
 
 
 def _apply_placement(site, compute, *, system, app):
+    expanded_background = ((system, app) == ("starfish", "mg") or
+                           (app in {"kv-a", "kv-b", "kv-s"} and
+                            system in {"nonft", "starfish"}))
+    if expanded_background and compute.get("ip") == "10.208.130.56":
+        compute = copy.deepcopy(compute)
+        compute.setdefault("placement_by_case", {}).setdefault(f"{app}/{system}", {
+            "fibre_cpu_set": "0-13,24-33", "background_cpu_base": 14,
+        })
     placement = {}
     # All machine defaults precede all explicit site settings. Within either
     # layer, the more specific selector wins; preserve existing site precedence.
@@ -151,7 +159,10 @@ def resolve(raw, ae_root, *, system=None, app=None):
     root = site.setdefault("memory_project_root", str(ae_root.parent))
     if not isinstance(root, str) or not REMOTE_PATH.fullmatch(root) or ".." in Path(root).parts:
         raise ValueError("memory_project_root must be an absolute project root")
-    directory = site.get("data_dir", os.environ.get("AE_PREPARED_DATA_DIR", "/data/starfish-ae"))
+    directory = site.get(
+        "data_dir",
+        os.environ.get("AE_PREPARED_DATA_DIR", str(ae_root / "data/inputs")),
+    )
     if not isinstance(directory, str) or not Path(directory).is_absolute():
         raise ValueError("data_dir must be an absolute directory")
     site["data_dir"] = directory

@@ -13,7 +13,32 @@ SERVER_KEYS = (
 )
 
 
-def memory_lower_bound(effective, workers):
+def endpoint_ports(specs):
+    """Give the legacy port-indexed protocol an unambiguous endpoint list."""
+    result = [dict(spec) for spec in specs]
+    if not result:
+        raise ValueError("Carbink requires memory endpoints")
+    requested = [int(spec["server_port"]) for spec in result]
+    # The legacy parser identifies itself by SERVER_PORT, not (address, port).
+    # Preserve distinct explicit ports; derive a sequence for repeated defaults.
+    derived = len(set(requested)) != len(requested)
+    ports = [requested[0] + i for i in range(len(result))] if derived else requested
+    occupied = {}
+    for spec, original, port in zip(result, requested, ports):
+        if not 1 <= port <= 55535:
+            raise ValueError("Carbink service port must leave room for its +10000 peer port")
+        peer = port + 10000
+        used = occupied.setdefault(spec["memory_addr"], set())
+        if port in used or peer in used:
+            raise ValueError("Carbink service/peer port collision on " + spec["memory_addr"])
+        used.update((port, peer))
+        spec.update(server_port=port, peer_server_port=peer,
+                    requested_server_port=original,
+                    port_reason="logical_index_derived" if derived else "site_requested")
+    return result
+
+
+def memory_lower_bound(effective, workers, *, endpoint_count=None, figure13=False):
     """Known fixed reservations, excluding verbs and other process memory."""
     values = {}
     for line in effective.splitlines():
@@ -26,6 +51,8 @@ def memory_lower_bound(effective, workers):
     receive_cap = int(values.get("qp_recv_cap", "128"))
     send_cap = int(values.get("qp_send_cap", "128"))
     data_pool = int(values["server_buffer_size"])
+    if figure13 and endpoint_count not in (7, 8):
+        raise ValueError("Figure13 Carbink reservation needs seven or eight endpoints")
     if min(qp_count, receive_cap, send_cap, data_pool) <= 0:
         raise ValueError("Carbink memory reservation requires positive capacities")
     data_qps = (clients + 1) * qp_count
@@ -86,7 +113,7 @@ def memory_lower_bound(effective, workers):
     }
 
 
-def server_config(effective, spec, site):
+def server_config(effective, spec, site, *, figure13=False):
     values = {}
     for line in effective.splitlines():
         fields = line.split()
@@ -94,8 +121,13 @@ def server_config(effective, spec, site):
             values[fields[0]] = fields[1]
     count = int(values["server_count"])
     capacity = int(values["server_buffer_size"])
-    if count != 6 or capacity <= 0 or capacity % (512 * 1024):
-        raise ValueError("Carbink requires six endpoints and 512KiB-aligned per-endpoint capacity")
+    if figure13:
+        if count not in (7, 8):
+            raise ValueError("Figure13 Carbink requires seven or eight endpoints")
+    elif count != 6:
+        raise ValueError("Carbink requires exactly six endpoints")
+    if capacity <= 0 or capacity % (512 * 1024):
+        raise ValueError("Carbink requires 512KiB-aligned per-endpoint capacity")
     # The frozen server divides TOTAL capacity before SERVER_PORT selects its
     # index. Retain all peers for its server-to-server compaction connections.
     values["server_buffer_size"] = str(capacity * count)
@@ -110,10 +142,13 @@ def server_config(effective, spec, site):
     pin = site.get("carbink_server_pin_cores")
     if pin is not None:
         rows = pin.split(",") if isinstance(pin, str) else []
-        if len(rows) != count or any(
-                not re.fullmatch(r"[0-9]+(?::[0-9]+){3}", row) for row in rows):
-            raise ValueError("carbink_server_pin_cores needs six four-CPU colon-separated rows")
-        values["server_pin_cores"] = pin
+        valid_pin = len(rows) == count and all(
+            re.fullmatch(r"[0-9]+(?::[0-9]+){3}", row) for row in rows)
+        if not valid_pin:
+            raise ValueError(
+                "carbink_server_pin_cores needs one four-CPU row per endpoint")
+        else:
+            values["server_pin_cores"] = pin
     return "".join(f"{key} {value}\n" for key, value in values.items())
 
 

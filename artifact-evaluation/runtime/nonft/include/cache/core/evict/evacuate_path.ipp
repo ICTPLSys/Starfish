@@ -474,12 +474,13 @@ inline void ConcurrentArrayCache::evacuate_work() {
         const size_t configured_mark_workers = get_mark_worker_count();
         const size_t evict_workers = get_evict_worker_count(configured_mark_workers);
         const size_t mark_workers = configured_mark_workers;
-        std::cerr << "runtime.exclusive_owned_batch="
-                  << (optimized_enabled &&
-                      optimized_legacy_exclusive_pipeline_enabled() &&
-                      exclusive_owned_batch_reclaim_enabled())
-                  << " mark_workers=" << mark_workers
-                  << " evict_workers=" << evict_workers << std::endl;
+        std::fprintf(
+            stdout,
+            "runtime.exclusive_owned_batch=%d mark_workers=%zu evict_workers=%zu\n",
+            static_cast<int>(optimized_enabled &&
+                             optimized_legacy_exclusive_pipeline_enabled() &&
+                             exclusive_owned_batch_reclaim_enabled()),
+            mark_workers, evict_workers);
         uint64_t handled_eviction_request_seq = 0;
         auto requeue_pending_pipeline_tasks = [&] {
             const size_t pending = pipeline_ready_tasks.size();

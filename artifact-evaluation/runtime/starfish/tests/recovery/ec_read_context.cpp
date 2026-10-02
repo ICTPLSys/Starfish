@@ -20,6 +20,7 @@ using FarLib::cache::ec_batch::EcStagingGroupSlot;
 using FarLib::cache::ec_read_recovery::EcReadContext;
 using FarLib::cache::ec_read_recovery::EcReadContextEvent;
 using FarLib::cache::ec_read_recovery::EcReadContextPool;
+using FarLib::cache::ec_read_recovery::EcReadStorageMode;
 using FarLib::cache::ec_read_recovery::EcReadTokenEventKind;
 using FarLib::cache::ec_read_recovery::ec_read_wr_id_segment;
 using FarLib::cache::ec_read_recovery::ec_read_wr_id_token;
@@ -317,6 +318,76 @@ void test_rebuilt_single_read() {
     }
 }
 
+void test_direct_split_mode_closes_and_releases() {
+    const auto scratch = scratch_for(41);
+    constexpr uint8_t data_mask = 0x0f;
+    constexpr uint8_t physical_all = kAllSegments;
+
+    {
+        EcReadContextPool pool(1, 0);
+        uint64_t id = 0;
+        EcReadContext *context = nullptr;
+        assert(pool.acquire(0, 0x1700000, 0x1800000, 2042, data_mask, 0,
+                            scratch, &id, &context, 8168, physical_all,
+                            EcReadStorageMode::kDirectSplit));
+        assert(context->storage_mode == EcReadStorageMode::kDirectSplit);
+        for (uint8_t segment = 0; segment < 4; ++segment)
+            assert(pool.mark_segment_posted(id, segment));
+        for (uint8_t segment : {2, 0, 3, 1})
+            assert_pending(pool.complete_segment_event(id, segment, true));
+        const auto event = pool.finish_posting(id);
+        assert(event.kind == EcReadTokenEventKind::kWinner);
+        assert(event.storage_mode == EcReadStorageMode::kDirectSplit);
+        assert(event.split_payload_bytes == 8168);
+        assert(pool.release(id));
+    }
+
+    // Keep the direct generation live while one accepted CQE is outstanding.
+    // A CQE that races the posting mark must also be accounted for before the
+    // close; only the final failed CQE is allowed to produce kRelease.
+    {
+        EcReadContextPool pool(1, 0);
+        uint64_t id = 0;
+        EcReadContext *context = nullptr;
+        assert(pool.acquire(0, 0x1b00000, 0x1c00000, 2043, data_mask, 0,
+                            scratch, &id, &context, 8169, physical_all,
+                            EcReadStorageMode::kDirectSplit));
+        assert_pending(pool.complete_segment_event(id, 0, true));
+        assert(pool.mark_segment_posted(id, 0));
+        for (uint8_t segment = 1; segment < 4; ++segment)
+            assert(pool.mark_segment_posted(id, segment));
+        assert_pending(pool.complete_segment_event(id, 1, true));
+        assert_pending(pool.complete_segment_event(id, 2, true));
+        const auto pending = pool.finish_posting(id);
+        assert(pending.kind == EcReadTokenEventKind::kPending);
+        assert(pool.in_use() == 1);
+        const auto release = pool.complete_segment_event(id, 3, false);
+        assert(release.kind == EcReadTokenEventKind::kRelease);
+        assert(release.storage_mode == EcReadStorageMode::kDirectSplit);
+        assert(pool.release(id));
+    }
+
+    // A partial post/failure still waits for every accepted direct READ before
+    // emitting kRelease; the caller can then retry without a scratch lease.
+    {
+        EcReadContextPool pool(1, 0);
+        uint64_t id = 0;
+        EcReadContext *context = nullptr;
+        assert(pool.acquire(0, 0x1900000, 0x1a00000, 2042, data_mask, 0,
+                            scratch, &id, &context, 8168, physical_all,
+                            EcReadStorageMode::kDirectSplit));
+        assert(pool.mark_segment_posted(id, 0));
+        assert(pool.mark_segment_posted(id, 1));
+        assert_pending(pool.complete_segment_event(id, 0, false));
+        assert_pending(pool.complete_segment_event(id, 1, true));
+        const auto event = pool.finish_posting(id);
+        assert(event.kind == EcReadTokenEventKind::kRelease);
+        assert(event.storage_mode == EcReadStorageMode::kDirectSplit);
+        assert(pool.release(id));
+        assert(pool.in_use() == 0);
+    }
+}
+
 int main() {
     test_success_reorder_and_close();
     test_completion_before_post_mark();
@@ -325,5 +396,6 @@ int main() {
     test_concurrent_last_winner();
     test_growth_and_owner_return_stack();
     test_rebuilt_single_read();
+    test_direct_split_mode_closes_and_releases();
     return 0;
 }

@@ -542,6 +542,16 @@ inline void ConcurrentArrayCache::handle_rdma_read_complete(
             }
         }
     } read_pin_guard{release_read_pin, wc.wr_id};
+    if (read_owner_diag::enabled() && release_read_pin) {
+        const auto obj = block->obj_meta_data.load(std::memory_order_acquire);
+        if (!obj.is_null()) {
+            auto &e = get_entry_of(obj);
+            const auto remote = e.remote_addr();
+            if (remote != FarObjectEntry::RemoteAddrInvalid48)
+                read_owner_diag::completed(e.get_client_idx(),
+                    ::FarLib::get_config().map_remote_addr(remote).first);
+        }
+    }
 retry:
     auto obj = block->obj_meta_data.load(std::memory_order_acquire);
     if (obj.is_null()) [[unlikely]] return;
@@ -663,6 +673,7 @@ retry:
             ++finalize_retry_count;
         }
 
+        read_owner_diag::published(wc.wr_id);
         if (retain_backup) {
             return;
         }
@@ -685,6 +696,25 @@ retry:
 }
 
 inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
+    if (carbink::shadow::is_wr_id(wc.wr_id)) {
+        if (wc.status != IBV_WC_SUCCESS)
+            note_ec_recovery_error_wc(wc);
+        if (!carbink::shadow::IoBatch::consume_completion(wc))
+            ERROR("unexpected Carbink shadow completion");
+        return;
+    }
+    if (ec_background::is_wr_id(wc.wr_id)) {
+        if (!handle_background_rebuild_complete(wc))
+            ERROR("unexpected background rebuild completion");
+        return;
+    }
+    if (::FarLib::get_config().ft_background_rebuild &&
+        wc.status != IBV_WC_SUCCESS)
+        note_ec_recovery_error_wc(wc);
+    if (wc.opcode == IBV_WC_RDMA_READ && wc.status == IBV_WC_SUCCESS &&
+        read_owner_diag::enabled())
+        read_owner_diag::received(wc.wr_id,
+            reinterpret_cast<uint64_t>(fibre_self()));
     if ((wc.opcode == IBV_WC_SEND || wc.opcode == IBV_WC_RECV ||
          wc.status != IBV_WC_SUCCESS) &&
         ::FarLib::get_config().is_carbink_mode() &&
@@ -699,7 +729,8 @@ inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
         // served from the surviving segments of its slot group instead.
         // Gated: with ft_method=none this branch is exactly the old one.
         if (::FarLib::get_config().is_ec_batch_mode()) [[unlikely]] {
-            note_ec_recovery_error_wc(wc);
+            if (!::FarLib::get_config().ft_background_rebuild)
+                note_ec_recovery_error_wc(wc);
             if (ec_batch::is_ec_batch_wr_id(wc.wr_id)) {
                 // Failed/flush completions also discharge hardware ownership.
                 // The group succeeds only if at least four other durable
@@ -774,6 +805,7 @@ inline void ConcurrentArrayCache::handle_work_complete(const ibv_wc &wc) {
             handle_ec_read_segment_complete(wc.wr_id);
         } else {
             handle_rdma_read_complete(wc);
+            read_owner_diag::finish(wc.wr_id);
         }
     } else if (wc.opcode == IBV_WC_SEND) {
         // EC commit RPC: the SEND completion releases its client send slot.

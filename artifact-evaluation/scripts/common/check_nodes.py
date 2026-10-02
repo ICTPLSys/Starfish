@@ -16,6 +16,7 @@ from node_probe import idle_exempt_process
 
 ROOT = Path(__file__).resolve().parents[2]
 TIMEOUT_SECONDS = 15
+DEFAULT_SERVER_PORT = 1893
 LOAD_POLICY = {
     "process_cpu_percent": 100.0,  # One logical CPU = 100%.
     "process_rss_bytes": 8 * 1024**3,
@@ -46,7 +47,56 @@ def load_targets(inventory, site, user=None):
     if not isinstance(servers, list) or not servers:
         raise ValueError("machine inventory must contain a nonempty servers list")
     raw_site = json.loads(Path(site).read_text()) if site and Path(site).is_file() else {}
-    records = [raw_site] + raw_site.get("memory_endpoints", [])
+    endpoint_records = raw_site.get("memory_endpoints", [])
+    if endpoint_records is None:
+        endpoint_records = []
+    if not isinstance(endpoint_records, list):
+        raise ValueError("site memory_endpoints must be a list")
+    site_port = raw_site.get("server_port", DEFAULT_SERVER_PORT)
+    try:
+        site_port = int(site_port)
+    except (TypeError, ValueError) as error:
+        raise ValueError("server_port must be an integer") from error
+    if not 1 <= site_port <= 65535:
+        raise ValueError("server_port must be between 1 and 65535")
+    if not endpoint_records:
+        legacy_address = (raw_site.get("memory_ip") or raw_site.get("memory_addr")
+                          or raw_site.get("ip"))
+        legacy_count = raw_site.get("memory_server_count", 1)
+        if isinstance(legacy_count, bool) or not isinstance(legacy_count, int) \
+                or not 1 <= legacy_count <= 64:
+            raise ValueError("memory_server_count must be an integer in 1..64")
+        if legacy_address:
+            endpoint_records = [
+                {"ip": legacy_address, "server_port": site_port + index}
+                for index in range(legacy_count)]
+    endpoint_ports = {}
+    for endpoint in endpoint_records:
+        if not isinstance(endpoint, dict):
+            raise ValueError("site memory endpoint must be an object")
+        address = endpoint.get("memory_ip") or endpoint.get("memory_addr") or endpoint.get("ip")
+        if address:
+            normalized = str(ip_address(address))
+            endpoint_ports.setdefault(normalized, set())
+            raw_port = endpoint.get("server_port", site_port)
+            if raw_port is not None:
+                try:
+                    port = int(raw_port)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("server_port must be an integer") from error
+                if not 1 <= port <= 65535:
+                    raise ValueError("server_port must be between 1 and 65535")
+                endpoint_ports[normalized].add(port)
+    inventory_port = data.get("server_port")
+    if inventory_port is not None:
+        try:
+            inventory_port = int(inventory_port)
+        except (TypeError, ValueError) as error:
+            raise ValueError("server_port must be an integer") from error
+        if not 1 <= inventory_port <= 65535:
+            raise ValueError("server_port must be between 1 and 65535")
+    site_has_topology = bool(endpoint_records)
+    records = [raw_site] + endpoint_records
     overrides, usernames = {}, set()
     for record in records:
         host = record.get("memory_host")
@@ -72,8 +122,12 @@ def load_targets(inventory, site, user=None):
         host = host or (default_user + "@" + address if default_user else address)
         if user:
             host = user + "@" + host.rsplit("@", 1)[-1]
+        expected_ports = sorted(endpoint_ports.get(address, set()))
+        if not site_has_topology:
+            expected_ports = [inventory_port or DEFAULT_SERVER_PORT]
         targets.append({"ip": address, "hostname": record.get("hostname", address),
-                        "ssh_host": ssh_target(host)})
+                        "ssh_host": ssh_target(host),
+                        "expected_server_ports": expected_ports})
     return targets
 
 
@@ -139,6 +193,10 @@ def availability(row):
     processes = snap.get("processes", [])
     known = [p for p in processes if p.get("kind") != "candidate_server"]
     candidates = [p for p in processes if p.get("kind") == "candidate_server"]
+    expected_ports = {int(port) for port in row.get("expected_server_ports", [])}
+    listening_ports = {int(port) for port in snap.get("tcp_listen_ports", [])
+                       if isinstance(port, int) or str(port).isdigit()}
+    port_conflicts = sorted(expected_ports & listening_ports)
     resource = {p.get("pid"): p for p in (
         snap.get("top_processes", []) + snap.get("top_memory_processes", []) + processes)}
     exempt = [p for p in snap.get("idle_exempt_processes", []) if idle_exempt_process(p)]
@@ -162,12 +220,21 @@ def availability(row):
     memory_busy = bool(high_memory) or pressure
     complete = (not row.get("error") and snap.get("visibility_complete", False)
                 and cpu is not None and total is not None and total > 0 and available is not None
-                and "top_memory_processes" in snap and exempt_complete)
-    if cpu_busy or memory_busy:
-        load = "CPU + memory" if cpu_busy and memory_busy else "high CPU" if cpu_busy else "high memory"
+                and "top_memory_processes" in snap and "tcp_listen_ports" in snap
+                and exempt_complete)
+    busy_reasons = []
+    if cpu_busy:
+        busy_reasons.append("high CPU")
+    if memory_busy:
+        busy_reasons.append("high memory")
+    if port_conflicts:
+        busy_reasons.append("server-port " + ",".join(map(str, port_conflicts)))
+    if busy_reasons:
+        load = " + ".join(busy_reasons)
     else:
         load = "clear" if complete else "unknown"
-    idle = False if known or cpu_busy or memory_busy else None if not complete or candidates else True
+    idle = (False if known or port_conflicts or cpu_busy or memory_busy
+            else None if not complete or candidates else True)
     labels = {"run_chat_far": "LLaMA", "gapbs_bfs_chunked": "BFS", "mg": "MG",
               "wordcount_far": "WC", "nhop_graph": "NQ", "kvs_throughput": "KV"}
     groups = {}
@@ -187,12 +254,30 @@ def availability(row):
         groups[label] = groups.get(label, 0) + 1
     runtime = ", ".join(label + (f" x{count}" if count > 1 else "")
                         for label, count in groups.items())
+    if port_conflicts:
+        runtime = (runtime + ", " if runtime else "") + \
+            "server-port " + ",".join(map(str, port_conflicts))
     if not runtime:
         runtime = "possible server" if candidates else "none" if complete else "unknown"
     return {"idle": idle, "load": load, "runtime": runtime,
             "effective_host_cpu_percent": effective_cpu,
             "idle_exempt_processes": exempt,
-            "high_cpu_processes": high_cpu, "high_memory_processes": high_memory}
+            "high_cpu_processes": high_cpu, "high_memory_processes": high_memory,
+            "port_conflicts": port_conflicts}
+
+
+def report_exit_code(report, require_idle=False):
+    states = [row.get("availability") or availability(row) for row in report["nodes"]]
+    incomplete = any("error" in row or
+                     not row.get("snapshot", {}).get("visibility_complete", False)
+                     for row in report["nodes"])
+    unknown = incomplete or any(state["idle"] is None for state in states)
+    busy = any(state["idle"] is False for state in states)
+    if require_idle:
+        if unknown:
+            return 3
+        return 1 if busy else 0
+    return 1 if incomplete else 0
 
 
 def colorize(text, color, *, bold=False):
@@ -225,16 +310,17 @@ def display(report):
 
 def display_verbose(report):
     print("Read-only node activity snapshot — " + report["timestamp_utc"])
-    print("NODE             HOST             STATUS       CPU%   AVAILABLE/TOTAL GiB  TCP LISTEN")
+    print("NODE             HOST             STATUS       CPU%   AVAILABLE/TOTAL GiB  TCP LISTEN  EXPECTED")
     for row in report["nodes"]:
         snap = row.get("snapshot", {})
         memory = snap.get("memory", {})
         available = number(memory.get("available_bytes"), 1024**3)
         total = number(memory.get("total_bytes"), 1024**3)
         ports = ",".join(str(p) for p in snap.get("tcp_listen_ports", [])) or "-"
+        expected = ",".join(str(p) for p in row.get("expected_server_ports", [])) or "-"
         print(f"{row['ip']:<16} {clean(snap.get('hostname', row['hostname'])):<16} "
               f"{row['status']:<12} {number(snap.get('cpu_percent')):>5} "
-              f"{available + '/' + total:>21}  {ports}")
+              f"{available + '/' + total:>21}  {ports:<11} {expected}")
     for row in report["nodes"]:
         print("\n[" + row["ip"] + "] " + row["status"])
         if "error" in row:
@@ -259,6 +345,9 @@ def display_verbose(report):
                 f"{clean(p.get('user', '?'))}/{p['pid']} {clean(p.get('name', '?'))} "
                 f"{number(p.get('cpu_percent'))}%" for p in others))
         state = row.get("availability") or availability(row)
+        if state["port_conflicts"]:
+            print("  Configured server-port conflicts: " +
+                  ",".join(map(str, state["port_conflicts"])))
         if state["idle_exempt_processes"]:
             print("  Excluded from idle load: " + "; ".join(
                 f"{clean(p['user'])}/{p['pid']} {clean(p['name'])}"
@@ -272,7 +361,8 @@ def display_verbose(report):
     print("EXPERIMENT means recognized processes exist, including idle memory services.")
     print("NO_MATCH is not a reservation or an availability guarantee; REVIEW means a candidate server.")
     print("PARTIAL/UNKNOWN/UNREACHABLE cannot establish whether the node is free.")
-    print("Exit 0 means a complete snapshot, not that all nodes are idle.")
+    print("Without --require-idle, exit 0 means only a complete snapshot.")
+    print("With --require-idle: 0=all nodes idle, 1=known busy, 3=unknown/unreachable.")
     print("Idle thresholds: process CPU >=100% (one core) or RSS >=8 GiB; "
           "host CPU >=10% or available RAM <20%. Known experiment processes also block idle.")
     print("The clickhouse-owned clickhouse-server daemon is excluded from process load "
@@ -281,14 +371,17 @@ def display_verbose(report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
-        "Exit codes: 0 = complete snapshot (nodes may be busy), 1 = incomplete "
-        "snapshot, 2 = invalid configuration. Requires existing SSH access; no sudo."))
+        "Exit codes: default 0 = complete snapshot, 1 = incomplete snapshot, "
+        "2 = invalid configuration; --require-idle adds 1 = busy and 3 = "
+        "unknown/unreachable. Requires existing SSH access; no sudo."))
     parser.add_argument("--inventory", type=Path, default=ROOT / "configs/machines.json")
     parser.add_argument("--site", type=Path, default=ROOT / "data/site.json",
                         help="reuse SSH accounts/endpoint aliases from this site")
     parser.add_argument("--user", help="override the SSH username; otherwise reuse site/SSH settings")
     parser.add_argument("--json", action="store_true", help="print machine-readable snapshots")
     parser.add_argument("--verbose", action="store_true", help="show process/resource details and idle thresholds")
+    parser.add_argument("--require-idle", action="store_true",
+                        help="fail unless every node is completely observed and idle")
     args = parser.parse_args()
     try:
         targets = load_targets(args.inventory, args.site, args.user)
@@ -309,8 +402,7 @@ def main():
             if args.verbose:
                 print()
                 display_verbose(report)
-        return int(any("error" in row or not row.get("snapshot", {}).get("visibility_complete", False)
-                       for row in nodes))
+        return report_exit_code(report, args.require_idle)
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         parser.exit(2, "ERROR: " + str(error) + "\n")
 

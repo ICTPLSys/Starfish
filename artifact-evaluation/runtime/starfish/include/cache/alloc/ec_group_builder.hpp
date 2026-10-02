@@ -79,6 +79,14 @@ enum class EcBatchStatus : uint8_t {
     kInvalidArgument,
 };
 
+// Local source ownership for a sealed group.  Staging is the historical
+// snapshot path; SplitDirect keeps four data sources borrowed from the final
+// object and materializes only parity in the split lease.
+enum class EcGroupSourceMode : uint8_t {
+    kStaging = 0,
+    kSplitDirect = 1,
+};
+
 inline const char *ec_batch_status_name(EcBatchStatus status) {
     switch (status) {
         case EcBatchStatus::kOk:
@@ -149,6 +157,13 @@ public:
         // Whole-object size-class groups use the grow-on-demand registered
         // pool, not the fixed <=4 KiB legacy staging pool.
         bool size_class_staging = false;
+        EcGroupSourceMode source_mode = EcGroupSourceMode::kStaging;
+        // Direct split data sources/lengths.  objects[0] remains the logical
+        // object identity used by completion; these are the four RDMA data
+        // SGE bases.  Parity still comes from staging.parity[].
+        const void *split_data_sources[kEcBatchDataSlots]{};
+        uint32_t split_data_lengths[kEcBatchDataSlots]{};
+        uint32_t split_direct_write_bytes = 0;
 
         bool full() const { return live_count == kEcBatchDataSlots; }
 

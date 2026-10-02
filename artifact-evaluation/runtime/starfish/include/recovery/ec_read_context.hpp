@@ -85,6 +85,17 @@ enum class EcReadTokenEventKind : uint8_t {
 
 namespace FarLib::cache::ec_read_recovery {
 
+// Where a successful split-read round placed its accepted READ payloads.
+// Scratch is the existing survivor/rebuild path; DirectSplit is the opt-in
+// healthy data-only path that writes the four fragments directly into the
+// object's local allocation.  The mode is carried with the generation so a
+// completion/release path can never infer ownership from a default scratch
+// value.
+enum class EcReadStorageMode : uint8_t {
+    kScratch = 0,
+    kDirectSplit = 1,
+};
+
 // The existing wr_id encoder owns bits 56..63, leaving exactly 56 low bits.
 // Contexts are alignas(256), so their low eight address bits are implicit.
 inline constexpr size_t kEcReadContextPointerBits = 40;
@@ -130,6 +141,7 @@ struct alignas(256) EcReadContext {
     // physical endpoint-survivor mask; skipped scratch buffers are invalid.
     uint8_t alive_mask = 0;
     uint8_t own_shard_idx = 0;
+    EcReadStorageMode storage_mode = EcReadStorageMode::kScratch;
     ec_batch::EcStagingGroupSlot scratch{};
     uint64_t profile_acquire_ns = 0;
 
@@ -177,6 +189,7 @@ struct EcReadContextEvent {
     uint64_t profile_acquire_ns = 0;
     uint32_t profile_byte_count = 0;
     uint32_t split_payload_bytes = 0;
+    EcReadStorageMode storage_mode = EcReadStorageMode::kScratch;
 };
 
 class EcReadContextPool {
@@ -214,7 +227,9 @@ public:
                  const ec_batch::EcStagingGroupSlot &scratch,
                  uint64_t *token_id_out, EcReadContext **context_out,
                  uint32_t split_payload_bytes = 0,
-                 uint8_t physical_alive_mask = 0) {
+                 uint8_t physical_alive_mask = 0,
+                 EcReadStorageMode storage_mode =
+                     EcReadStorageMode::kScratch) {
         if (token_id_out == nullptr || context_out == nullptr ||
             target_local_addr == 0 || owner_idx >= owner_count_) {
             return false;
@@ -264,6 +279,7 @@ public:
         context->byte_count = byte_count;
         context->alive_mask = intended;
         context->own_shard_idx = own_shard_idx;
+        context->storage_mode = storage_mode;
         context->scratch = scratch;
         context->profile_acquire_ns =
             ec_recovery_profile_enabled() ? ec_recovery_profile_now_ns() : 0;
@@ -600,6 +616,7 @@ private:
         event.profile_acquire_ns = context->profile_acquire_ns;
         event.profile_byte_count = context->byte_count;
         event.split_payload_bytes = context->split_payload_bytes;
+        event.storage_mode = context->storage_mode;
         return event;
     }
 

@@ -39,6 +39,10 @@ inline bool ConcurrentArrayCache::handle_background_rebuild_complete(const ibv_w
     return true;
 }
 inline void ConcurrentArrayCache::background_rebuild_work() {
+    if (::FarLib::get_config().ft_background_rebuild_failures == 2) {
+        background_rebuild_work_dual();
+        return;
+    }
     using namespace ec_background;
     using Manager = SmallObjectStripeManager;
     using Status = Manager::BackgroundRebuildStatus;

@@ -1,4 +1,10 @@
-"""Figure 13 log protocol (schema_version=1).
+"""Figure 13 explicit result/sample protocol (schema_version=1 or 2).
+
+Native recovery result directories are supported separately by --run-result;
+they do not need manufactured figure13_result lines. For new explicit logs,
+use schema_version=2 and add rebuild_start_elapsed_s. Version 2 duration is
+background start to fully completed rebuild. Version 1 retains the legacy
+failure-to-completion definition; never silently compare the two definitions.
 
 One final result per run, after workload/recovery verification and process exit:
 figure13_result schema_version=1 run_id=starfish-one-r1 system=starfish scenario=1-node workload=kv-b environment=pair-a workload_id=kvb-fixed ratio=25 app_workers=24 repeat=1 phase=work time_origin=work_start steady_start_s=0 failure_elapsed_s=20 recovered_elapsed_s=24 run_end_s=40 failure_confirmed=1 recovery_verified=1 exit_status=0 correctness=pass source_type=measured panel=both
@@ -29,7 +35,10 @@ panel is optional, default both: recovery supplies duration bars, trace supplies
 the timeline, both supplies both. Separate runs may supply the two panels.
 Each selected panel/scenario/system must have at most one final run.
 
-Collector: recovery duration = recovered_elapsed_s - failure_elapsed_s.
+Collector schema 1: recovery duration = recovered_elapsed_s - failure_elapsed_s.
+Collector schema 2: recovery duration = recovered_elapsed_s - rebuild_start_elapsed_s.
+Both keep the observed failure time for aligning the throughput plot. Do not
+substitute a kill-command receipt time or the first successful degraded read.
 Throughput = completed_ops / (window_end_s - window_start_s).
 All curves divide by ONE Starfish pre-failure throughput: sum(completed_ops)
 divided by sum(window durations), using complete contiguous windows within
@@ -96,11 +105,21 @@ def parse_line(line):
     int_keys = RESULT_INTS if kind == "result" else ("schema_version", "completed_ops")
     for key in int_keys:
         record[key] = integer(record[key], key)
-    if record["schema_version"] != 1:
+    if record["schema_version"] not in (1, 2):
         raise ValueError("unsupported Figure 13 log schema")
     for key in (RESULT_TIMES if kind == "result" else ("window_start_s", "window_end_s")):
         record[key] = seconds(record[key], key)
     if kind == "result":
+        if record["schema_version"] == 2:
+            if "rebuild_start_elapsed_s" not in record:
+                raise ValueError("schema 2 requires rebuild_start_elapsed_s")
+            record["rebuild_start_elapsed_s"] = seconds(
+                record["rebuild_start_elapsed_s"], "rebuild_start_elapsed_s")
+            if not record["rebuild_start_elapsed_s"] < record["recovered_elapsed_s"]:
+                raise ValueError("background rebuild must start before completion")
+            record["recovery_definition"] = "background_start_to_done"
+        else:
+            record["recovery_definition"] = "failure_to_reconstruction"
         record["system"] = record["system"].lower()
         if record["system"] not in SYSTEMS or record["scenario"] not in SCENARIOS:
             raise ValueError("unknown system/scenario")

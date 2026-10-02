@@ -56,7 +56,14 @@ _LAUNCHER_SCRIPTS = (
     "scripts/common/run_case.py",
     "scripts/figure9/run.sh",
     "scripts/figure10/run.py",
+    "scripts/figure11/run.py",
+    "scripts/figure12/run.py",
+    "scripts/figure13/run.py",
     "scripts/run_fast_check.sh",
+)
+_CHECKER_SCRIPTS = (
+    "scripts/check_nodes.sh",
+    "scripts/common/check_nodes.py",
 )
 _EXPERIMENT_MARKERS = ("starfish", "hydra", "carbink", "nonft", "artifact-evaluation")
 _INTERPRETERS = frozenset(
@@ -465,6 +472,11 @@ def _matches_launcher_script(arg: str) -> bool:
     return any(normalized == script or normalized.endswith("/" + script) for script in _LAUNCHER_SCRIPTS)
 
 
+def _matches_checker_script(arg: str) -> bool:
+    normalized = _normalise_path(arg)
+    return any(normalized == script or normalized.endswith("/" + script) for script in _CHECKER_SCRIPTS)
+
+
 def _looks_like_server(record: _ProcRecord) -> bool:
     names = {_basename(record.exe), _basename(record.argv[0]) if record.argv else ""}
     if any(_known_executable(name, _SERVER_NAMES) for name in names):
@@ -490,6 +502,8 @@ def _classify(record: _ProcRecord) -> Optional[str]:
     if any(_known_executable(name, _NETWORK_BENCHMARKS) for name in names):
         return "network_benchmark"
     interpreter = any(name in _INTERPRETERS for name in names)
+    if interpreter and any(_matches_checker_script(arg) for arg in record.argv[1:]):
+        return None
     if interpreter and any(_matches_launcher_script(arg) for arg in record.argv[1:]):
         return "launcher"
     if _looks_like_server(record):

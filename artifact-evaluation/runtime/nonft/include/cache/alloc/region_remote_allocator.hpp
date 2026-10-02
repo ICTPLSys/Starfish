@@ -394,6 +394,16 @@ public:
         return server_used_bytes[endpoint_idx].load(std::memory_order::relaxed);
     }
 
+    std::vector<uint64_t> get_server_used_bytes_observer() const {
+        const size_t count = static_cast<size_t>(FarLib::get_config().server_count);
+        if (sharded_usage) return sharded_usage->snapshot_observer();
+        std::vector<uint64_t> result(count, 0);
+        if (server_used_bytes)
+            for (size_t i = 0; i < count; ++i)
+                result[i] = server_used_bytes[i].load(std::memory_order_relaxed);
+        return result;
+    }
+
     // init function
     // call only once per remote allocator
     void register_remote(size_t size) {

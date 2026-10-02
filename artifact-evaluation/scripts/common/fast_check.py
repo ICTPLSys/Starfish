@@ -62,7 +62,7 @@ def case_args(run_id: str, system: str, recovery: int | None,
         check_local=check_local, capture_chat=True, recover_endpoint=recovery,
         reference_chat=(out / "runs/llama-nonft-25/chat-output.txt"
                         if system == "starfish" else None),
-        recipe=(ROOT / "configs/llama/starfish_ec.config"
+        recipe=(ROOT / "configs/llama/starfish.config"
                 if system == "starfish" else None),
     )
 

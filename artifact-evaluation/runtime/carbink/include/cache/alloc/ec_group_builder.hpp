@@ -146,6 +146,12 @@ public:
         // Carbink borrows four separate 8-KiB pages, never four fragments.
         // Empty tail slots use one immutable registered zero page.
         bool direct_span_data = false;
+        // Recovery-enabled Carbink keeps immutable data beside the parity
+        // banks. objects[] still owns the original local WRITE references.
+        bool staged_span_data = false;
+        // Independent registered snapshot banks are not the parity slot.
+        // Keep staging's ownership cookie/pointers exactly as reserved.
+        std::array<void *, kEcBatchDataSlots> span_snapshot{};
         const void *zero_data = nullptr;
         uint32_t zero_lkey = 0;
 
@@ -167,6 +173,8 @@ public:
             return staging.mr_offset + static_cast<uint64_t>(i) * slot_size;
         }
         uintptr_t source_addr(size_t i) const {
+            if (staged_span_data && i < kEcBatchDataSlots)
+                return reinterpret_cast<uintptr_t>(span_snapshot[i]);
             if (direct_page_data && i < kEcBatchDataSlots)
                 return reinterpret_cast<uintptr_t>(objects[0]) + i * slot_size;
             return reinterpret_cast<uintptr_t>(i < kEcBatchDataSlots

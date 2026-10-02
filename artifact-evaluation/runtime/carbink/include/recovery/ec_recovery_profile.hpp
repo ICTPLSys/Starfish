@@ -292,8 +292,10 @@ public:
             uint64_t expected = 0;
             if (first_recovered_ns_.compare_exchange_strong(
                     expected, now, std::memory_order_relaxed)) {
-                std::cerr << "INFO: ec_recovery first_recovered monotonic_ns="
-                          << now << " object_bytes=" << byte_count << '\n';
+                std::ostringstream out;
+                out << "INFO: ec_recovery first_recovered monotonic_ns="
+                    << now << " object_bytes=" << byte_count;
+                std::cerr << (out.str() + "\n") << std::flush;
             }
         }
         if (!enabled()) return;

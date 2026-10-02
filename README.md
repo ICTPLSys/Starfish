@@ -47,7 +47,6 @@ Paths below are relative to `artifact-evaluation/`:
 | [Data and models](artifact-evaluation/docs/DATA.md) | Download sources, preparation and input paths |
 | [Multi-server configuration](artifact-evaluation/docs/MULTI-SERVER.md) | Compute/memory roles, SSH/TCP addresses and ports |
 | [Configuration layout](artifact-evaluation/configs/README.md) | Recipes, overrides, generated files and deployment checks |
-| [Recovery integration status](artifact-evaluation/docs/RECOVERY-STATUS.md) | Starfish v13 source, supported mode and historical evidence |
 | [Server table](artifact-evaluation/docs/MACHINES.md) | Server IPs, IB devices and NUMA placement |
 | [Experiments](artifact-evaluation/docs/EXPERIMENTS.md) | Experiment commands, result files and plotting |
 | [Script index](artifact-evaluation/scripts/README.md) | Figure-specific instructions and CSV formats |
@@ -74,8 +73,32 @@ once using [multi-server configuration](artifact-evaluation/docs/MULTI-SERVER.md
 To download and prepare inputs from their original sources instead, follow
 [Data and models](artifact-evaluation/docs/DATA.md).
 
-Before running benchmarks, we recommend that reviewers run `bash scripts/check_nodes.sh`
-and confirm that the intended compute and memory nodes are idle.
+**Before running benchmarks, we recommend that reviewers run `bash scripts/check_nodes.sh`
+and confirm that the intended compute and memory nodes are idle.**
+
+Run the command from `artifact-evaluation/`. For example, this read-only check
+reported all eight nodes idle:
+
+~~~text
+$ bash scripts/check_nodes.sh
+
+  ✓  8/8 NODES IDLE    0 busy
+  ──────────────────────────────────────────────────────────────────
+  NODE              IDLE       LOAD            RUNTIME / TEST
+  10.208.130.22     ✓ YES      clear           none
+  10.208.130.54     ✓ YES      clear           none
+  10.208.130.56     ✓ YES      clear           none
+  10.208.130.58     ✓ YES      clear           none
+  10.208.130.74     ✓ YES      clear           none
+  10.208.130.76     ✓ YES      clear           none
+  10.208.130.82     ✓ YES      clear           none
+  10.208.130.84     ✓ YES      clear           none
+  ──────────────────────────────────────────────────────────────────
+  Snapshot only · details and thresholds: --verbose
+~~~
+
+This read-only snapshot helps reviewers see whether other reviewers are already
+running experiments on the shared nodes.
 
 ### Fast check
 
@@ -147,13 +170,13 @@ Installation, input loading, warm-up and service resets are additional.
 
 | Experiment | Estimated work time |
 | --- | --- |
-| Application performance (Fig. 9) | 11.8 hours |
-| Tail latency (Fig. 10) | 5.1 hours |
-| FT resource cost (Fig. 11) | 3.2 hours |
-| Compute-node overhead (Fig. 12) | 1.6 hours |
-| Failure recovery (Fig. 13) | 10 minutes |
+| Application performance (Fig. 9) | around 25 hours |
+| Tail latency (Fig. 10) | 12 hours |
+| FT resource cost (Fig. 11) | 0 hours |
+| Compute-node overhead (Fig. 12) | 5 hours |
+| Failure recovery (Fig. 13) | 68 minutes |
 
-Please allow 2–3 days for Figure 9.
+Please allow around 25 hours for Figure 9.
 
 ## Run and plot
 
@@ -162,10 +185,10 @@ From `artifact-evaluation/`:
 | Figure | Run / collect | Plot |
 | --- | --- | --- |
 | [Figure 9: application performance](artifact-evaluation/scripts/figure9/README.md) | `bash scripts/figure9/run.sh` | `bash scripts/plot.sh figure9` |
-| [Figure 10: tail latency](artifact-evaluation/scripts/figure10/README.md) | `bash scripts/figure10/run.sh` | `bash scripts/plot.sh figure10 --input data/figure10.csv` |
-| [Figure 11: FT resource cost](artifact-evaluation/scripts/figure11/README.md) | `bash scripts/figure11/collect.sh --logs-root results/figure9` | `bash scripts/plot.sh figure11 --input data/figure11.csv` |
-| [Figure 12: compute-node overhead](artifact-evaluation/scripts/figure12/README.md) | `bash scripts/figure12/run.sh --build --metrics all`, then follow its collection guide | `bash scripts/plot.sh figure12 --input data/figure12.csv` |
-| [Figure 13: failure recovery](artifact-evaluation/scripts/figure13/README.md) | `bash scripts/figure13/collect.sh --logs-root results/figure13` | `bash scripts/plot.sh figure13 --logs-root results/figure13` |
+| [Figure 10: tail latency](artifact-evaluation/scripts/figure10/README.md) | `bash scripts/figure10/run.sh` | `bash scripts/plot.sh figure10` |
+| [Figure 11: FT resource cost](artifact-evaluation/scripts/figure11/README.md) | `bash scripts/figure11/collect.sh --logs-root "$(python3 scripts/common/plot_inputs.py figure11)"` | `bash scripts/plot.sh figure11` |
+| [Figure 12: compute-node overhead](artifact-evaluation/scripts/figure12/README.md) | `bash scripts/figure12/run.sh --build --metric all` | `bash scripts/plot.sh figure12` |
+| [Figure 13: failure recovery](artifact-evaluation/scripts/figure13/README.md) | `bash scripts/figure13/run.sh` | `bash scripts/plot.sh figure13` |
 
 The Figure 9 runner writes `data/figure9.csv`. Input formats and output files
 are described in the linked figure guides.

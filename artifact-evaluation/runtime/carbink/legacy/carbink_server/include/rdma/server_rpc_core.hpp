@@ -60,6 +60,205 @@ inline rdma::EC2PCRpcMessage make_ec2pc_rpc_message(
     };
 }
 
+inline void Server::drop_unposted_peer_work(size_t peer_idx) {
+    if (!peer_recovery_enabled() || peer_idx >= peer_endpoint_count)
+        return;
+
+    auto subtract_pending = [&](size_t count) {
+        size_t current = pending_peer_send_total.load(
+            std::memory_order_relaxed);
+        while (count != 0 && current != 0) {
+            size_t next = current > count ? current - count : 0;
+            if (pending_peer_send_total.compare_exchange_weak(
+                    current, next, std::memory_order_relaxed,
+                    std::memory_order_relaxed))
+                break;
+        }
+    };
+    auto release_external_owner = [&](BatchRpcRecvSlot *owner,
+                                      uint64_t generation) {
+        if (owner == nullptr || generation == 0 ||
+            owner->generation.load(std::memory_order_acquire) != generation)
+            return;
+        uint8_t refs = owner->parity_send_refs.load(
+            std::memory_order_acquire);
+        while (refs != 0 &&
+               !owner->parity_send_refs.compare_exchange_weak(
+                   refs, static_cast<uint8_t>(refs - 1),
+                   std::memory_order_acq_rel,
+                   std::memory_order_acquire)) {
+        }
+        if (refs == 1)
+            release_batch_rpc_recv_slot(*owner);
+    };
+    if (peer_idx < pending_peer_send_queues.size() &&
+        pending_peer_send_queue_mutexes != nullptr) {
+        std::lock_guard<std::mutex> lock(
+            pending_peer_send_queue_mutexes[peer_idx]);
+        size_t dropped = pending_peer_send_queues[peer_idx].size();
+        pending_peer_send_queues[peer_idx].clear();
+        subtract_pending(dropped);
+    }
+    if (peer_idx < pending_peer_ack_queues.size() &&
+        pending_peer_ack_queue_mutexes != nullptr) {
+        std::lock_guard<std::mutex> lock(
+            pending_peer_ack_queue_mutexes[peer_idx]);
+        pending_peer_ack_queues[peer_idx].clear();
+    }
+
+    size_t lane_owner_count = std::max<size_t>(1, rpc_worker_count);
+    for (size_t worker_idx = 0; worker_idx < lane_owner_count; ++worker_idx) {
+        size_t lane_idx = peer_idx * lane_owner_count + worker_idx;
+        if (lane_idx >= peer_lane_send_queues.size() ||
+            peer_lane_mutexes == nullptr)
+            continue;
+        std::lock_guard<std::mutex> lock(peer_lane_mutexes[lane_idx]);
+        auto &lane = peer_lane_send_queues[lane_idx];
+        lane.pending_head = 0;
+        lane.pending_tail = 0;
+        lane.pending_count = 0;
+    }
+
+    for (size_t shard_idx = 0;
+         shard_idx < std::max<size_t>(1, peer_payload_qp_count);
+         ++shard_idx) {
+        size_t q_idx = probe_parity_batch_queue_index(peer_idx, shard_idx);
+        if (q_idx >= probe_parity_batch_send_queues.size())
+            continue;
+        if (probe_parity_batch_pending_mutexes != nullptr) {
+            std::lock_guard<std::mutex> lock(
+                probe_parity_batch_pending_mutexes[q_idx]);
+            auto &queue = probe_parity_batch_send_queues[q_idx];
+            if (queue.pending_items != nullptr &&
+                queue.pending_capacity != 0) {
+                for (size_t n = 0; n < queue.pending_count; ++n) {
+                    auto &item = queue.pending_items[
+                        (queue.pending_head + n) % queue.pending_capacity];
+                    release_external_owner(
+                        item.batch_owner, item.batch_owner_generation);
+                    item = ProbeParityBatchPendingItem{};
+                }
+            }
+            queue.pending_head = 0;
+            queue.pending_tail = 0;
+            queue.pending_count = 0;
+            if (probe_parity_batch_pending_space_cvs != nullptr)
+                probe_parity_batch_pending_space_cvs[q_idx].notify_all();
+        }
+        if (probe_parity_batch_ready_mutexes != nullptr &&
+            q_idx < probe_parity_batch_ready_queues.size()) {
+            std::lock_guard<std::mutex> lock(
+                probe_parity_batch_ready_mutexes[q_idx]);
+            probe_parity_batch_ready_queues[q_idx].clear();
+        }
+        if (probe_parity_batch_send_mutexes != nullptr) {
+            std::lock_guard<std::mutex> lock(
+                probe_parity_batch_send_mutexes[q_idx]);
+            auto &queue = probe_parity_batch_send_queues[q_idx];
+            for (size_t slot_idx = 0;
+                 queue.slots != nullptr && slot_idx < queue.depth;
+                 ++slot_idx) {
+                auto &slot = queue.slots[slot_idx];
+                if (slot.state.load(std::memory_order_acquire) ==
+                    kProbeBatchSlotReady) {
+                    release_external_owner(
+                        slot.batch_owner, slot.batch_owner_generation);
+                    slot.reset_message_binding();
+                    slot.in_use.store(false, std::memory_order_release);
+                    slot.state.store(kProbeBatchSlotFree,
+                                     std::memory_order_release);
+                }
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
+            probe_parity_batch_pair_pending_mutex);
+        for (auto it = probe_parity_batch_pair_pending_queue.begin();
+             it != probe_parity_batch_pair_pending_queue.end();) {
+            if (it->peer_idx0 == peer_idx || it->peer_idx1 == peer_idx) {
+                release_external_owner(
+                    it->batch_owner, it->batch_owner_generation);
+                release_external_owner(
+                    it->batch_owner, it->batch_owner_generation);
+                it = probe_parity_batch_pair_pending_queue.erase(it);
+            } else
+                ++it;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(
+            runtime_parity_batch_pair_pending_mutex);
+        for (auto it = runtime_parity_batch_pair_pending_queue.begin();
+             it != runtime_parity_batch_pair_pending_queue.end();) {
+            if (it->peer_idx0 == peer_idx || it->peer_idx1 == peer_idx)
+                it = runtime_parity_batch_pair_pending_queue.erase(it);
+            else
+                ++it;
+        }
+    }
+}
+
+inline void Server::fail_tracked_requests_for_peer(
+    size_t peer_idx, uint32_t status) {
+    if (!peer_recovery_enabled())
+        return;
+    struct FailedRequest {
+        uint64_t wr_id;
+        size_t client_qp_local_idx;
+        uint16_t completion_msg_type;
+        uint16_t target_endpoint;
+    };
+    std::vector<FailedRequest> failed;
+    {
+        std::lock_guard<std::mutex> lock(server_ec2pc_track_mutex_);
+        for (auto it = server_ec2pc_track_.begin();
+             it != server_ec2pc_track_.end();) {
+            auto &request = it->second;
+            if (request.parity_peer0 != peer_idx &&
+                request.parity_peer1 != peer_idx) {
+                ++it;
+                continue;
+            }
+            request.failed = true;
+            request.failure_status = status;
+            failed.push_back({it->first, request.client_qp_local_idx,
+                              request.completion_msg_type,
+                              request.target_endpoint});
+            server_ec2pc_canceled_.insert(it->first);
+            it = server_ec2pc_track_.erase(it);
+        }
+    }
+    for (const auto &request : failed) {
+        rdma::EC2PCRpcMessage ack = make_ec2pc_rpc_message(
+            request.completion_msg_type, request.wr_id,
+            request.target_endpoint);
+        ack.status = status;
+        if (request.completion_msg_type == rdma::EC2PC_MSG_ACK_BATCH) {
+            ack.payload_len = static_cast<uint32_t>(sizeof(uint64_t));
+            std::memcpy(ack.payload, &request.wr_id, sizeof(uint64_t));
+        }
+        // The client may already have quarantined this request.  A failed
+        // ACK is still best-effort; healthy peer/server threads must not
+        // abort merely because the client lane disappeared.
+        (void)enqueue_rpc_send(request.client_qp_local_idx, ack);
+    }
+}
+
+inline bool Server::mark_peer_dead(size_t peer_idx, uint32_t status) {
+    if (!peer_recovery_enabled() || peer_alive_ == nullptr ||
+        peer_idx >= peer_endpoint_count || peer_idx == local_server_index)
+        return false;
+    uint8_t expected = 1;
+    if (!peer_alive_[peer_idx].compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel))
+        return false;
+    drop_unposted_peer_work(peer_idx);
+    fail_tracked_requests_for_peer(peer_idx, status);
+    return true;
+}
+
 // Tag a parity-send slot with a fresh bind generation before it is published.
 inline void Server::prepare_probe_parity_slot(
     ProbeParityBatchSendSlot &slot) {
@@ -196,6 +395,23 @@ inline void Server::release_batch_rpc_recv_slot(BatchRpcRecvSlot &slot) {
     ctr_recv_repost_ok.fetch_add(1, std::memory_order_relaxed);
 }
 
+inline void Server::release_probe_parity_batch_owner(
+    BatchRpcRecvSlot *owner, uint64_t generation) {
+    if (owner == nullptr || generation == 0 ||
+        owner->generation.load(std::memory_order_acquire) != generation)
+        return;
+    uint8_t refs = owner->parity_send_refs.load(
+        std::memory_order_acquire);
+    while (refs != 0 &&
+           !owner->parity_send_refs.compare_exchange_weak(
+               refs, static_cast<uint8_t>(refs - 1),
+               std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+    if (refs == 1)
+        release_batch_rpc_recv_slot(*owner);
+}
+
 inline Server::BatchRpcMessageBuffer *
 Server::try_acquire_batch_rpc_message_buffer() {
     std::lock_guard<std::mutex> lock(batch_rpc_msg_pool_mutex);
@@ -327,6 +543,8 @@ inline bool Server::complete_probe_parity_batch_send_slot(
 }
 
 inline void Server::post_peer_recv_slot(PeerRpcRecvSlot &slot) {
+    if (peer_recovery_enabled() && !peer_is_alive(slot.peer_idx))
+        return;
     if (peer_rpc_mr == nullptr || slot.peer_idx >= peer_qps.size() ||
         peer_qps[slot.peer_idx].queue_pair == nullptr) {
         ERROR("server post_peer_recv_slot: peer transport not ready");
@@ -352,6 +570,8 @@ inline void Server::post_peer_recv_slot(PeerRpcRecvSlot &slot) {
 inline bool Server::post_probe_parity_batch_message(
     size_t peer_idx, const rdma::ProbeParityBatchMessage &msg,
     size_t preferred_shard_idx) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     bool runtime_msg = (msg.flags & rdma::kEC2PCFlagProbeBatch) == 0;
     uint64_t reserve_begin_ns = 0;
     uint64_t reserve_end_ns = 0;
@@ -412,6 +632,8 @@ inline bool Server::post_probe_parity_batch_message_external(
     size_t peer_idx, rdma::ProbeParityBatchMessage *msg, uint32_t msg_lkey,
     BatchRpcRecvSlot *batch_owner, uint64_t batch_owner_generation,
     size_t preferred_shard_idx) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (msg == nullptr || msg_lkey == 0 || batch_owner == nullptr) {
         return false;
     }
@@ -469,6 +691,9 @@ inline bool Server::post_probe_parity_batch_message_pair_external(
     rdma::ProbeParityBatchMessage *msg1, uint32_t msg_lkey,
     BatchRpcRecvSlot *batch_owner, uint64_t batch_owner_generation,
     size_t preferred_shard_idx0, size_t preferred_shard_idx1) {
+    if ((peer_recovery_enabled() && !peer_is_alive(peer_idx0)) ||
+        (peer_recovery_enabled() && !peer_is_alive(peer_idx1)))
+        return false;
     if (msg0 == nullptr || msg1 == nullptr || msg_lkey == 0 ||
         batch_owner == nullptr) {
         return false;
@@ -530,6 +755,9 @@ inline bool Server::enqueue_runtime_parity_batch_pair_pending(
         peer_idx0 == local_server_index || peer_idx1 == local_server_index) {
         return false;
     }
+    if (peer_recovery_enabled() &&
+        (!peer_is_alive(peer_idx0) || !peer_is_alive(peer_idx1)))
+        return false;
     RuntimeParityBatchPairPendingItem item{};
     item.peer_idx0 = peer_idx0;
     item.peer_idx1 = peer_idx1;
@@ -544,6 +772,9 @@ inline bool Server::enqueue_runtime_parity_batch_pair_pending(
     item.msg0 = msg0;
     item.msg1 = msg1;
     std::lock_guard<std::mutex> lock(runtime_parity_batch_pair_pending_mutex);
+    if (peer_recovery_enabled() &&
+        (!peer_is_alive(peer_idx0) || !peer_is_alive(peer_idx1)))
+        return false;
     runtime_parity_batch_pair_pending_queue.push_back(std::move(item));
     return true;
 }
@@ -553,6 +784,9 @@ inline bool Server::try_post_runtime_parity_batch_pair_pending_item(
     if (peer_rpc_mr == nullptr) {
         return false;
     }
+    if (peer_recovery_enabled() &&
+        (!peer_is_alive(item.peer_idx0) || !peer_is_alive(item.peer_idx1)))
+        return true;
     auto preferred_shard = [](uint16_t shard) -> size_t {
         return shard == std::numeric_limits<uint16_t>::max()
                    ? std::numeric_limits<size_t>::max()
@@ -607,6 +841,9 @@ inline bool Server::try_post_runtime_parity_batch_pair_storage_slot(
     if (item == nullptr || peer_rpc_mr == nullptr) {
         return false;
     }
+    if (peer_recovery_enabled() &&
+        (!peer_is_alive(item->peer_idx0) || !peer_is_alive(item->peer_idx1)))
+        return true;
     uint64_t try_begin_ns = Server::steady_clock_now_ns();
     if (item->first_try_time_ns == 0) {
         item->first_try_time_ns = try_begin_ns;
@@ -702,6 +939,9 @@ inline bool Server::enqueue_runtime_parity_batch_pair_pending_for_worker(
         peer_idx0 == local_server_index || peer_idx1 == local_server_index) {
         return false;
     }
+    if (peer_recovery_enabled() &&
+        (!peer_is_alive(peer_idx0) || !peer_is_alive(peer_idx1)))
+        return false;
     if (worker_idx < runtime_parity_batch_pair_storage_by_worker.size()) {
         uint32_t slot_idx = 0;
         RuntimeParityBatchPairStorageSlot *slot = nullptr;
@@ -997,6 +1237,12 @@ inline Server::ProbeParityBatchSendSlot *
 Server::reserve_probe_parity_batch_send_slot(size_t peer_idx,
                                              bool record_runtime_fail,
                                              size_t preferred_shard_idx) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx)) {
+        if (record_runtime_fail)
+            ctr_runtime_parity_reserve_fail_invalid.fetch_add(
+                1, std::memory_order_relaxed);
+        return nullptr;
+    }
     if (peer_rpc_mr == nullptr || peer_idx >= peer_endpoint_count ||
         peer_idx == local_server_index) {
         if (record_runtime_fail) {
@@ -1105,25 +1351,42 @@ Server::reserve_probe_parity_batch_send_slot(size_t peer_idx,
 // Return a parity send slot to the free pool before it was posted.
 inline void Server::release_reserved_probe_parity_batch_send_slot(
     ProbeParityBatchSendSlot &slot) {
+    auto *batch_owner = slot.batch_owner;
+    uint64_t batch_generation = slot.batch_owner_generation;
     slot.post_time_ns = 0;
     slot.last_flush_bookkeeping_ns = 0;
     slot.last_post_send_ns = 0;
     slot.state.store(kProbeBatchSlotFree, std::memory_order_release);
     slot.in_use.store(false, std::memory_order_release);
     slot.reset_message_binding();
+    release_probe_parity_batch_owner(batch_owner, batch_generation);
 }
 
 // Try to reserve transport tokens for both runtime parity packets together.
 inline bool Server::try_post_probe_parity_batch_pair_pending_item(
     ProbeParityBatchPairPendingItem &item) {
+    auto abandon_pair = [&]() {
+        release_probe_parity_batch_owner(
+            item.batch_owner, item.batch_owner_generation);
+        release_probe_parity_batch_owner(
+            item.batch_owner, item.batch_owner_generation);
+        item.msg0 = nullptr;
+        item.msg1 = nullptr;
+        item.batch_owner = nullptr;
+        item.batch_owner_generation = 0;
+        return true;
+    };
+    if (peer_recovery_enabled() &&
+        (!peer_is_alive(item.peer_idx0) || !peer_is_alive(item.peer_idx1)))
+        return abandon_pair();
     if (item.msg0 == nullptr || item.msg1 == nullptr ||
         item.batch_owner == nullptr || item.msg_lkey == 0) {
-        return true;
+        return abandon_pair();
     }
     if (item.batch_owner_generation == 0 ||
         item.batch_owner->generation.load(std::memory_order_acquire) !=
             item.batch_owner_generation) {
-        return true;
+        return abandon_pair();
     }
     uint64_t try_begin_ns = Server::steady_clock_now_ns();
     if (item.first_try_time_ns == 0) {
@@ -1228,29 +1491,28 @@ inline size_t Server::flush_probe_parity_batch_pair_pending(size_t max_jobs) {
 
 inline bool Server::post_reserved_probe_parity_batch_send_slot(
     ProbeParityBatchSendSlot &slot) {
+    if (peer_recovery_enabled() && !peer_is_alive(slot.peer_idx)) {
+        release_reserved_probe_parity_batch_send_slot(slot);
+        return false;
+    }
     if (peer_rpc_mr == nullptr || slot.peer_idx >= peer_endpoint_count ||
         slot.shard_idx >= peer_payload_qp_count) {
-        slot.state.store(kProbeBatchSlotFree, std::memory_order_release);
-        slot.in_use.store(false, std::memory_order_release);
+        release_reserved_probe_parity_batch_send_slot(slot);
         return false;
     }
     size_t q_idx = peer_payload_qp_index(slot.peer_idx, slot.shard_idx);
     if (q_idx >= peer_payload_qps.size()) {
-        slot.state.store(kProbeBatchSlotFree, std::memory_order_release);
-        slot.in_use.store(false, std::memory_order_release);
+        release_reserved_probe_parity_batch_send_slot(slot);
         return false;
     }
     auto &qp = peer_payload_qps[q_idx];
     if (qp.queue_pair == nullptr) {
-        slot.state.store(kProbeBatchSlotFree, std::memory_order_release);
-        slot.in_use.store(false, std::memory_order_release);
+        release_reserved_probe_parity_batch_send_slot(slot);
         return false;
     }
     auto *msg = slot.active_msg();
     if (msg == nullptr) {
-        slot.state.store(kProbeBatchSlotFree, std::memory_order_release);
-        slot.in_use.store(false, std::memory_order_release);
-        slot.reset_message_binding();
+        release_reserved_probe_parity_batch_send_slot(slot);
         return false;
     }
     ibv_sge sge = {
@@ -1277,11 +1539,19 @@ inline bool Server::post_reserved_probe_parity_batch_send_slot(
             ctr_runtime_parity_batch_post_fail.fetch_add(
                 1, std::memory_order_relaxed);
         }
-        slot.state.store(kProbeBatchSlotFree, std::memory_order_release);
-        slot.in_use.store(false, std::memory_order_release);
-        slot.post_time_ns = 0;
-        msg->post_time_ns = 0;
-        slot.reset_message_binding();
+        const bool endpoint_dead =
+            peer_recovery_enabled() && !peer_is_alive(slot.peer_idx);
+        if (ret == ENOMEM && !endpoint_dead) {
+            // Keep the BUSY binding intact.  The ready-flush caller may
+            // safely return it to READY and retry without touching a freed
+            // external message.
+            return false;
+        }
+        if (endpoint_dead) {
+            release_reserved_probe_parity_batch_send_slot(slot);
+            return false;
+        }
+        ERROR("server probe parity ibv_post_send failed");
         return false;
     }
     uint64_t post_time_ns = Server::steady_clock_now_ns();
@@ -1313,6 +1583,8 @@ inline bool Server::post_reserved_probe_parity_batch_send_slot(
 inline bool Server::enqueue_probe_parity_batch_pending(
     size_t peer_idx, const rdma::ProbeParityBatchMessage &msg,
     size_t preferred_shard_idx) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (peer_idx >= peer_endpoint_count ||
         probe_parity_batch_pending_mutexes == nullptr ||
         probe_parity_batch_pending_space_cvs == nullptr) {
@@ -1342,6 +1614,8 @@ inline bool Server::enqueue_probe_parity_batch_pending(
     }
     std::unique_lock<std::mutex> lock(
         probe_parity_batch_pending_mutexes[q_idx]);
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     while (queue.pending_count >= queue.pending_capacity) {
         probe_parity_batch_pending_space_cvs[q_idx].wait_for(
             lock, std::chrono::microseconds(50));
@@ -1361,6 +1635,8 @@ inline bool Server::enqueue_probe_parity_batch_pending_external(
     size_t peer_idx, rdma::ProbeParityBatchMessage *msg, uint32_t msg_lkey,
     BatchRpcRecvSlot *batch_owner, uint64_t batch_owner_generation,
     size_t preferred_shard_idx) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (msg == nullptr || msg_lkey == 0 || batch_owner == nullptr ||
         peer_idx >= peer_endpoint_count ||
         probe_parity_batch_pending_mutexes == nullptr ||
@@ -1391,6 +1667,8 @@ inline bool Server::enqueue_probe_parity_batch_pending_external(
     }
     std::unique_lock<std::mutex> lock(
         probe_parity_batch_pending_mutexes[q_idx]);
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     while (queue.pending_count >= queue.pending_capacity) {
         probe_parity_batch_pending_space_cvs[q_idx].wait_for(
             lock, std::chrono::microseconds(50));
@@ -1409,6 +1687,10 @@ inline bool Server::enqueue_probe_parity_batch_pending_external(
 
 inline size_t Server::fill_probe_parity_batch_send_slots_from_pending(
     size_t peer_idx, size_t preferred_shard_idx, size_t max_fill) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx)) {
+        drop_unposted_peer_work(peer_idx);
+        return 0;
+    }
     if (peer_idx >= peer_endpoint_count || max_fill == 0 ||
         probe_parity_batch_pending_mutexes == nullptr) {
         return 0;
@@ -1509,6 +1791,8 @@ inline void Server::publish_probe_parity_batch_send_slot(
 
 inline size_t Server::flush_ready_probe_parity_batch_send_slots(
     size_t peer_idx, size_t preferred_shard_idx, size_t max_posts) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return 0;
     size_t payload_qp_count = std::max<size_t>(1, peer_payload_qp_count);
     size_t target_shard =
         preferred_shard_idx == std::numeric_limits<size_t>::max()
@@ -1636,17 +1920,29 @@ inline size_t Server::flush_ready_probe_parity_batch_send_slots(
             }
         }
         if (!post_reserved_probe_parity_batch_send_slot(slot)) {
-            if (runtime_msg && runtime_parity_batch_ready_by_qp != nullptr &&
-                q_idx < peer_endpoint_count * payload_qp_count) {
-                runtime_parity_batch_ready_by_qp[q_idx].fetch_add(
-                    1, std::memory_order_relaxed);
+            const bool binding_retained =
+                slot.in_use.load(std::memory_order_acquire) &&
+                slot.state.load(std::memory_order_acquire) ==
+                    kProbeBatchSlotBusy &&
+                slot.bind_generation.load(std::memory_order_acquire) ==
+                    bind_seq &&
+                slot.active_msg() != nullptr;
+            if (binding_retained) {
+                auto *retry_msg = slot.active_msg();
+                if (runtime_msg &&
+                    runtime_parity_batch_ready_by_qp != nullptr &&
+                    q_idx < peer_endpoint_count * payload_qp_count) {
+                    runtime_parity_batch_ready_by_qp[q_idx].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                slot.state.store(kProbeBatchSlotReady,
+                                 std::memory_order_release);
+                slot.post_time_ns = 0;
+                retry_msg->post_time_ns = 0;
+                enqueue_probe_parity_ready_slot(
+                    q_idx, slot.slot_index, bind_seq,
+                    ready_item.ready_enqueue_time_ns);
             }
-            slot.state.store(kProbeBatchSlotReady, std::memory_order_release);
-            slot.in_use.store(true, std::memory_order_release);
-            slot.post_time_ns = 0;
-            msg->post_time_ns = 0;
-            enqueue_probe_parity_ready_slot(q_idx, slot.slot_index, bind_seq,
-                                            ready_item.ready_enqueue_time_ns);
             break;
         }
         uint64_t post_time_ns = slot.post_time_ns;
@@ -1674,6 +1970,8 @@ inline size_t Server::flush_ready_probe_parity_batch_send_slots(
 }
 
 inline void Server::post_peer_payload_recv_slot(PeerPayloadRecvSlot &slot) {
+    if (peer_recovery_enabled() && !peer_is_alive(slot.peer_idx))
+        return;
     if (peer_rpc_mr == nullptr || !peer_payload_transport_ready() ||
         slot.peer_idx >= peer_endpoint_count ||
         slot.shard_idx >= peer_payload_qp_count) {
@@ -1787,6 +2085,9 @@ inline size_t Server::try_post_peer_send_batch_locked(
     size_t peer_idx, std::deque<rdma::EC2PCRpcMessage> &dq, size_t max_posts) {
     if (peer_idx >= peer_rpc_queues.size() || peer_idx >= peer_qps.size() ||
         peer_idx == local_server_index || max_posts == 0 || dq.empty()) {
+        return 0;
+    }
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx)) {
         return 0;
     }
 
@@ -1905,6 +2206,8 @@ inline size_t Server::try_post_peer_send_batch_locked(
                                             : -1)
                               << std::endl;
                 }
+                if (!peer_recovery_enabled() || peer_is_alive(peer_idx))
+                    ERROR("server peer batch ibv_post_send failed");
             }
         }
 
@@ -1933,6 +2236,8 @@ inline size_t Server::try_post_peer_send_batch_locked(
 
 inline bool Server::enqueue_peer_rpc_send(size_t peer_idx,
                                           const rdma::EC2PCRpcMessage &msg) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (msg.type == rdma::EC2PC_MSG_PARITY_APPLY && msg.wr_id == 0) {
         ERROR("enqueue_peer_rpc_send zero parity wr_id");
     }
@@ -1941,6 +2246,8 @@ inline bool Server::enqueue_peer_rpc_send(size_t peer_idx,
         return false;
     }
     std::lock_guard<std::mutex> lock(pending_peer_send_queue_mutexes[peer_idx]);
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     auto &dq = pending_peer_send_queues[peer_idx];
     bool merged = false;
     if (msg.type == rdma::EC2PC_MSG_ACK_BATCH && !dq.empty()) {
@@ -1997,6 +2304,10 @@ inline size_t Server::flush_pending_peer_sends(size_t max_posts,
         if (peer_idx == local_server_index) {
             continue;
         }
+        if (peer_recovery_enabled() && !peer_is_alive(peer_idx)) {
+            drop_unposted_peer_work(peer_idx);
+            continue;
+        }
         std::lock_guard<std::mutex> lock(
             pending_peer_send_queue_mutexes[peer_idx]);
         auto &dq = pending_peer_send_queues[peer_idx];
@@ -2021,6 +2332,8 @@ inline size_t Server::flush_pending_peer_sends(size_t max_posts,
 inline bool Server::post_peer_ack_message(size_t peer_idx,
                                           const rdma::EC2PCRpcMessage &msg) {
     auto post_begin = std::chrono::steady_clock::now();
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (msg.type != rdma::EC2PC_MSG_ACK &&
         msg.type != rdma::EC2PC_MSG_ACK_BATCH) {
         return false;
@@ -2079,6 +2392,9 @@ inline bool Server::post_peer_ack_message(size_t peer_idx,
         ctr_peer_ack_direct_post_fail_cnt.fetch_add(1,
                                                     std::memory_order_relaxed);
         picked->in_use.store(false, std::memory_order_release);
+        if (ret != ENOMEM &&
+            (!peer_recovery_enabled() || peer_is_alive(peer_idx)))
+            ERROR("server peer ACK ibv_post_send failed");
         return false;
     }
     picked->post_time_ns = steady_clock_now_ns();
@@ -2099,6 +2415,8 @@ inline bool Server::post_peer_ack_message(size_t peer_idx,
 inline bool Server::enqueue_peer_ack_send(size_t peer_idx,
                                           const rdma::EC2PCRpcMessage &msg) {
     auto enqueue_begin = std::chrono::steady_clock::now();
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (msg.type != rdma::EC2PC_MSG_ACK &&
         msg.type != rdma::EC2PC_MSG_ACK_BATCH) {
         return false;
@@ -2107,6 +2425,8 @@ inline bool Server::enqueue_peer_ack_send(size_t peer_idx,
         return false;
     }
     std::lock_guard<std::mutex> lock(pending_peer_ack_queue_mutexes[peer_idx]);
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     auto &dq = pending_peer_ack_queues[peer_idx];
     bool merged = false;
     if (msg.type == rdma::EC2PC_MSG_ACK_BATCH && !dq.empty()) {
@@ -2142,6 +2462,10 @@ inline size_t Server::flush_pending_peer_acks(size_t max_posts,
         if (peer_idx == local_server_index) {
             continue;
         }
+        if (peer_recovery_enabled() && !peer_is_alive(peer_idx)) {
+            drop_unposted_peer_work(peer_idx);
+            continue;
+        }
         std::lock_guard<std::mutex> lock(
             pending_peer_ack_queue_mutexes[peer_idx]);
         auto &dq = pending_peer_ack_queues[peer_idx];
@@ -2159,6 +2483,8 @@ inline size_t Server::flush_pending_peer_acks(size_t max_posts,
 inline bool Server::post_peer_rpc_message(size_t peer_idx,
                                           const rdma::EC2PCRpcMessage &msg) {
     static std::atomic<uint32_t> log_budget{0};
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (msg.type == rdma::EC2PC_MSG_PARITY_APPLY && msg.wr_id == 0) {
         ERROR("post_peer_rpc_message zero parity wr_id");
     }
@@ -2266,6 +2592,9 @@ inline bool Server::post_peer_rpc_message(size_t peer_idx,
                       << (qret == 0 ? static_cast<int>(qp_attr.dest_qp_num) : -1)
                       << std::endl;
         }
+        if (ret != ENOMEM &&
+            (!peer_recovery_enabled() || peer_is_alive(peer_idx)))
+            ERROR("server post_peer_rpc_message ibv_post_send failed");
         auto send_lock_release = std::chrono::steady_clock::now();
         ctr_peer_send_lock_direct_hold_ns.fetch_add(
             elapsed_ns(send_lock_acquired, send_lock_release),
@@ -2297,6 +2626,8 @@ inline bool Server::post_peer_parity_apply_lane(
     size_t peer_idx, size_t worker_idx, const rdma::EC2PCRpcMessage &msg) {
     static std::atomic<uint32_t> log_budget{0};
     auto lane_try_begin = std::chrono::steady_clock::now();
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (msg.type != rdma::EC2PC_MSG_PARITY_APPLY) {
         return false;
     }
@@ -2379,6 +2710,9 @@ inline bool Server::post_peer_parity_apply_lane(
                       << (qret == 0 ? static_cast<int>(qp_attr.dest_qp_num) : -1)
                       << std::endl;
         }
+        if (ret != ENOMEM &&
+            (!peer_recovery_enabled() || peer_is_alive(peer_idx)))
+            ERROR("server post_peer_parity_apply_lane ibv_post_send failed");
         return false;
     }
     lane.next_slot = (lane.next_slot + 1) % depth;
@@ -2394,6 +2728,10 @@ inline bool Server::post_peer_parity_apply_lane(
 
 inline size_t Server::flush_peer_parity_apply_lane(size_t peer_idx,
                                                    size_t worker_idx) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx)) {
+        drop_unposted_peer_work(peer_idx);
+        return 0;
+    }
     if (worker_idx >= std::max<size_t>(1, rpc_worker_count)) {
         return 0;
     }
@@ -2522,6 +2860,8 @@ inline size_t Server::flush_all_peer_parity_apply_lanes(size_t max_posts) {
 
 inline bool Server::enqueue_peer_parity_apply_lane(
     size_t peer_idx, size_t worker_idx, const rdma::EC2PCRpcMessage &msg) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return false;
     if (msg.type != rdma::EC2PC_MSG_PARITY_APPLY) {
         return false;
     }
@@ -2544,6 +2884,8 @@ inline bool Server::enqueue_peer_parity_apply_lane(
             continue;
         }
         std::lock_guard<std::mutex> lock(peer_lane_mutexes[lane_idx]);
+        if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+            return false;
         auto &lane = peer_lane_send_queues[lane_idx];
         if (lane.pending_msgs == nullptr || lane.pending_capacity == 0) {
             continue;

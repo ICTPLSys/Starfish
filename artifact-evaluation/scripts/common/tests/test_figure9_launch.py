@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,16 +22,74 @@ AE = run_case.AE_ROOT
 
 
 class Figure9Launch(unittest.TestCase):
-    def plan(self, root, raw, app="llama", system="starfish"):
+    def plan(self, root, raw, app="llama", system="starfish", out=None,
+             build_root=None):
         site = root / "site.json"
         site.write_text(json.dumps(raw))
         args = argparse.Namespace(app=app, system=system, ratio=25, site=site,
-                                  out=root / "case", timeout=1800, dry_run=True)
+                                  out=root / "case" if out is None else out,
+                                  timeout=1800, dry_run=True,
+                                  build_root=build_root)
         with patch.object(run_case, "ssh") as ssh, contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(run_case.run(args), 0)
         ssh.assert_not_called()
         self.assertFalse(args.out.exists())
         return json.loads(output.getvalue())
+
+    def test_different_clone_roots_have_different_remote_namespaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plans = []
+            for name in ("clone-a", "clone-b"):
+                root = Path(tmp) / name
+                root.mkdir()
+                plans.append(self.plan(root, {"memory_ip": "10.208.130.76",
+                                              "memory_server_count": 6}))
+            namespaces = {
+                plan["remote_namespace"] for plan in plans
+            }
+            self.assertEqual(len(namespaces), 2)
+            self.assertTrue(all(plan["remote_namespace_source"].endswith(
+                ("clone-a", "clone-b")[index])
+                for index, plan in enumerate(plans)))
+
+    def test_relative_out_and_build_root_are_resolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = Path.cwd()
+            try:
+                os.chdir(root)
+                plan = self.plan(root, {"memory_ip": "10.208.130.76",
+                                        "memory_server_count": 6},
+                                 out=Path("case"), build_root=Path("build"))
+            finally:
+                os.chdir(old)
+            self.assertTrue(Path(plan["client_bin"]).is_absolute())
+
+    def test_memory_sampling_plan_uses_work_hooks_and_bfs_single_point(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for system in ("nonft", "starfish", "hydra", "carbink"):
+                for app in ("llama", "bfs", "mg", "wordcount", "kv-b", "kv-a", "kv-s", "nq"):
+                    with self.subTest(system=system, app=app):
+                        plan = self.plan(Path(tmp), {
+                            "memory_ip": "10.208.130.76",
+                            "memory_server_count": 6,
+                            "compute_ip": "10.208.130.56",
+                            "remote_memory_samples": True,
+                            "remote_memory_observer_cpu": 47,
+                        }, app=app, system=system)
+                        sampling = plan["remote_memory_sampling"]
+                        self.assertEqual(
+                            sampling["time_origin"],
+                            "kvs_request_start" if app in ("kv-b", "kv-a", "kv-s")
+                            else "profile_start_work")
+                        self.assertEqual(
+                            sampling["stop_at"],
+                            "kvs_request_drain_end" if app in ("kv-b", "kv-a", "kv-s")
+                            else "profile_end_work")
+                        self.assertEqual(sampling["schema_version"], 3)
+                        self.assertEqual(sampling["planned_points_s"],
+                                         [3] if app == "bfs" else [10, 20, 30, 40, 50])
+                        self.assertNotIn("FARLIB_BENCHMARK_START_MONOTONIC_NS", plan["client_env"])
 
     def test_colocated_six_and_seven_endpoint_plans(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,7 +8,8 @@ case "${1:---help}" in
   figure12) shift; exec bash "$HERE/figure12/plot.sh" "$@" ;;
   figure13) shift; exec bash "$HERE/figure13/plot.sh" "$@" ;;
   -h|--help)
-    echo 'Usage: scripts/plot.sh {figure9|figure10|figure11|figure12|figure13} [figure-specific CSV options]'
+    echo 'Usage: scripts/plot.sh {figure9|figure10|figure11|figure12|figure13} [figure-specific options]'
+    echo 'Without an explicit input, the newest measured result is selected read-only.'
     echo 'Use scripts/plot.sh FIGURE --help for figure-specific options.' ;;
   *) echo "unknown figure: $1 (available: figure9, figure10, figure11, figure12, figure13)" >&2; exit 2 ;;
 esac

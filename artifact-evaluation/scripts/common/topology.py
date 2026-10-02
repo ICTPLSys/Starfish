@@ -372,6 +372,32 @@ def check_cpu_placement(site, runtime_config=None, *,
     }
 
 
+def observer_cpu(site, runtime_config, requested=None):
+    """Plan one observer CPU without changing application/background workers."""
+    profile = check_cpu_profile(site, runtime_config)
+    used = set(profile["app_cpus"]) | set(profile["background_cpus"])
+    if requested is None:
+        return max(used) + 1
+    cpu = _config_integer(requested, "remote_memory_observer_cpu", allow_zero=True)
+    if cpu in used:
+        raise ValueError("remote-memory observer overlaps application/background CPUs")
+    return cpu
+
+
+def check_observer_cpu(site, runtime_config, cpu):
+    """Check the observer against real allowed CPUs and physical-core IDs."""
+    profile = check_cpu_profile(site, runtime_config)
+    records = _normalise_cpu_records(_read_cpu_records())
+    if cpu not in records or cpu not in os.sched_getaffinity(0):
+        raise ValueError("remote-memory observer CPU is offline or outside process affinity")
+    physical = (records[cpu]["socket"], records[cpu]["core"])
+    for worker in (*profile["app_cpus"], *profile["background_cpus"]):
+        if physical == (records[worker]["socket"], records[worker]["core"]):
+            raise ValueError("remote-memory observer shares a physical core with a worker")
+    return {"cpu": cpu, "socket": physical[0], "core": physical[1],
+            "numa_node": records[cpu]["node"], "physical_core_disjoint": True}
+
+
 def memory_binding(node, *, server=False):
     validate_numa(node, "numa_node")
     prefix = ["numactl", f"--membind={node}"]

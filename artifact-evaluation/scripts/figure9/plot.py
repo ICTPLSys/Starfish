@@ -44,6 +44,11 @@ DEFAULT_RATIOS = (13, 25, 50, 75, 100)
 TEARDOWN_EXIT_STATUSES = frozenset(("124", "-15", "-9"))
 CANONICAL_VARIANT = "canonicalruntime"
 OFF_VARIANT = "nonft-backup-off"
+NONFT_SOURCE_SYSTEMS = {
+    "bfs": "nonft", "llama": "nonft", "mg": "nonft",
+    "wc": OFF_VARIANT, "kv_b": OFF_VARIANT, "kv_a": OFF_VARIANT,
+    "kv_s": OFF_VARIANT, "nq": OFF_VARIANT,
+}
 
 
 def canonical(value, names, label):
@@ -82,6 +87,7 @@ def run_metadata(row):
         "run_id": row["run_id"],
         "elapsed_s": row["elapsed_s"],
         "source": row["source"],
+        "source_system": row["system"],
         "exit_status": row.get("exit_status", "0"),
         "measurement_usable": row.get("measurement_usable", ""),
         "execution_status": row.get("execution_status", ""),
@@ -100,7 +106,8 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
     systems = [canonical(x, BAR_SYSTEMS, "bar system") for x in systems]
     if OFF_VARIANT in systems:
         raise ValueError(
-            "Figure 9 does not plot the backup-OFF variant; use the four canonical systems")
+            "Figure 9 has one Non-FT series with a fixed per-workload ON/OFF source; "
+            "select nonft, not a separate backup-OFF series")
     if not workloads or len(set(workloads)) != len(workloads):
         raise ValueError("workloads must be nonempty and unique")
     if not systems or len(set(systems)) != len(systems):
@@ -109,6 +116,10 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
             or any(not isinstance(x, int) or not 1 <= x <= 100 for x in ratios)):
         raise ValueError("ratios must be unique integer percentages in [1, 100]")
     ratios = sorted(ratios)
+    selected_conditions = {
+        (w, NONFT_SOURCE_SYSTEMS[w] if s == "nonft" else s, r)
+        for w in workloads for s in systems for r in ratios
+    } | {(w, "native", 100) for w in workloads}
     numbered_rows, digest = read_csv(path, REQUIRED)
     groups = defaultdict(list)
     blank_rows = []
@@ -134,7 +145,7 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
                     "workload": workload, "system": system, "ratio": ratio,
                     "csv_line": line, "source": row["source"],
                 }
-                if system == OFF_VARIANT:
+                if system == OFF_VARIANT and NONFT_SOURCE_SYSTEMS[workload] != system:
                     ignored_backup_off_rows.append(record)
                 else:
                     blank_rows.append(record)
@@ -168,12 +179,11 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
                           measurement_usable=row.get("measurement_usable", ""),
                           execution_status=row.get("execution_status", ""),
                           warning=row.get("warning", ""))
-            if system == OFF_VARIANT:
+            if system == OFF_VARIANT and NONFT_SOURCE_SYSTEMS[workload] != system:
                 ignored_backup_off_rows.append({
                     "workload": workload, "system": system, "ratio": ratio,
                     "csv_line": line, "source": row["source"],
                 })
-                continue
             groups[workload, system, ratio].append(record)
         except ValueError as exc:
             raise ValueError(f"CSV line {line}: {exc}") from exc
@@ -205,8 +215,10 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
             "runs": [run_metadata(row) for row in native],
         }
         for s in systems:
+            # Select by the approved application policy, never by speed or availability.
+            source_system = NONFT_SOURCE_SYSTEMS[w] if s == "nonft" else s
             for r in ratios:
-                records = groups.get((w, s, r), [])
+                records = groups.get((w, source_system, r), [])
                 for row in records:
                     for field in ("experiment_id", "environment", "measurement_phase"):
                         if field in row:
@@ -216,6 +228,7 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
                 values = [row["elapsed_s"] for row in records]
                 points.append({
                     "workload": w, "system": s, "ratio": r,
+                    "source_system": source_system,
                     "mean_s": statistics.mean(values) if values else None,
                     "stddev_s": statistics.stdev(values) if len(values) > 1 else None,
                     "n": len(values),
@@ -225,22 +238,21 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
         if len(values) > 1:
             raise ValueError(f"{workload}: mixed {field} values: {sorted(values)}")
     return {
-        "schema_version": 2, "figure": "figure9",
+        "schema_version": 3, "figure": "figure9",
         "input": str(path.resolve()), "input_sha256": digest,
         "source_type": source_type,
         "metric": "elapsed_s", "unit": "seconds",
         "x_metric": "local memory capacity / application footprint * 100",
         "aggregation": "arithmetic mean; error bars = sample standard deviation (ddof=1)",
         "workloads": workloads, "systems": systems, "ratios": ratios,
+        "nonft_source_systems": {w: NONFT_SOURCE_SYSTEMS[w] for w in workloads},
         "input_rows": len(numbered_rows),
         "blank_rows": blank_rows,
         "ignored_backup_off_rows": ignored_backup_off_rows,
         "unselected_conditions": [list(key) for key in sorted(
             set(groups) | {(row["workload"], row["system"], row["ratio"])
                            for row in blank_rows})
-            if key[0] not in workloads or
-            (key[1] not in systems and key[1] != "native") or
-            (key[2] not in ratios and key[1] != "native")],
+            if key not in selected_conditions],
         "selected_rows": sum(p["n"] for p in points)
                          + sum(v["n"] for v in native_baselines.values()),
         "missing_conditions": [[p["workload"], p["system"], p["ratio"]]
@@ -256,7 +268,7 @@ def draw(data):
     """Keep the paper's geometry, colors, hatches and guides; replace its arrays with CSV."""
     if OFF_VARIANT in data["systems"]:
         raise ValueError(
-            "Figure 9 does not plot the backup-OFF variant; use the four canonical systems")
+            "Figure 9 uses backup-OFF data within its Non-FT series, not as a fifth series")
     plt = get_pyplot()
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch

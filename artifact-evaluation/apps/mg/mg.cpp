@@ -140,7 +140,14 @@ static int* debug_vec = (int*)malloc(sizeof(int) * (8));
 // static double(*v) = (double*)malloc(sizeof(double) * (NV));
 // static double(*r) = (double*)malloc(sizeof(double) * (NR));
 #endif
+#ifdef MG_OBJECT_ALLOCATION_BYTES
+static_assert(MG_OBJECT_ALLOCATION_BYTES > allocator::BlockHeadSize);
+static_assert((MG_OBJECT_ALLOCATION_BYTES - allocator::BlockHeadSize) % sizeof(double) == 0);
+using DoubleVec = FarVector<double,
+    (MG_OBJECT_ALLOCATION_BYTES - allocator::BlockHeadSize) / sizeof(double)>;
+#else
 using DoubleVec = FarVector<double>;
+#endif
 using DoubleVecIter = DoubleVec::lite_iterator;
 using DoubleVecConstIter = DoubleVec::const_lite_iterator;
 
@@ -1851,6 +1858,9 @@ void do_work(void* /* arg */) {
 #endif
     FarLib::profile::begin_frequency_output_scope();
     const auto work_start = std::chrono::steady_clock::now();
+#ifdef FARLIB_STARFISH_MG
+    const auto work_start_tsc = get_cycles();
+#endif
     if (timeron) {
         timer_start(T_RESID2);
     }
@@ -1898,6 +1908,9 @@ void do_work(void* /* arg */) {
         }
     }
     norm2u3_caller(r_vec, n1, n2, n3, &rnm2, &rnmu, nx[lt], ny[lt], nz[lt], 0);
+#ifdef FARLIB_STARFISH_MG
+    const auto work_tsc_ticks = get_cycles() - work_start_tsc;
+#endif
     const double work_ms = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - work_start)
                                .count();
@@ -1908,6 +1921,13 @@ void do_work(void* /* arg */) {
     FarLib::profile::thread_end_work();
 #endif
     FarLib::profile::end_work();
+#ifdef FARLIB_STARFISH_MG
+    if (FarLib::profile::evac_phase_metrics_enabled()) {
+        printf("MG_PROFILE_CLOCK native_work_ms=%.9f native_work_tsc_ticks=%llu\n",
+               work_ms, static_cast<unsigned long long>(work_tsc_ticks));
+        FarLib::profile::print_profile_data();
+    }
+#endif
     printf("rdma read bytes %lld\nrdma write bytes %lld\n",
            static_cast<long long>(FarLib::profile::collect_rdma_read_post_bytes()),
            static_cast<long long>(FarLib::profile::collect_rdma_write_post_bytes()));
@@ -2134,6 +2154,10 @@ static void setup(int* n1, int* n2, int* n3, int k) {
 }
 
 int main(int argc, char** argv) {
+#ifdef FARLIB_STARFISH_MG
+    // Set once before any runtime/server workers start, never via environment.
+    FarLib::cache::ec_split::mg_optimizations_enabled = true;
+#endif
     FarLib::rdma::Configure config;
 #ifndef STANDALONE
     if (argc != 2) {
@@ -2153,6 +2177,11 @@ int main(int argc, char** argv) {
 #endif
     printf("MG_PARALLELISM fibres=%zu configured_app_workers=%u\n",
            UthreadCount, static_cast<unsigned>(config.max_thread_cnt));
+#ifdef FARLIB_STARFISH_MG
+    printf("MG_OBJECT_LAYOUT allocation_bytes=%zu payload_bytes=%zu elements=%zu\n",
+           DoubleVec::GROUP_SIZE * sizeof(double) + allocator::BlockHeadSize,
+           DoubleVec::GROUP_SIZE * sizeof(double), DoubleVec::GROUP_SIZE);
+#endif
     FarLib::runtime_init(config);
     do_work(nullptr);
     fflush(stdout);

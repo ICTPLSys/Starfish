@@ -149,11 +149,19 @@ inline void ConcurrentArrayCache::note_ec_recovery_error_wc(const ibv_wc &wc) {
                 uthread::notify_all(&background_rebuild_cond_,
                                     &background_rebuild_mutex_);
             }
-            std::cout << "INFO: ec_recovery endpoint_dead endpoint="
-                      << endpoint_idx << " qp_num=" << wc.qp_num
-                      << " wc_status=" << wc.status << " wr_id=" << wc.wr_id
-                      << " monotonic_ns=" << endpoint_dead_ns
-                      << std::endl;
+            // Publish one complete stdio record: worker-start messages may
+            // run immediately after notify_all and must not split its fields.
+            char record[512];
+            const int length = std::snprintf(
+                record, sizeof(record),
+                "INFO: ec_recovery endpoint_dead endpoint=%d qp_num=%u "
+                "wc_status=%u wr_id=%llu monotonic_ns=%llu\n",
+                endpoint_idx, wc.qp_num, static_cast<unsigned>(wc.status),
+                static_cast<unsigned long long>(wc.wr_id),
+                static_cast<unsigned long long>(endpoint_dead_ns));
+            ASSERT(length > 0 && static_cast<size_t>(length) < sizeof(record));
+            std::fwrite(record, 1, static_cast<size_t>(length), stdout);
+            std::fflush(stdout);
         }
     } else if (endpoint_idx < 0) {
         static std::atomic<int> unmapped_qp_log{0};
@@ -420,6 +428,13 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
         bool active = true;
         ~EntryPinGuard() { if (active) unpin_fetch_entry_for_recovery(entry); }
     } entry_pin{entry};
+    // A waiter may have sampled client_idx before fetch publication finished.
+    // The successful pin acquired the published state; use its matching client
+    // for both the context owner and RDMA submissions, not that stale argument.
+    if (ec_split::direct_read_enabled() && ec_batch_uses_split(
+            entry->load_state(std::memory_order_relaxed).size)) {
+        client_idx = entry->get_client_idx();
+    }
     void *local_addr = entry->local_addr();
     if (expected_local_addr != nullptr && expected_local_addr != local_addr) {
         profile_post_attempt.set_outcome(Outcome::kUnavailable);
@@ -479,28 +494,56 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
         }
     }
     auto *client = rdma::get_client(client_idx);
+    constexpr uint8_t kAllSegments = static_cast<uint8_t>(
+        (1u << ec_read_recovery::kEcReadSegmentCount) - 1u);
+    constexpr uint8_t kDataSegments = static_cast<uint8_t>(
+        (1u << kStripeCodecDataShards) - 1u);
+    const auto *client_control = rdma::ClientControl::get_default();
+    // ClientControl registers exactly (get_buffer(), client_buffer_size) as
+    // its private mr in the constructor.  Use that public equivalent here so
+    // the direct path never hands a local address outside the registered MR
+    // to post_read; the interval helper also rejects integer wraparound.
+    const bool direct_target_in_mr =
+        view.split_object && ec_split::direct_read_enabled() &&
+        client_control != nullptr &&
+        ec_split::address_range_within(
+            local_addr, view.object_bytes, client_control->get_buffer(),
+            config.client_buffer_size);
+    // Healthy split groups select data[0..3].  Only that exact plan can land
+    // directly in the object: any parity/dead-endpoint plan still needs the
+    // registered scratch buffers and the existing decoder.
+    const bool direct_split_read =
+        direct_target_in_mr &&
+        view.alive_mask == kAllSegments &&
+        view.plan.read_mask == kDataSegments;
+    const auto storage_mode = direct_split_read
+                                  ? ec_read_recovery::EcReadStorageMode::kDirectSplit
+                                  : ec_read_recovery::EcReadStorageMode::kScratch;
     const bool scratch_pool_valid =
-        view.split_object ? ec_split_buffers_.valid()
-                          : ec_read_scratch_pool_.valid();
+        direct_split_read ||
+        (view.split_object ? ec_split_buffers_.valid()
+                           : ec_read_scratch_pool_.valid());
     if (client == nullptr || !scratch_pool_valid) {
         profile_post_attempt.set_outcome(Outcome::kUnavailable);
         return Result::kUnavailable;
     }
     ec_batch::EcStagingGroupSlot scratch;
-    bool acquired = false;
-    {
-        EcRecoveryProfile::ScopedTimer timer(
-            ec_recovery_profile(), EcRecoveryProfile::Stage::kScratchAcquire);
-        if (view.split_object) {
-            // Split buffers accept the group's padded fragment slot size. The
-            // actual READ length remains the logical fragment extent below.
-            acquired = ec_split_buffers_.acquire(view.group.slot_size,
-                                                 client_idx, &scratch);
-        } else {
-            acquired = ec_read_scratch_pool_.acquire(&scratch, client_idx);
+    bool acquired = direct_split_read;
+    if (!direct_split_read) {
+        {
+            EcRecoveryProfile::ScopedTimer timer(
+                ec_recovery_profile(), EcRecoveryProfile::Stage::kScratchAcquire);
+            if (view.split_object) {
+                // Split buffers accept the group's padded fragment slot size. The
+                // actual READ length remains the logical fragment extent below.
+                acquired = ec_split_buffers_.acquire(view.group.slot_size,
+                                                     client_idx, &scratch);
+            } else {
+                acquired = ec_read_scratch_pool_.acquire(&scratch, client_idx);
+            }
         }
+        ec_recovery_profile().note_scratch_acquire_result(acquired);
     }
-    ec_recovery_profile().note_scratch_acquire_result(acquired);
     if (!acquired) {
         ec_recovery_scratch_backpressure_.fetch_add(1, std::memory_order_relaxed);
         profile_post_attempt.set_outcome(Outcome::kUnavailable);
@@ -517,14 +560,17 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
         acquired = ec_read_tokens_.acquire(
             client_idx, target, remote_addr, read_bytes, view.plan.read_mask,
             view.own_shard_idx, scratch, &token_id, &context,
-            view.split_object ? view.object_bytes : 0, view.alive_mask);
+            view.split_object ? view.object_bytes : 0, view.alive_mask,
+            storage_mode);
     }
     ec_recovery_profile().note_token_acquire_result(acquired);
     if (!acquired) {
-        if (view.split_object) {
-            (void)ec_split_buffers_.release(scratch);
-        } else {
-            (void)ec_read_scratch_pool_.release(scratch);
+        if (!direct_split_read) {
+            if (view.split_object) {
+                (void)ec_split_buffers_.release(scratch);
+            } else {
+                (void)ec_read_scratch_pool_.release(scratch);
+            }
         }
         ec_recovery_post_unavailable_.fetch_add(1, std::memory_order_relaxed);
         profile_post_attempt.set_outcome(Outcome::kUnavailable);
@@ -537,8 +583,6 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
     const size_t qp_idx = client->get_qp_idx();
     const uint64_t post_deadline_us = ec_recovery_post_deadline_us();
     bool all_posted = true;
-    constexpr uint8_t kAllSegments = static_cast<uint8_t>(
-        (1u << ec_read_recovery::kEcReadSegmentCount) - 1u);
     const bool repaired_read = !view.split_object &&
         view.plan.read_mask == static_cast<uint8_t>(1u << view.own_shard_idx);
     const bool degraded_round =
@@ -554,15 +598,32 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
             if ((view.plan.read_mask & (1u << segment)) == 0) continue;
             const auto &seg = view.group.segments[segment];
             const auto slot_index = static_cast<uint8_t>(segment);
-            void *dst = ec_read_recovery::ec_read_scratch_segment(scratch, slot_index);
+            uint32_t segment_read_bytes = read_bytes;
+            void *dst = nullptr;
+            if (direct_split_read) {
+                ec_split::DirectReadFragment fragment;
+                if (!ec_split::direct_read_fragment(view.object_bytes, segment,
+                                                    &fragment)) {
+                    all_posted = false;
+                    break;
+                }
+                segment_read_bytes = static_cast<uint32_t>(fragment.bytes);
+                dst = static_cast<uint8_t *>(local_addr) + fragment.offset;
+            } else {
+                dst = ec_read_recovery::ec_read_scratch_segment(scratch,
+                                                                 slot_index);
+            }
             const uint64_t wr_id =
                 ec_read_recovery::encode_ec_read_wr_id(token_id, slot_index);
             const auto mapped = config.map_remote_addr(seg.addr);
             ASSERT(mapped.first == seg.endpoint_idx);
             ASSERT(mapped.second + seg.slot_size <= config.server_buffer_size);
             uint64_t spin = 0;
-            while (!client->post_read(mapped.second, dst, read_bytes, wr_id, 0,
-                                     qp_idx, seg.endpoint_idx, &scratch.lkey)) {
+            const uint32_t *lkey_override =
+                direct_split_read ? nullptr : &scratch.lkey;
+            while (!client->post_read(mapped.second, dst, segment_read_bytes,
+                                      wr_id, 0, qp_idx, seg.endpoint_idx,
+                                      lkey_override)) {
                 (void)check_cq_idx_with_client_idx_endpoint(
                     qp_idx, client_idx, seg.endpoint_idx);
                 if (++spin > kEcRecoveryScratchSpinLimit ||
@@ -576,7 +637,8 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
             }
             if (!all_posted) break;
             if (degraded_round) {
-                ec_recovery_profile().note_accepted_survivor_segment(read_bytes);
+                ec_recovery_profile().note_accepted_survivor_segment(
+                    segment_read_bytes);
             }
             // This is a request-local atomic update, not a shared-table lookup.
             // CQEs may beat this mark; posting close prevents premature release.
@@ -594,6 +656,12 @@ ConcurrentArrayCache::post_ec_degraded_read_entry(FarObjectEntry *entry,
             // read is still a four-fragment reconstruction, but it is not a
             // degraded small-object recovery event.
             ec_split_read_posts_.fetch_add(1, std::memory_order_relaxed);
+            if (direct_split_read) {
+                ec_split_direct_read_posts_.fetch_add(1,
+                                                      std::memory_order_relaxed);
+                ec_split_direct_read_bytes_.fetch_add(
+                    view.object_bytes, std::memory_order_relaxed);
+            }
         } else {
             ec_recovery_posts_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -662,7 +730,8 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
             reinterpret_cast<void *>(event.token->target_local_addr)) - 1;
         auto *entry = &get_entry_of(block->obj_meta_data.load(std::memory_order_acquire));
         ec_recovery_profile().note_token_abandon(event.profile_acquire_ns);
-        {
+        if (event.storage_mode !=
+            ec_read_recovery::EcReadStorageMode::kDirectSplit) {
             EcRecoveryProfile::ScopedTimer timer(
                 ec_recovery_profile(), EcRecoveryProfile::Stage::kScratchRelease);
             release_scratch(event.scratch, event.split_payload_bytes != 0);
@@ -677,6 +746,8 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
     if (event.kind != ec_read_recovery::EcReadTokenEventKind::kWinner) return;
     ec_read_recovery::EcReadContext *token = event.token;
     const bool split_object = token->split_payload_bytes != 0;
+    const bool direct_split_read =
+        token->storage_mode == ec_read_recovery::EcReadStorageMode::kDirectSplit;
     const uint32_t object_bytes =
         split_object ? token->split_payload_bytes : token->byte_count;
     constexpr uint8_t kAllSegments = static_cast<uint8_t>(
@@ -702,7 +773,7 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
     auto *owner_entry = &get_entry_of(owner_obj);
     if (owner_entry->load_state(std::memory_order_acquire).state != EntryState::FETCHING ||
         owner_entry->local_addr() != dst || owner_entry->remote_addr() != token->remote_addr) {
-        release_scratch(scratch, split_object);
+        if (!direct_split_read) release_scratch(scratch, split_object);
         if (!ec_read_tokens_.release(token_id))
             ERROR("ec_recovery: cannot release obsolete context");
         release_degraded_read_owner(target_block);
@@ -722,7 +793,12 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
     {
         EcRecoveryProfile::ScopedTimer timer(
             ec_recovery_profile(), EcRecoveryProfile::Stage::kDecode);
-    if (split_object) {
+    if (direct_split_read) {
+        // Healthy data[0..3] READs already landed in the final object slot.
+        // The token still gates publication on all four terminal CQEs; no
+        // scratch buffer or codec pass is involved in this mode.
+        rebuilt = true;
+    } else if (split_object) {
         // Split rounds always reconstruct the logical object, including the
         // healthy case where data-0 is one of the four selected fragments.
         // The codec consumes exactly the selected four fragment buffers and
@@ -780,7 +856,7 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
     }
     // Return the scratch segment first; the token still pins the target, so no
     // second read of this object can start in between.
-    {
+    if (!direct_split_read) {
         EcRecoveryProfile::ScopedTimer timer(
             ec_recovery_profile(), EcRecoveryProfile::Stage::kScratchRelease);
         release_scratch(scratch, split_object);
@@ -816,6 +892,10 @@ inline void ConcurrentArrayCache::finish_ec_read_context(
         }
         if (published && split_object) {
             ec_split_read_completions_.fetch_add(1, std::memory_order_relaxed);
+            if (direct_split_read) {
+                ec_split_direct_read_completions_.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             if (split_degraded) {
                 ec_split_degraded_read_completions_.fetch_add(
                     1, std::memory_order_relaxed);
@@ -1099,8 +1179,21 @@ inline void ConcurrentArrayCache::ec_read_recovery_diag_report(
                   << " completions=" << ld(ec_recovery_completions_)
                   << " split_read_posts=" << ld(ec_split_read_posts_)
                   << " split_read_completions="
-                  << ld(ec_split_read_completions_)
-                  << " split_degraded_completions="
+                  << ld(ec_split_read_completions_);
+        if (ec_split::mg_optimizations_enabled) {
+        formatted << " split_direct_read_enabled="
+                  << (ec_split::direct_read_enabled() ? 1 : 0)
+                  << " split_direct_read_posts="
+                  << ec_split_direct_read_posts_.load(
+                         std::memory_order_relaxed)
+                  << " split_direct_read_completions="
+                  << ec_split_direct_read_completions_.load(
+                         std::memory_order_relaxed)
+                  << " split_direct_read_bytes="
+                  << ec_split_direct_read_bytes_.load(
+                         std::memory_order_relaxed);
+        }
+        formatted << " split_degraded_completions="
                   << ld(ec_split_degraded_read_completions_)
                   << " rebuild_failures=" << ld(ec_recovery_rebuild_failures_)
                   << " verify_pass=" << ld(ec_recovery_verify_pass_)

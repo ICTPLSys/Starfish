@@ -23,6 +23,10 @@ enum class ReclaimKind : uint8_t { Mark, Evict, GC };
 struct alignas(64) Shard {
     std::atomic<uint64_t> alloc_slots{0};
     std::atomic<uint64_t> alloc_slot_bytes{0};
+    std::atomic<uint64_t> alloc_elapsed_cycles{0};
+    std::atomic<uint64_t> fetch_wait_calls{0};
+    std::atomic<uint64_t> fetch_wait_cycles{0};
+    std::atomic<uint64_t> fetch_wait_rounds{0};
     std::atomic<uint64_t> mark_slots{0};
     std::atomic<uint64_t> mark_slot_bytes{0};
     std::atomic<uint64_t> evict_slots{0};
@@ -52,11 +56,13 @@ inline Shard *get_local_shard() {
     return local_shard;
 }
 
-inline void record_allocation(size_t slot_bytes) {
+inline void record_allocation(size_t slot_bytes, uint64_t elapsed_cycles = 0) {
     Shard *shard = get_local_shard();
     if (shard == nullptr) return;
     shard->alloc_slots.fetch_add(1, std::memory_order_relaxed);
     shard->alloc_slot_bytes.fetch_add(slot_bytes, std::memory_order_relaxed);
+    shard->alloc_elapsed_cycles.fetch_add(elapsed_cycles,
+                                           std::memory_order_relaxed);
 }
 
 inline void record_reclaim(ReclaimKind kind, size_t slots,
@@ -87,11 +93,32 @@ inline void record_reclaim(ReclaimKind kind, size_t slots,
     }
 }
 
+// Owned workers bypass the generic collector's reclaim counters.
+inline void record_owned_pass(ReclaimKind kind, size_t used_before,
+                              size_t used_after, size_t slot_bytes) {
+    if (!enabled()) return;
+    if (used_after > used_before) std::abort();
+    const size_t freed = used_before - used_after;
+    record_reclaim(kind, freed, freed * slot_bytes, false);
+}
+
+inline void record_fetch_wait(uint64_t cycles, uint64_t rounds = 0) {
+    Shard *shard = get_local_shard();
+    if (shard == nullptr) return;
+    shard->fetch_wait_calls.fetch_add(1, std::memory_order_relaxed);
+    shard->fetch_wait_cycles.fetch_add(cycles, std::memory_order_relaxed);
+    shard->fetch_wait_rounds.fetch_add(rounds, std::memory_order_relaxed);
+}
+
 struct Snapshot {
     uint64_t shard_count = 0;
     uint64_t dropped = 0;
     uint64_t alloc_slots = 0;
     uint64_t alloc_slot_bytes = 0;
+    uint64_t alloc_elapsed_cycles = 0;
+    uint64_t fetch_wait_calls = 0;
+    uint64_t fetch_wait_cycles = 0;
+    uint64_t fetch_wait_rounds = 0;
     uint64_t mark_slots = 0;
     uint64_t mark_slot_bytes = 0;
     uint64_t evict_slots = 0;
@@ -110,6 +137,14 @@ inline Snapshot snapshot() {
     result.dropped = dropped_records.load(std::memory_order_relaxed);
     for (size_t i = 0; i < result.shard_count; ++i) {
         const Shard &shard = shards[i];
+        result.fetch_wait_rounds +=
+            shard.fetch_wait_rounds.load(std::memory_order_relaxed);
+        result.fetch_wait_calls +=
+            shard.fetch_wait_calls.load(std::memory_order_relaxed);
+        result.fetch_wait_cycles +=
+            shard.fetch_wait_cycles.load(std::memory_order_relaxed);
+        result.alloc_elapsed_cycles +=
+            shard.alloc_elapsed_cycles.load(std::memory_order_relaxed);
         result.alloc_slots +=
             shard.alloc_slots.load(std::memory_order_relaxed);
         result.alloc_slot_bytes +=

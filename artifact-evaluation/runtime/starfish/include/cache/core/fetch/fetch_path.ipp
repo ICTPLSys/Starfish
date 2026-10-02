@@ -11,7 +11,7 @@ inline bool ConcurrentArrayCache::post_fetch(far_obj_t obj,
     auto &entry = get_entry_of(obj);
 retry:
     auto old_state = entry.load_state();
-    if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
+    if (old_state.invalid) [[unlikely]] {
         auto spin_start = get_cycles();
         profile::count_excl_move_lock_spin();
         profile::count_excl_move_lock_spin_cycles(get_cycles() - spin_start);
@@ -34,7 +34,7 @@ retry:
         return false;
     case MARKED:
     case EVICTING:
-        if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
+        if (old_state.invalid) [[unlikely]] {
             auto spin_start = get_cycles();
             profile::count_excl_move_lock_spin();
             profile::count_excl_move_lock_spin_cycles(get_cycles() - spin_start);
@@ -54,7 +54,14 @@ retry:
             local_behavior_group(entry, placement.requested_placement));
         void* local_ptr = allocation.get();
         new_state.state = FETCHING;
-        if (!entry.cas_state_weak(old_state, new_state)) {
+        // Every fetch publishes its address/client metadata under invalid,
+        // including whole small objects. FETCHING alone must not expose the
+        // old (or half-written) split local_addr fields to another waiter.
+        // Allocation may yield, but precedes this claim; the publication
+        // section below has no miss handler, fibre yield, or RDMA polling.
+        auto claim_state = new_state;
+        claim_state.invalid = true;
+        if (!entry.cas_state_weak(old_state, claim_state)) {
             deallocate_local(local_ptr, entry);
             if (placement.backup_reserved) {
                 release_remote_backup_budget(obj.size);
@@ -76,6 +83,9 @@ retry:
                                     actual_fetch_placement);
         record_profiled_backup_decision(entry, obj.size,
                                         placement.backup_reserved);
+        if (claim_state.invalid) {
+            ASSERT(entry.cas_state_strong(claim_state, new_state));
+        }
         auto *diag_fibre = fibre_self();
         scope_diag::set_pending(
             diag_fibre, reinterpret_cast<uintptr_t>(&entry));
@@ -137,10 +147,10 @@ inline bool ConcurrentArrayCache::post_fetch_lite_slow_path(
     }
     auto old_state = entry.load_state(std::memory_order::relaxed);
 retry:
-    if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
+    if (old_state.invalid) [[unlikely]] {
         auto spin_start = get_cycles();
         profile::count_excl_move_lock_spin();
-        old_state = entry.load_state(std::memory_order::relaxed);
+        old_state = entry.load_state(std::memory_order_acquire);
         profile::count_excl_move_lock_spin_cycles(get_cycles() - spin_start);
         goto retry;
     }
@@ -206,7 +216,7 @@ retry:
         return false;
     case MARKED:
     case EVICTING:
-        if (::FarLib::get_config().exclusive_cache && old_state.invalid) [[unlikely]] {
+        if (old_state.invalid) [[unlikely]] {
             auto spin_start = get_cycles();
             profile::count_excl_move_lock_spin();
             old_state = entry.load_state(std::memory_order::relaxed);
@@ -238,7 +248,12 @@ retry:
             local_behavior_group(entry, placement.requested_placement));
         void* local_ptr = allocation.get();
         new_state.state = FETCHING;
-        if (!entry.cas_state_weak(old_state, new_state)) {
+        // Match post_fetch() for every object size: publish FETCHING with its
+        // address, posting client and placement hidden until all are ready.
+        // Allocation has finished; do not yield or poll RDMA while invalid.
+        auto claim_state = new_state;
+        claim_state.invalid = true;
+        if (!entry.cas_state_weak(old_state, claim_state)) {
             deallocate_local(local_ptr, entry);
             if (placement.backup_reserved) {
                 release_remote_backup_budget(obj.size);
@@ -261,6 +276,9 @@ retry:
         if constexpr (!Mut) {
             record_profiled_backup_decision(entry, obj.size,
                                              placement.backup_reserved);
+        }
+        if (claim_state.invalid) {
+            ASSERT(entry.cas_state_strong(claim_state, new_state));
         }
         auto *diag_fibre = fibre_self();
         scope_diag::set_pending(
@@ -294,6 +312,8 @@ retry:
 
 inline bool ConcurrentArrayCache::check_fetch(FarObjectEntry *entry,
                                               fetch_ddl_t &ddl) {
+    const auto state = entry->load_state(std::memory_order_acquire);
+    if (state.invalid || state.state == BUSY) return false;
     fetch_ddl_t now = __rdtsc();
     auto client_idx = entry->get_client_idx();
     auto *client = rdma::get_client(client_idx);
@@ -321,10 +341,11 @@ inline bool ConcurrentArrayCache::check_fetch(FarObjectEntry *entry,
 inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
     FarObjectEntry *entry, void *wait_local_addr, size_t qp_idx, size_t client_idx,
     size_t endpoint_idx) {
-    // Keep the allocator block as the wait identity.  Accessor moves transfer
+    // Keep the allocator block as a fallback wait identity. Accessor moves transfer
     // FETCHING and the recipe binding to a new FarObjectEntry, while the
     // original waiter's entry pointer becomes FREE; resolving this metadata
-    // on every round prevents a waiter from spinning on that stale pointer.
+    // only after the old entry becomes FREE avoids consulting a stale block
+    // for ordinary stable-entry fetches while retaining moved-entry support.
     // Capture the local address before calling the miss handler: the handler
     // may itself move the accessor and clear the old entry's address.
     auto *wait_block = wait_local_addr != nullptr
@@ -342,8 +363,14 @@ inline FarObjectEntry *ConcurrentArrayCache::fetch_wait_until_local(
     {
         scope_diag::Guard diag_guard(diag_fibre, scope_diag::RDMA_WAIT);
         while (true) {
-            entry = resolve_wait_entry();
-            if (entry->is_local()) break;
+            auto state = entry->load_state(std::memory_order_acquire);
+            if (state.invalid || state.state == BUSY) continue;
+            if (state.state == FREE) {
+                entry = resolve_wait_entry();
+                state = entry->load_state(std::memory_order_acquire);
+                if (state.invalid || state.state == BUSY) continue;
+            }
+            if (state.state <= EVICTING) break;
             client_idx = entry->get_client_idx();
             if (auto *current_client = rdma::get_client(client_idx)) {
                 qp_idx = current_client->get_qp_idx();

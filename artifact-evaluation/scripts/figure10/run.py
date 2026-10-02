@@ -15,6 +15,7 @@ sys.path.insert(0, str(AE_ROOT / "scripts/common"))
 
 from batch_status import classify_case
 from collect import collect
+from kv_latency import DEFAULT_MAX_QUEUE_DELAY_US as KV_QUEUE_DELAY_US
 from nq_latency import DEFAULT_MAX_QUEUE_DELAY_US as NQ_QUEUE_DELAY_US
 from paper_loads import OFFERED_LOAD_OPS
 
@@ -69,7 +70,7 @@ def plans(args):
         for app in apps:
             queue_us = args.max_queue_delay_us
             if queue_us is None:
-                queue_us = NQ_QUEUE_DELAY_US if app == "nq" else 0
+                queue_us = NQ_QUEUE_DELAY_US if app == "nq" else KV_QUEUE_DELAY_US
             recipe = args.recipe or args.config_root / app / f"{system}.config"
             load_source = ("explicit" if explicit is not None else
                            "ae_selected_load_grid" if app == "nq"
@@ -84,7 +85,8 @@ def plans(args):
                         "--app", app, "--system", system, "--ratio", str(args.ratio),
                         "--site", str(args.site), "--recipe", str(recipe),
                         "--build-root", str(args.build_root), "--out", str(directory),
-                        "--timeout", str(args.timeout), "--offered-load-ops", str(load),
+                        "--timeout", str(args.timeout), "--repeat", str(repeat),
+                        "--offered-load-ops", str(load),
                         "--latency-warmup-ms", str(args.warmup_ms),
                         "--latency-measure-ms", str(args.measure_ms),
                         "--latency-drain-ms", str(args.drain_ms),
@@ -312,7 +314,7 @@ def main():
     parser.add_argument("--measure-ms", type=int, default=10000)
     parser.add_argument("--drain-ms", type=int, default=60000)
     parser.add_argument("--max-queue-delay-us", type=int, default=None,
-                        help="pre-execution queue deadline in us; NQ default 1500000, KV default 0; 0 disables")
+                        help="pre-execution queue deadline in us; NQ default 1500000, KV default 500; 0 disables")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--out", type=Path, default=AE_ROOT / "results/figure10" /

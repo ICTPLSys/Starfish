@@ -18,6 +18,7 @@
 #include <mutex>
 #include <new>
 #include <iostream>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -134,6 +135,68 @@ void test_all_survivor_sets(size_t bytes) {
     }
 }
 
+void test_direct_read_fragment_ranges_and_canaries() {
+    constexpr size_t kCanaryBytes = 32;
+    constexpr uint8_t kCanary = 0xd3;
+    const std::array<size_t, 6> sizes = {
+        4097, 8168, 8169, 8192, 262143, 262144};
+    for (const size_t bytes : sizes) {
+        std::vector<uint8_t> source(bytes);
+        for (size_t i = 0; i < bytes; ++i) {
+            source[i] = static_cast<uint8_t>(0x4bu + 0x23u * i + (i >> 5));
+        }
+        std::vector<uint8_t> guarded(kCanaryBytes + bytes + kCanaryBytes,
+                                     kCanary);
+        auto *payload = guarded.data() + kCanaryBytes;
+        std::memset(payload, 0xa6, bytes);
+
+        size_t covered = 0;
+        for (size_t fragment = 0;
+             fragment < FarLib::cache::ec_split::kDataSlots; ++fragment) {
+            FarLib::cache::ec_split::DirectReadFragment range;
+            assert(FarLib::cache::ec_split::direct_read_fragment(
+                bytes, fragment, &range));
+            assert(range.bytes != 0);
+            assert(range.offset + range.bytes <= bytes);
+            if (bytes == 8169 && fragment == 3) {
+                assert(range.offset == 6129 && range.bytes == 2040);
+            }
+            // Model the four accepted RDMA READs writing their exact logical
+            // ranges into the final object; no padded tail is touched.
+            std::memcpy(payload + range.offset, source.data() + range.offset,
+                        range.bytes);
+            covered += range.bytes;
+        }
+        assert(covered == bytes);
+        assert(std::memcmp(payload, source.data(), bytes) == 0);
+        for (size_t i = 0; i < kCanaryBytes; ++i) {
+            assert(guarded[i] == kCanary);
+            assert(guarded[kCanaryBytes + bytes + i] == kCanary);
+        }
+    }
+
+    FarLib::cache::ec_split::DirectReadFragment untouched{17, 19};
+    assert(!FarLib::cache::ec_split::direct_read_fragment(0, 0, &untouched));
+    assert(!FarLib::cache::ec_split::direct_read_fragment(
+        FarLib::cache::ec_split::kMaxObjectBytes + 1, 0, &untouched));
+    assert(!FarLib::cache::ec_split::direct_read_fragment(4097, 4, &untouched));
+    assert(!FarLib::cache::ec_split::direct_read_fragment(4097, 0, nullptr));
+
+    std::array<uint8_t, 128> region{};
+    assert(FarLib::cache::ec_split::address_range_within(
+        region.data() + 8, 64, region.data(), region.size()));
+    assert(!FarLib::cache::ec_split::address_range_within(
+        region.data() + 8, 121, region.data(), region.size()));
+    assert(!FarLib::cache::ec_split::address_range_within(
+        region.data(), 0, region.data(), region.size()));
+    constexpr uintptr_t kMax = std::numeric_limits<uintptr_t>::max();
+    assert(!FarLib::cache::ec_split::address_range_within(
+        reinterpret_cast<const void *>(kMax - 3), 8, region.data(),
+        region.size()));
+    assert(!FarLib::cache::ec_split::address_range_within(
+        region.data(), 8, reinterpret_cast<const void *>(kMax - 3), 8));
+}
+
 void test_buffer_pools() {
     Context context;
     BufferPools pools;
@@ -176,6 +239,7 @@ int main() {
                                size_t{256 * 1024}}) {
         test_all_survivor_sets(bytes);
     }
+    test_direct_read_fragment_ranges_and_canaries();
     test_buffer_pools();
     std::cout << "EC_SPLIT_FOUNDATION_PASS\n";
     return 0;

@@ -36,6 +36,8 @@ inline void *ec_batch_record_staging_source(const EcGroupSendRecord &record,
 
 inline void *ec_batch_record_source(const EcGroupSendRecord &record,
                                     size_t segment) {
+    if (record.staged_span_data && segment < kEcBatchDataSlots)
+        return record.span_snapshot[segment];
     if (record.direct_span_data && segment < kEcBatchDataSlots)
         return const_cast<void *>(record.objects[segment] != nullptr
                                       ? record.objects[segment] : record.zero_data);
@@ -817,11 +819,12 @@ inline void ConcurrentArrayCache::handle_ec_batch_write_complete(uint64_t wr_id,
                                                                 bool success) {
     if (::FarLib::get_config().is_carbink_mode() &&
         carbink::WriteFenceTable::is_fence(wr_id)) {
-        if (!success) ERROR("carbink: parity WRITE fence failed");
+        if (!success && !::FarLib::get_config().ft_background_rebuild)
+            ERROR("carbink: parity WRITE fence failed");
         const auto *fence = carbink_write_fences_->consume(wr_id);
         if (!fence) return; // duplicate/stale fence
         for (size_t i = 0; i < fence->count; ++i)
-            handle_ec_batch_write_complete(fence->ids[i], true);
+            handle_ec_batch_write_complete(fence->ids[i], success);
         if (!carbink_write_fences_->release(wr_id))
             ERROR("carbink: WRITE fence lifetime mismatch");
         return;
@@ -830,7 +833,8 @@ inline void ConcurrentArrayCache::handle_ec_batch_write_complete(uint64_t wr_id,
     const uint8_t segment = ec_batch::ec_batch_wr_id_segment(wr_id);
     ec_diag_complete_cqes_.fetch_add(1, std::memory_order_relaxed);
     const bool private_page = hydra::WriteRing::is_token(token_id);
-    if (::FarLib::get_config().is_carbink_mode() && private_page && !success)
+    if (::FarLib::get_config().is_carbink_mode() && private_page && !success &&
+        !::FarLib::get_config().ft_background_rebuild)
         ERROR("carbink: owner WRITE failed; no degraded publication");
     const ec_batch::EcGroupSendRecord *record_ptr = nullptr;
     unsigned completed_ok = 0;
@@ -892,7 +896,7 @@ inline void ConcurrentArrayCache::handle_ec_batch_write_complete(uint64_t wr_id,
     }
     ec_diag_complete_last_.fetch_add(1, std::memory_order_relaxed);
     if (::FarLib::get_config().is_carbink_mode()) {
-        if (failed != 0)
+        if (failed != 0 && !::FarLib::get_config().ft_background_rebuild)
             ERROR("carbink: failed full-stripe WRITE; degraded compaction is not supported");
         // Register while every local payload still owns its WRITE reference.
         // seal_slot_group alone is not a remote-durability boundary.
@@ -903,6 +907,11 @@ inline void ConcurrentArrayCache::handle_ec_batch_write_complete(uint64_t wr_id,
             complete_evict_writeback(const_cast<void *>(record.objects[i]));
         }
     }
+    // Fixed Hydra parity is part of the completion position itself: releasing
+    if (::FarLib::get_config().ft_background_rebuild &&
+        !remote_allocator.small_object_stripe_manager()
+             .finish_background_write(record.group.id))
+        ERROR("background rebuild: lost full-stripe write reservation");
     // Fixed Hydra parity is part of the completion position itself: releasing
     // that position below makes both reusable together. Other paths retain
     // their existing temporary-buffer ownership contract.
@@ -976,7 +985,9 @@ inline bool ConcurrentArrayCache::stage_ec_batch_object(void *local_addr,
                                                         size_t size,
                                                         FarObjectEntry *entry,
                                                         uint32_t behavior_group,
-                                                        size_t hydra_owner_id) {
+                                                        size_t hydra_owner_id,
+                                                        bool *snapshot_canceled) {
+    if (snapshot_canceled) *snapshot_canceled = false;
     ec_diag_stage_called_.fetch_add(1, std::memory_order_relaxed);
     if (entry == nullptr || local_addr == nullptr) return false;
     if (entry->is_recomputable()) {
@@ -984,7 +995,8 @@ inline bool ConcurrentArrayCache::stage_ec_batch_object(void *local_addr,
     }
     if (::FarLib::get_config().is_carbink_mode() &&
         size == hydra::kPageBytes && entry->hydra_page())
-        return stage_carbink_span(local_addr, entry, hydra_owner_id);
+        return stage_carbink_span(local_addr, entry, hydra_owner_id,
+                                  snapshot_canceled);
     if (::FarLib::get_config().is_ec_batch_mode() &&
         ec_batch_uses_split(size)) {
         return stage_ec_split_object(local_addr, size, entry, hydra_owner_id);

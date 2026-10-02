@@ -462,6 +462,11 @@ struct Configure {
                          "eager eviction, a standby, and bandwidth in 1..1000000 MB/s");
         }
         if (ft_background_rebuild) {
+            if (ft_background_rebuild_failures < 1 || ft_background_rebuild_failures > 2)
+                config_error("ft_background_rebuild_failures must be 1 or 2");
+            if (ft_background_rebuild_failures == 2 &&
+                (server_count < 8 || server_count > 64))
+                config_error("dual background rebuild requires 8..64 endpoints (at least six survivors)");
             const char *pool = std::getenv("FARLIB_SEPARATE_BACKGROUND_CLUSTER");
             if (!pool || std::string(pool) != "1")
                 config_error("ft_background_rebuild requires FARLIB_SEPARATE_BACKGROUND_CLUSTER=1");

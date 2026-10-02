@@ -1,7 +1,10 @@
 #pragma once
+#include <array>
 #include <chrono>
 #include <map>
 #include "cache/carbink/entry_guard.hpp"
+#include "cache/carbink/shadow_io.hpp"
+#include "cache/carbink/shadow_io.ipp"
 #include "cache/carbink/settings.hpp"
 
 namespace FarLib::cache {
@@ -73,6 +76,18 @@ inline void ConcurrentArrayCache::carbink_stop_workers() {
     std::cout << "carbink.compaction_work task_drained=" << wt
               << " reclaim_stripes=" << wr << " moved_spans=" << wm
               << " rollback_spans=" << wb << '\n';
+    if (::FarLib::get_config().ft_background_rebuild) {
+        uint64_t durable = 0, quarantined = 0, after_failure = 0;
+        for (size_t i = 0; i < carbink_worker_count_; ++i) {
+            durable += carbink_counters_[i].shadow_durable;
+            quarantined += carbink_counters_[i].shadow_quarantined;
+            after_failure += carbink_counters_[i].shadow_moved_after_failure;
+        }
+        std::cout << (std::string("carbink.shadow_compaction durable_groups=") +
+            std::to_string(durable) + " quarantined_groups=" +
+            std::to_string(quarantined) + " moved_spans_after_failure=" +
+            std::to_string(after_failure) + "\n");
+    }
     const auto &transport = rdma::get_client(
         ::FarLib::get_config().compaction_client_base())->carbink_transport();
     std::cout << "carbink.transport data_req_explicit="
@@ -83,6 +98,7 @@ inline void ConcurrentArrayCache::carbink_stop_workers() {
 
 inline void ConcurrentArrayCache::carbink_scan_work() {
     auto &m=remote_allocator.small_object_stripe_manager();
+    const auto &config = ::FarLib::get_config();
     size_t stripe=0, slot=0, dispatch=0;
     // Diagnostic only: retain the same worker/client topology while isolating
     // full-stripe eviction from remote compaction traffic.
@@ -100,7 +116,21 @@ inline void ConcurrentArrayCache::carbink_scan_work() {
         for (const auto &v:snapshot) {
             if (!v.live_mask || v.live_mask>=15) continue;
             Layout l{};
-            for (size_t i=0;i<6;++i) l[i]=v.group.segments[i].endpoint_idx;
+            bool healthy = true;
+            if (!config.ft_background_rebuild) {
+                for (size_t i=0;i<6;++i)
+                    l[i] = v.group.segments[i].endpoint_idx;
+            } else {
+                for (size_t i=0;i<6;++i) {
+                    const auto physical = m.resolve_rebuilt_addr(
+                        v.group.id.stripe_id, static_cast<uint8_t>(i),
+                        v.group.segments[i].addr);
+                    l[i] = static_cast<uint32_t>(
+                        config.map_remote_addr(physical).first);
+                    if (!m.endpoint_is_alive(l[i])) healthy = false;
+                }
+            }
+            if (!healthy) continue;
             buckets[l][v.live_mask].push_back(v);
         }
         for (auto &[layout, masks]:buckets) {
@@ -123,6 +153,10 @@ inline void ConcurrentArrayCache::carbink_scan_work() {
     }
 }
 inline void ConcurrentArrayCache::carbink_compact_work(size_t worker_id) {
+    if (::FarLib::get_config().ft_background_rebuild) {
+        carbink_compact_work_shadow(worker_id);
+        return;
+    }
     using Status=rdma::compact::CompactSubmitStatus;
     using Descriptor=rdma::compact::CompactMoveDescriptor;
     const auto &config=::FarLib::get_config();
@@ -295,5 +329,337 @@ inline void ConcurrentArrayCache::carbink_compact_work(size_t worker_id) {
     std::lock_guard<std::mutex> lock(q.mutex);
     carbink_queue_depth_.fetch_sub(q.tasks.size(),std::memory_order_relaxed);
     q.tasks.clear();
+}
+
+// Failure-safe shadow compaction. The existing path above intentionally
+// remains byte-for-byte the default path. In the opt-in path, all remote
+// writes land in a fresh zeroed target group and source groups are immutable
+// until every request reaches a terminal local state.
+inline void ConcurrentArrayCache::carbink_compact_work_shadow(
+    size_t worker_id) {
+    using Manager = SmallObjectStripeManager;
+    using View = Manager::CompactionGroupView;
+    using Status = rdma::compact::CompactSubmitStatus;
+    using Descriptor = rdma::compact::CompactMoveDescriptor;
+    const auto &config = ::FarLib::get_config();
+    const size_t client_idx = config.compaction_client_base() + worker_id;
+    auto *client = rdma::get_client(client_idx);
+    if (client == nullptr) ERROR("carbink: missing shadow compaction client");
+    const size_t qp_idx = client->get_qp_idx();
+    auto &transport = client->carbink_transport();
+    transport.enable_failure_recovery(true);
+    auto &manager = remote_allocator.small_object_stripe_manager();
+    auto &queue = carbink_queues_[worker_id];
+    auto &stats = carbink_counters_[worker_id];
+
+    struct Source {
+        const View *view = nullptr;
+        uint8_t slot = 0;
+        uint64_t physical = 0;
+        uint32_t endpoint = 0;
+    };
+    struct Update {
+        Descriptor descriptor{};
+        bool submitted = false;
+        bool terminal = false;
+        bool failed = false;
+    };
+
+    auto effective_layout = [&](const View &view,
+                                std::array<uint32_t,6> *layout) {
+        bool healthy = true;
+        for (size_t s = 0; s < 6; ++s) {
+            const uint64_t physical = manager.resolve_rebuilt_addr(
+                view.group.id.stripe_id, static_cast<uint8_t>(s),
+                view.group.segments[s].addr);
+            const auto endpoint = static_cast<uint32_t>(
+                config.map_remote_addr(physical).first);
+            (*layout)[s] = endpoint;
+            if (!manager.endpoint_is_alive(endpoint)) healthy = false;
+        }
+        return healthy;
+    };
+
+    auto release_sources = [&](View &src, View &dst,
+                               std::array<carbink::EntryGuard,4> &src_guard,
+                               std::array<carbink::EntryGuard,4> &dst_guard) {
+        for (auto &guard : src_guard) guard.release();
+        for (auto &guard : dst_guard) guard.release();
+        if (!manager.release_compaction_group_claim(src.id) ||
+            !manager.release_compaction_group_claim(dst.id))
+            ERROR("carbink: shadow source claim release failed");
+    };
+
+    auto zero_shadow = [&](const View &shadow) {
+        carbink::shadow::IoBatch io;
+        std::array<bool, carbink::shadow::kShadowZeroSlots> posted{};
+        bool fault = false;
+        for (size_t s = 0; s < 6 && !fault; ++s) {
+            const auto mapped = config.map_remote_addr(
+                manager.resolve_rebuilt_addr(shadow.id.stripe_id,
+                    static_cast<uint8_t>(s), shadow.group.segments[s].addr));
+            for (;;) {
+                const auto result = io.post_zero(
+                    *client, qp_idx, mapped.first, mapped.second,
+                    carbink_zero_page_.base, carbink_zero_page_.lkey,
+                    static_cast<uint32_t>(hydra::kPageBytes), s);
+                if (result == carbink::shadow::PostResult::kAccepted) {
+                    posted[s] = true;
+                    break;
+                }
+                if (result == carbink::shadow::PostResult::kFailed) {
+                    fault = true;
+                    break;
+                }
+                (void)check_cq_idx_with_client_idx(qp_idx, client_idx);
+                uthread::yield();
+            }
+        }
+        auto terminal = [&] {
+            for (size_t s = 0; s < 6; ++s)
+                if (posted[s] && io.status(s) == 0) return false;
+            return true;
+        };
+        while (!terminal()) {
+            (void)check_cq_idx_with_client_idx(qp_idx, client_idx);
+            uthread::yield();
+        }
+        for (size_t s = 0; s < 6; ++s)
+            if (posted[s] && io.status(s) != 1) fault = true;
+        return !fault;
+    };
+
+    auto run_task = [&](CarbinkTask queued) {
+        View src_claimed{}, dst_claimed{};
+        if (!manager.try_claim_compaction_group(queued.dst, &dst_claimed))
+            return;
+        if (!manager.try_claim_compaction_group(queued.src, &src_claimed)) {
+            manager.release_compaction_group_claim(dst_claimed.id);
+            return;
+        }
+        if ((src_claimed.live_mask ^ dst_claimed.live_mask) != 0xfu ||
+            (src_claimed.live_mask & dst_claimed.live_mask) != 0) {
+            manager.release_compaction_group_claim(src_claimed.id);
+            manager.release_compaction_group_claim(dst_claimed.id);
+            return;
+        }
+        std::array<uint32_t,6> layout{};
+        std::array<uint32_t,6> dst_layout{};
+        if (!effective_layout(src_claimed, &layout) ||
+            !effective_layout(dst_claimed, &dst_layout) ||
+            layout != dst_layout) {
+            manager.release_compaction_group_claim(src_claimed.id);
+            manager.release_compaction_group_claim(dst_claimed.id);
+            return;  // background shard publication has not caught up yet
+        }
+
+        std::array<Source,4> sources{};
+        std::array<carbink::EntryGuard,4> src_guard, dst_guard;
+        bool guards_ok = true;
+        for (uint8_t s = 0; s < 4; ++s) {
+            const bool from_src = (src_claimed.live_mask & (1u << s)) != 0;
+            const View &owner_view = from_src ? src_claimed : dst_claimed;
+            auto &guard = from_src ? src_guard[s] : dst_guard[s];
+            if (owner_view.owners[s] == 0 ||
+                !guard.acquire(reinterpret_cast<FarObjectEntry *>(
+                                   owner_view.owners[s]),
+                               owner_view.group.segments[s].addr)) {
+                guards_ok = false;
+                break;
+            }
+            const uint64_t physical = manager.resolve_rebuilt_addr(
+                owner_view.group.id.stripe_id, s,
+                owner_view.group.segments[s].addr);
+            const auto mapped = config.map_remote_addr(physical);
+            sources[s] = {&owner_view, s, physical,
+                          static_cast<uint32_t>(mapped.first)};
+        }
+        if (!guards_ok) {
+            release_sources(src_claimed, dst_claimed, src_guard, dst_guard);
+            return;
+        }
+
+        View shadow{};
+        if (!manager.allocate_compaction_shadow(layout, &shadow)) {
+            release_sources(src_claimed, dst_claimed, src_guard, dst_guard);
+            return;
+        }
+        bool fault = false;
+        bool setup_failed = false;
+        if (!zero_shadow(shadow)) fault = true;
+        std::array<Update,4> updates{};
+        if (!fault && !setup_failed) {
+            for (uint8_t s = 0; s < 4; ++s) {
+                auto &update = updates[s];
+                auto &d = update.descriptor;
+                const auto src = config.map_remote_addr(sources[s].physical);
+                const auto dst = config.map_remote_addr(
+                    manager.resolve_rebuilt_addr(shadow.id.stripe_id, s,
+                        shadow.group.segments[s].addr));
+                const auto p0 = config.map_remote_addr(
+                    manager.resolve_rebuilt_addr(shadow.id.stripe_id, 4,
+                        shadow.group.segments[4].addr));
+                const auto p1 = config.map_remote_addr(
+                    manager.resolve_rebuilt_addr(shadow.id.stripe_id, 5,
+                        shadow.group.segments[5].addr));
+                if (src.first != dst.first ||
+                    !manager.endpoint_is_alive(dst.first) ||
+                    !manager.endpoint_is_alive(p0.first) ||
+                    !manager.endpoint_is_alive(p1.first)) {
+                    if (!manager.endpoint_is_alive(dst.first) ||
+                        !manager.endpoint_is_alive(p0.first) ||
+                        !manager.endpoint_is_alive(p1.first))
+                        fault = true;
+                    else
+                        setup_failed = true;
+                    break;
+                }
+                d.wr_id = carbink::shadow::IoBatch::next_rpc_wr_id();
+                d.src_offset = src.second;
+                d.dst_offset = dst.second;
+                d.endpoint_idx = dst.first;
+                d.qp_idx = client->carbink_qp_index(0);
+                d.parity_endpoint0 = p0.first;
+                d.parity_endpoint1 = p1.first;
+                d.parity0_offset = p0.second;
+                d.parity1_offset = p1.second;
+                d.data_slot = s;
+                d.ack_data_qp_idx =
+                    static_cast<uint16_t>(d.qp_idx);
+                d.init_from_zero = true;
+            }
+        }
+        for (size_t s = 0; s < 4 && !fault && !setup_failed; ++s) {
+            auto &update = updates[s];
+            for (;;) {
+                const Status status =
+                    transport.submit(update.descriptor);
+                if (status == Status::Accepted) {
+                    update.submitted = true;
+                    break;
+                }
+                if (status == Status::NeedFlush) {
+                    (void)transport.flush(update.descriptor.endpoint_idx,
+                                           update.descriptor.qp_idx);
+                    continue;
+                }
+                if (status == Status::Backpressure) {
+                    (void)check_cq_idx_with_client_idx(qp_idx, client_idx);
+                    uthread::yield();
+                    continue;
+                }
+                fault = status == Status::EndpointDead;
+                setup_failed = !fault;
+                break;
+            }
+        }
+        (void)transport.flush_qp(client->carbink_qp_index(0));
+        auto updates_terminal = [&] {
+            for (auto &update : updates) {
+                if (!update.submitted || update.terminal) continue;
+                uint32_t status = 0;
+                const bool failed =
+                    transport.request_failed(update.descriptor.wr_id, &status);
+                if (!transport.send_complete(update.descriptor.wr_id) ||
+                    !transport.final_ack_done(update.descriptor.wr_id,
+                                              &status))
+                    continue;
+                update.failed = failed || status !=
+                    rdma::compact::kCompactRpcStatusOk;
+                update.terminal = true;
+                if (update.failed) fault = true;
+                (void)transport.erase(update.descriptor.wr_id);
+            }
+            for (auto &update : updates)
+                if (update.submitted && !update.terminal) return false;
+            return true;
+        };
+        while (!updates_terminal()) {
+            (void)check_cq_idx_with_client_idx(qp_idx, client_idx);
+            uthread::yield();
+        }
+
+        if (fault) {
+            if (!manager.quarantine_compaction_shadow(shadow))
+                ERROR("carbink: shadow fault quarantine failed");
+            ++stats.shadow_quarantined;
+            release_sources(src_claimed, dst_claimed, src_guard, dst_guard);
+            return;
+        }
+        if (setup_failed) {
+            // No remote fault was observed, so this unpublished target can
+            // use the normal sealed/dead cleanup transition.
+            if (!manager.mark_compaction_shadow_durable(shadow))
+                ERROR("carbink: shadow setup seal failed");
+            if (!manager.finish_background_write(shadow.id))
+                ERROR("carbink: shadow setup cleanup lost reservation");
+            if (!manager.release_compaction_group_claim(shadow.id))
+                ERROR("carbink: shadow setup cleanup lost claim");
+            release_sources(src_claimed, dst_claimed, src_guard, dst_guard);
+            return;
+        }
+        if (!manager.mark_compaction_shadow_durable(shadow)) {
+            // All four RPCs are terminal-success, but metadata validation
+            // failed.  Do not expose or recycle an unvalidated target.
+            if (!manager.quarantine_compaction_shadow(shadow))
+                ERROR("carbink: shadow seal/quarantine failed");
+            ++stats.shadow_quarantined;
+            release_sources(src_claimed, dst_claimed, src_guard, dst_guard);
+            return;
+        }
+        ++stats.shadow_durable;
+        for (uint8_t s = 0; s < 4; ++s) {
+            auto &guard = (src_claimed.live_mask & (1u << s))
+                              ? src_guard[s] : dst_guard[s];
+            if (!guard.try_lock_publish()) continue;  // foreground won
+            const View &source_view =
+                (src_claimed.live_mask & (1u << s))
+                    ? src_claimed : dst_claimed;
+            if (!manager.compaction_transfer_slot(
+                    source_view, shadow, s,
+                    reinterpret_cast<uintptr_t>(guard.entry()))) {
+                guard.cancel_publish();
+                continue;
+            }
+            guard.publish_locked(shadow.group.segments[s].addr);
+            stats.moved.add();
+            if (ec_recovery_dead_endpoints_.load(std::memory_order_acquire))
+                ++stats.shadow_moved_after_failure;
+        }
+        if (!manager.finish_background_write(shadow.id))
+            ERROR("carbink: shadow write reservation lost");
+        if (!manager.release_compaction_group_claim(shadow.id))
+            ERROR("carbink: shadow claim release failed");
+        release_sources(src_claimed, dst_claimed, src_guard, dst_guard);
+    };
+
+    while (carbink_running_.load(std::memory_order_acquire)) {
+        CarbinkTask queued;
+        bool empty = false;
+        {
+            std::lock_guard<std::mutex> lock(queue.mutex);
+            if (queue.tasks.empty()) {
+                empty = true;
+            } else {
+                queued = queue.tasks.front();
+                queue.tasks.pop_front();
+                carbink_queue_depth_.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
+        if (empty) {
+            uthread::yield();
+            continue;
+        }
+        run_task(std::move(queued));
+        stats.drained.add();
+        // A failed target allocation does no I/O and otherwise drains an
+        // arbitrarily long queue without a scheduling point. Let repair
+        // fibres publish reusable stripes before retrying more tasks.
+        uthread::yield();
+    }
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    carbink_queue_depth_.fetch_sub(queue.tasks.size(),
+                                   std::memory_order_relaxed);
+    queue.tasks.clear();
 }
 } // namespace FarLib::cache

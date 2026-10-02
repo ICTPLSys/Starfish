@@ -25,6 +25,10 @@ constexpr uint16_t kCompactRpcParityPayloadBatch = 2;
 constexpr uint16_t kCompactRpcAck = 4;
 constexpr uint16_t kCompactRpcAckBatch = 5;
 constexpr uint16_t kCompactRpcStatusOk = 0;
+// Nonzero status used when a compact request is abandoned because one of the
+// participating endpoints failed.  It is deliberately distinct from the
+// legacy success status and is carried in the existing ACK wire field.
+constexpr uint16_t kCompactRpcStatusPeerDead = 1;
 constexpr uint16_t kCompactRpcFlagInitFromZero = 1u << 0;
 constexpr uint16_t kCompactRpcDataReqBatchMaxSpans = 8;
 constexpr uint32_t kCompactRpcPayloadBytes = 8192;
@@ -207,12 +211,17 @@ struct CompactRequestHandle {
     uint64_t lane = 0;
 };
 enum class CompactSubmitStatus : uint8_t {
-    Accepted = 0, NeedFlush = 1, Backpressure = 2, Invalid = 3
+    Accepted = 0, NeedFlush = 1, Backpressure = 2, Invalid = 3,
+    EndpointDead = 4
 };
 struct CompactTransportEndpoint {
     QueuePair *qp = nullptr;
     CompleteQueue *cq = nullptr;
 };
+
+#ifdef FARLIB_CARBINK_COMPACT_TRANSPORT_TEST
+struct CompactReqBatchTransportTest;
+#endif
 
 class CompactReqBatchTransport {
     static constexpr uint32_t kSendMagic = 0xEC2CC101u;
@@ -246,7 +255,12 @@ class CompactReqBatchTransport {
     struct RequestState {
         bool send_done = false;
         bool ack_done = false;
+        bool failed = false;
         uint32_t ack_status = std::numeric_limits<uint32_t>::max();
+        size_t target_endpoint = 0;
+        size_t parity_endpoint0 = 0;
+        size_t parity_endpoint1 = 0;
+        uint64_t creation_epoch = 0;
     };
     std::vector<CompactTransportEndpoint> endpoints_;
     size_t qps_per_endpoint_ = 0;
@@ -259,6 +273,9 @@ class CompactReqBatchTransport {
     ibv_mr *ack_mr_ = nullptr;
     ibv_mr *zero_mr_ = nullptr;
     bool recv_posts_ready_ = false;
+    std::unique_ptr<std::atomic<uint8_t>[]> endpoint_state_;
+    std::atomic<bool> failure_recovery_enabled_{false};
+    std::atomic<uint64_t> failure_epoch_{0};
     std::array<uint8_t, kCompactRpcPayloadBytes> zero_page_{};
     uint32_t payload_lkey_ = 0;
     std::atomic<uint64_t> explicit_data_requests_{0};
@@ -270,6 +287,9 @@ class CompactReqBatchTransport {
         std::unordered_map<uint64_t, RequestState> states;
     };
     std::array<StateShard, kStateShardCount> state_shards_{};
+#ifdef FARLIB_CARBINK_COMPACT_TRANSPORT_TEST
+    friend struct CompactReqBatchTransportTest;
+#endif
     StateShard &state_shard(uint64_t wr_id) {
         return state_shards_[compact_transport_state_shard_index(wr_id)];
     }
@@ -285,6 +305,103 @@ class CompactReqBatchTransport {
                endpoints_[lane].qp != nullptr &&
                endpoints_[lane].cq != nullptr &&
                endpoints_[lane].qp->queue_pair != nullptr;
+    }
+    size_t endpoint_count() const {
+        return qps_per_endpoint_ == 0 ? 0 :
+            endpoints_.size() / qps_per_endpoint_;
+    }
+    size_t endpoint_for_lane(size_t lane) const {
+        return qps_per_endpoint_ == 0 ? endpoint_count() :
+            lane / qps_per_endpoint_;
+    }
+    bool endpoint_alive_internal(size_t endpoint) const {
+        if (!failure_recovery_enabled_.load(std::memory_order_acquire))
+            return true;
+        if (endpoint >= endpoint_count() || endpoint_state_ == nullptr)
+            return true;
+        return endpoint_state_[endpoint].load(std::memory_order_acquire) == 0;
+    }
+    static void mark_request_failed(
+        RequestState &state, uint32_t status, bool send_done) {
+        state.failed = true;
+        state.ack_done = true;
+        state.ack_status = status;
+        if (send_done) state.send_done = true;
+    }
+    void mark_slot_failed_locked(
+        SendSlot &slot, uint32_t status, bool send_done,
+        uint64_t failure_epoch = std::numeric_limits<uint64_t>::max()) {
+        const size_t count = std::min<size_t>(
+            slot.message.span_count, kCompactRpcDataReqBatchMaxSpans);
+        for (size_t i = 0; i < count; ++i) {
+            StateShard &shard = state_shard(slot.message.wr_ids[i]);
+            std::lock_guard<std::mutex> state_lock(shard.mutex);
+            auto it = shard.states.find(slot.message.wr_ids[i]);
+            if (it != shard.states.end() &&
+                (failure_epoch == std::numeric_limits<uint64_t>::max() ||
+                 it->second.creation_epoch < failure_epoch))
+                mark_request_failed(it->second, status, send_done);
+        }
+    }
+    bool lane_has_request_before_epoch(
+        const SendSlot &slot, uint64_t failure_epoch) {
+        const size_t count = std::min<size_t>(
+            slot.message.span_count, kCompactRpcDataReqBatchMaxSpans);
+        for (size_t i = 0; i < count; ++i) {
+            const StateShard &shard = state_shard(slot.message.wr_ids[i]);
+            std::lock_guard<std::mutex> state_lock(shard.mutex);
+            auto it = shard.states.find(slot.message.wr_ids[i]);
+            if (it != shard.states.end() &&
+                it->second.creation_epoch < failure_epoch)
+                return true;
+        }
+        return false;
+    }
+    void fail_unposted_lane(
+        size_t lane, uint32_t status,
+        uint64_t failure_epoch = std::numeric_limits<uint64_t>::max()) {
+        if (lanes_ == nullptr || lane >= endpoints_.size()) return;
+        Lane &lane_state = lanes_[lane];
+        std::lock_guard<std::mutex> lane_lock(lane_state.mutex);
+        if (lane_state.active < 0) return;
+        SendSlot &slot =
+            send_slots_[lane * send_depth_ + lane_state.active];
+        if (failure_epoch != std::numeric_limits<uint64_t>::max() &&
+            !lane_has_request_before_epoch(slot, failure_epoch))
+            return;
+        // The transport slot is indivisible.  If it contains any request
+        // predating the barrier, retire every request batched in that slot;
+        // otherwise a post-barrier request would be left without a SEND CQE.
+        mark_slot_failed_locked(slot, status, true);
+        slot.in_use = false;
+        slot.message = CompactReqBatchMessage{};
+        for (auto &p : slot.payload) p = nullptr;
+        for (auto &k : slot.payload_lkeys) k = 0;
+        lane_state.active = -1;
+        lane_state.free_slots.push_back(slot.slot);
+    }
+    void mark_requests_failed_for_endpoint(
+        size_t endpoint, uint32_t status) {
+        for (StateShard &shard : state_shards_) {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            for (auto &entry : shard.states) {
+                RequestState &state = entry.second;
+                if (state.target_endpoint == endpoint ||
+                    state.parity_endpoint0 == endpoint ||
+                    state.parity_endpoint1 == endpoint)
+                    mark_request_failed(state, status, false);
+            }
+        }
+    }
+    void mark_all_requests_failed_before(
+        uint64_t failure_epoch, uint32_t status) {
+        for (StateShard &shard : state_shards_) {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            for (auto &entry : shard.states) {
+                if (entry.second.creation_epoch < failure_epoch)
+                    mark_request_failed(entry.second, status, false);
+            }
+        }
     }
     bool is_send_slot(uint64_t id) const {
         const uintptr_t value = static_cast<uintptr_t>(id);
@@ -303,7 +420,9 @@ class CompactReqBatchTransport {
                ((value - begin) % sizeof(AckSlot) == 0);
     }
     bool post_ack_recv(AckSlot &slot) {
-        if (!valid_lane(slot.lane) || ack_mr_ == nullptr) return false;
+        if (!valid_lane(slot.lane) || ack_mr_ == nullptr ||
+            !endpoint_alive_internal(endpoint_for_lane(slot.lane)))
+            return false;
         ibv_sge sge{reinterpret_cast<uint64_t>(&slot.message),
                     static_cast<uint32_t>(sizeof(slot.message)), ack_mr_->lkey};
         ibv_recv_wr wr{};
@@ -325,9 +444,17 @@ class CompactReqBatchTransport {
             d.endpoint_idx * qps_per_endpoint_ + d.qp_idx >=
                 endpoints_.size())
             return CompactSubmitStatus::Invalid;
+        if (!endpoint_alive_internal(d.endpoint_idx) ||
+            !endpoint_alive_internal(d.parity_endpoint0) ||
+            !endpoint_alive_internal(d.parity_endpoint1))
+            return CompactSubmitStatus::EndpointDead;
         const size_t lane = lane_for(d.endpoint_idx, d.qp_idx);
         Lane &lane_state = lanes_[lane];
         std::lock_guard<std::mutex> lane_lock(lane_state.mutex);
+        if (!endpoint_alive_internal(d.endpoint_idx) ||
+            !endpoint_alive_internal(d.parity_endpoint0) ||
+            !endpoint_alive_internal(d.parity_endpoint1))
+            return CompactSubmitStatus::EndpointDead;
         if (lane_state.active < 0) {
             if (lane_state.free_slots.empty())
                 return CompactSubmitStatus::Backpressure;
@@ -356,7 +483,13 @@ class CompactReqBatchTransport {
             std::lock_guard<std::mutex> state_lock(shard.mutex);
             if (shard.states.find(d.wr_id) != shard.states.end())
                 return CompactSubmitStatus::Invalid;
-            shard.states.emplace(d.wr_id, RequestState{});
+            RequestState state{};
+            state.target_endpoint = d.endpoint_idx;
+            state.parity_endpoint0 = d.parity_endpoint0;
+            state.parity_endpoint1 = d.parity_endpoint1;
+            state.creation_epoch =
+                failure_epoch_.load(std::memory_order_acquire);
+            shard.states.emplace(d.wr_id, state);
         }
         const size_t i = slot.message.span_count++;
         slot.message.wr_ids[i] = d.wr_id;
@@ -404,8 +537,9 @@ class CompactReqBatchTransport {
         constexpr size_t header_bytes = offsetof(CompactAckBatchMessage, payload);
         const uint32_t payload_bytes = slot.message.payload_len;
         if (payload_bytes > kCompactRpcPayloadBytes ||
-            received_bytes != header_bytes + payload_bytes)
+            received_bytes != header_bytes + payload_bytes) {
             ERROR("Carbink compact ACK receive length is invalid");
+        }
 
         uint64_t single_id = 0;
         const uint64_t *ids = nullptr;
@@ -437,14 +571,46 @@ class CompactReqBatchTransport {
             StateShard &shard = state_shard(ids[i]);
             std::lock_guard<std::mutex> lock(shard.mutex);
             auto it = shard.states.find(ids[i]);
-            if (it != shard.states.end()) {
+            if (it != shard.states.end() && !it->second.failed) {
                 it->second.ack_done = true;
                 it->second.ack_status = slot.message.status;
+                if (slot.message.status != kCompactRpcStatusOk)
+                    it->second.failed = true;
             }
         }
     }
 
 public:
+#ifdef FARLIB_CARBINK_COMPACT_TRANSPORT_TEST
+    // Verbs-free constructor used only by the CPU recovery-state test.  It
+    // intentionally leaves MRs/QPs absent; the friend test hook exercises
+    // request/epoch/CQE bookkeeping without claiming verbs coverage.
+    explicit CompactReqBatchTransport(
+        size_t test_endpoint_count, size_t test_send_depth = 2)
+        : endpoints_(test_endpoint_count),
+          qps_per_endpoint_(1),
+          send_depth_(std::max<size_t>(1, test_send_depth)),
+          ack_depth_(1) {
+        endpoint_state_ = std::make_unique<std::atomic<uint8_t>[]>(
+            endpoint_count());
+        send_slots_.resize(endpoints_.size() * send_depth_);
+        ack_slots_.resize(endpoints_.size() * ack_depth_);
+        lanes_ = std::make_unique<Lane[]>(endpoints_.size());
+        for (size_t lane = 0; lane < endpoints_.size(); ++lane) {
+            for (size_t i = 0; i < send_depth_; ++i) {
+                SendSlot &slot = send_slots_[lane * send_depth_ + i];
+                slot.lane = static_cast<uint16_t>(lane);
+                slot.slot = static_cast<uint16_t>(i);
+                lanes_[lane].free_slots.push_back(
+                    static_cast<uint16_t>(send_depth_ - i - 1));
+            }
+            AckSlot &slot = ack_slots_[lane];
+            slot.lane = static_cast<uint16_t>(lane);
+            slot.slot = 0;
+            endpoint_state_[lane].store(0, std::memory_order_relaxed);
+        }
+    }
+#endif
     CompactReqBatchTransport(
         ibv_pd *pd, std::vector<CompactTransportEndpoint> endpoints,
         size_t qps_per_endpoint, uint32_t payload_lkey = 0,
@@ -457,6 +623,10 @@ public:
         if (pd == nullptr || qps_per_endpoint_ == 0 ||
             endpoints_.empty())
             return;
+        endpoint_state_ = std::make_unique<std::atomic<uint8_t>[]>(
+            endpoint_count());
+        for (size_t ep = 0; ep < endpoint_count(); ++ep)
+            endpoint_state_[ep].store(0, std::memory_order_relaxed);
         zero_page_.fill(0);
         send_slots_.resize(endpoints_.size() * send_depth_);
         ack_slots_.resize(endpoints_.size() * ack_depth_);
@@ -501,6 +671,64 @@ public:
         if (send_mr_ != nullptr) ibv_dereg_mr(send_mr_);
         if (ack_mr_ != nullptr) ibv_dereg_mr(ack_mr_);
     }
+    void enable_failure_recovery(bool enabled) {
+        failure_recovery_enabled_.store(enabled, std::memory_order_release);
+    }
+    bool failure_recovery_enabled() const {
+        return failure_recovery_enabled_.load(std::memory_order_acquire);
+    }
+    bool endpoint_is_alive(size_t endpoint) const {
+        return endpoint_alive_internal(endpoint);
+    }
+    // Expose the endpoint encoded by a transport-owned CQE so the outer
+    // client/router can notify cache recovery before it consumes the WC.
+    size_t endpoint_for_completion(uint64_t wr_id) const {
+        if (is_send_slot(wr_id)) {
+            const auto *slot = reinterpret_cast<const SendSlot *>(wr_id);
+            return endpoint_for_lane(slot->lane);
+        }
+        if (is_ack_slot(wr_id)) {
+            const auto *slot = reinterpret_cast<const AckSlot *>(wr_id);
+            return endpoint_for_lane(slot->lane);
+        }
+        return std::numeric_limits<size_t>::max();
+    }
+    bool mark_endpoint_failed(
+        size_t endpoint, uint32_t status = kCompactRpcStatusPeerDead) {
+        if (!failure_recovery_enabled() || endpoint >= endpoint_count() ||
+            endpoint_state_ == nullptr)
+            return false;
+        uint8_t expected = 0;
+        if (!endpoint_state_[endpoint].compare_exchange_strong(
+                expected, 1, std::memory_order_acq_rel))
+            return false;
+        uint64_t expected_epoch = 0;
+        if (failure_epoch_.compare_exchange_strong(
+                expected_epoch, 1, std::memory_order_acq_rel)) {
+            for (size_t lane = 0; lane < endpoints_.size(); ++lane)
+                fail_unposted_lane(lane, status, 1);
+            mark_all_requests_failed_before(1, status);
+        }
+        mark_requests_failed_for_endpoint(endpoint, status);
+        return true;
+    }
+    void fail_all_requests(
+        uint32_t status = kCompactRpcStatusPeerDead) {
+        if (!failure_recovery_enabled()) return;
+        uint64_t failure_epoch =
+            failure_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        for (size_t lane = 0; lane < endpoints_.size(); ++lane)
+            fail_unposted_lane(lane, status, failure_epoch);
+        mark_all_requests_failed_before(failure_epoch, status);
+    }
+    bool request_failed(uint64_t wr_id, uint32_t *status = nullptr) const {
+        const StateShard &shard = state_shard(wr_id);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.states.find(wr_id);
+        if (it == shard.states.end()) return false;
+        if (status != nullptr) *status = it->second.ack_status;
+        return it->second.failed;
+    }
     bool ready() const {
         return send_mr_ != nullptr && ack_mr_ != nullptr &&
                zero_mr_ != nullptr && lanes_ != nullptr && recv_posts_ready_;
@@ -531,9 +759,26 @@ public:
     bool flush(size_t endpoint_idx, size_t qp_idx) {
         const size_t lane = lane_for(endpoint_idx, qp_idx);
         if (!ready() || !valid_lane(lane)) return false;
+        if (!endpoint_alive_internal(endpoint_idx)) {
+            fail_unposted_lane(lane, kCompactRpcStatusPeerDead);
+            return true;
+        }
         Lane &lane_state = lanes_[lane];
-        std::lock_guard<std::mutex> lock(lane_state.mutex);
+        std::unique_lock<std::mutex> lock(lane_state.mutex);
         if (lane_state.active < 0) return true;
+        if (!endpoint_alive_internal(endpoint_idx)) {
+            SendSlot &dead_slot =
+                send_slots_[lane * send_depth_ + lane_state.active];
+            mark_slot_failed_locked(
+                dead_slot, kCompactRpcStatusPeerDead, true);
+            dead_slot.in_use = false;
+            dead_slot.message = CompactReqBatchMessage{};
+            for (auto &p : dead_slot.payload) p = nullptr;
+            for (auto &k : dead_slot.payload_lkeys) k = 0;
+            lane_state.active = -1;
+            lane_state.free_slots.push_back(dead_slot.slot);
+            return true;
+        }
         SendSlot &slot =
             send_slots_[lane * send_depth_ + lane_state.active];
         const size_t count = std::min<size_t>(
@@ -574,6 +819,23 @@ public:
             endpoints_[lane].qp->queue_pair, &wr, &bad);
         if (post_result == ENOMEM) return false;
         if (post_result != 0) {
+            if (failure_recovery_enabled()) {
+                mark_slot_failed_locked(
+                    slot, kCompactRpcStatusPeerDead, true);
+                slot.in_use = false;
+                slot.message = CompactReqBatchMessage{};
+                for (auto &p : slot.payload) p = nullptr;
+                for (auto &k : slot.payload_lkeys) k = 0;
+                lane_state.active = -1;
+                lane_state.free_slots.push_back(slot.slot);
+                lock.unlock();
+                if (endpoint_is_alive(endpoint_idx)) {
+                    std::cerr << "carbink: ibv_post_send error="
+                              << post_result << '\n';
+                    ERROR("Carbink compact SEND posting failed");
+                }
+                return true;
+            }
             std::cerr << "carbink: ibv_post_send error=" << post_result << '\n';
             ERROR("Carbink compact SEND posting failed");
         }
@@ -605,9 +867,26 @@ public:
     bool consume_completion(const ibv_wc &wc) {
         // An error WC need not retain a meaningful opcode. Ownership comes
         // from the registered slot range, not from SEND/RECV classification.
-        if (wc.status != IBV_WC_SUCCESS &&
-            (is_send_slot(wc.wr_id) || is_ack_slot(wc.wr_id)))
+        if (wc.status != IBV_WC_SUCCESS && is_send_slot(wc.wr_id)) {
+            auto *slot = reinterpret_cast<SendSlot *>(wc.wr_id);
+            if (failure_recovery_enabled()) {
+                mark_endpoint_failed(
+                    endpoint_for_lane(slot->lane), kCompactRpcStatusPeerDead);
+                complete_send(*slot);
+                return true;
+            }
             ERROR("Carbink transport completion failed");
+        }
+        if (wc.status != IBV_WC_SUCCESS && is_ack_slot(wc.wr_id)) {
+            auto *slot = reinterpret_cast<AckSlot *>(wc.wr_id);
+            if (failure_recovery_enabled()) {
+                mark_endpoint_failed(
+                    endpoint_for_lane(slot->lane), kCompactRpcStatusPeerDead);
+                slot->message = CompactAckBatchMessage{};
+                return true;
+            }
+            ERROR("Carbink transport completion failed");
+        }
         if (wc.opcode == IBV_WC_SEND && is_send_slot(wc.wr_id)) {
             if (wc.status != IBV_WC_SUCCESS)
                 ERROR("Carbink compact SEND completion failed");
@@ -621,8 +900,15 @@ public:
             auto *slot = reinterpret_cast<AckSlot *>(wc.wr_id);
             complete_ack(*slot, wc.byte_len);
             slot->message = CompactAckBatchMessage{};
-            if (!post_ack_recv(*slot))
-                ERROR("Carbink compact ACK receive repost failed");
+            const bool reposted = post_ack_recv(*slot);
+            if (!reposted) {
+                if (failure_recovery_enabled())
+                    mark_endpoint_failed(
+                        endpoint_for_lane(slot->lane),
+                        kCompactRpcStatusPeerDead);
+                else
+                    ERROR("Carbink compact ACK receive repost failed");
+            }
             return true;
         }
         return false;

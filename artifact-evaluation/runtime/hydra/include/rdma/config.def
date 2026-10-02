@@ -56,6 +56,12 @@ CONFIG(size_t, ft_ec_parity_shards, 2)
 // allocations until a live endpoint is reported dead.  -1 keeps the legacy
 // no-standby placement policy.
 CONFIG(int, ft_standby_endpoint, -1)
+CONFIG(int, ft_standby_endpoint2, -1)
+CONFIG(size_t, ft_background_rebuild_failures, 1)
+// Single-fault Hydra reconstruction; diagnostics/Figure13 opt-in only.
+CONFIG(bool, ft_background_rebuild, false)
+// Aggregate per direction, decimal MB/s across all repair fibres.
+CONFIG(size_t, ft_rebuild_bandwidth_mbps, 2500)
 
 // Configure of Server & Client
 CONFIG(uint16_t, qp_count, 1)

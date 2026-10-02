@@ -47,6 +47,7 @@
 #include "recovery/ec_read_recovery.hpp"
 #include "recovery/ec_read_context.hpp"
 #include "recovery/ec_recovery_scratch.hpp"
+#include "recovery/ec_background_rebuild.hpp"
 #include "cache/alloc/ec_split_buffers.hpp"
 #include "hydra/write_ring.hpp"
 #include "hydra/write_batch.hpp"
@@ -597,6 +598,18 @@ private:
     // cluster intentionally has process lifetime after all fibres are joined.
     uthread::Cluster *background_cluster_ = nullptr;
     std::unique_ptr<UThread> master_evacuation_thread;
+    std::array<std::unique_ptr<UThread>, ec_background::kWorkers> background_rebuild_threads_;
+    uthread::Mutex background_rebuild_mutex_;
+    uthread::Condition background_rebuild_cond_;
+    std::atomic<bool> background_rebuild_stop_{false};
+    std::atomic<int> background_rebuild_failed_endpoint_{-1};
+    std::atomic<uint64_t> background_rebuild_redirected_reads_{0};
+    ec_background::SharedState background_rebuild_state_;
+    void start_background_rebuild();
+    void stop_background_rebuild();
+    void background_rebuild_work();
+    void background_rebuild_work_dual();
+    bool handle_background_rebuild_complete(const ibv_wc &wc);
     size_t evacuate_thread_cnt;
     std::atomic_flag flag;
     std::atomic_bool stw_active{false};
@@ -4538,7 +4551,19 @@ private:
                 "ec_group_allocator", [this] {
                     return this->remote_memory_endpoint_bytes();
                 });
-        benchmark_memory_sampler_->start();
+        ::FarLib::profile::benchmark_memory_observer_context =
+            benchmark_memory_sampler_.get();
+        ::FarLib::profile::benchmark_memory_begin_observer =
+            &::FarLib::benchmark_memory::Sampler::begin_work_callback;
+        ::FarLib::profile::benchmark_memory_end_observer =
+            &::FarLib::benchmark_memory::Sampler::end_work_callback;
+        ::FarLib::benchmark_memory::explicit_work_origin_context =
+            benchmark_memory_sampler_.get();
+        ::FarLib::benchmark_memory::explicit_work_begin_observer =
+            &::FarLib::benchmark_memory::Sampler::begin_work_at_callback;
+        ::FarLib::benchmark_memory::explicit_work_end_observer =
+            &::FarLib::benchmark_memory::Sampler::end_work_at_callback;
+        benchmark_memory_sampler_->arm();
     }
 
 public:
@@ -4876,6 +4901,7 @@ public:
             master_evacuation_thread = uthread::create<true>(
                 evict_fn, this, std::string("evacuation master"));
         }
+        start_background_rebuild();
         ::FarLib::allocator::global_heap.set_on_memory_low(
             [this] {
                 uthread::notify_all(&eviction_cond, &eviction_mutex);
@@ -4893,12 +4919,29 @@ public:
     }
 
     ~ConcurrentArrayCache() {
-        if (benchmark_memory_sampler_) benchmark_memory_sampler_->stop();
+        if (benchmark_memory_sampler_) {
+            if (::FarLib::profile::benchmark_memory_observer_context ==
+                benchmark_memory_sampler_.get()) {
+                ::FarLib::profile::benchmark_memory_begin_observer = nullptr;
+                ::FarLib::profile::benchmark_memory_end_observer = nullptr;
+                ::FarLib::profile::benchmark_memory_observer_context = nullptr;
+            }
+            if (::FarLib::benchmark_memory::explicit_work_origin_context ==
+                benchmark_memory_sampler_.get()) {
+                ::FarLib::benchmark_memory::explicit_work_begin_observer = nullptr;
+                ::FarLib::benchmark_memory::explicit_work_end_observer = nullptr;
+                ::FarLib::benchmark_memory::explicit_work_origin_context = nullptr;
+            }
+            benchmark_memory_sampler_->shutdown();
+        }
         ::FarLib::simple_region_heat::end_work();
         ec_batch_diag_report("cache_dtor_begin");
         quiesce_background_evacuation();
         ec_read_recovery_diag_report("cache_quiesced");
         hydra_shutdown_pages();
+        if (::FarLib::get_config().ft_background_rebuild)
+            remote_allocator.small_object_stripe_manager()
+                .release_background_targets_for_shutdown();
         if (::FarLib::allocator::six_group::enabled()) {
             ::FarLib::allocator::six_group::registry().stop();
             ::FarLib::allocator::six_group::registry().dump();
@@ -4922,6 +4965,7 @@ public:
 
     void quiesce_background_evacuation() {
         ec_batch_diag_step("quiesce_background_evacuation_begin");
+        stop_background_rebuild();
         // ft_method=ec_batch: one bounded drain of the write round *before* the
         // workers stop, so every group that is still observable gets its real
         // completions.  What is left after that is settled further down.
@@ -5828,7 +5872,7 @@ public:
     // by RemoteGlobalHeap and are intentionally not mixed into this vector.
     std::vector<uint64_t> remote_memory_endpoint_bytes() const {
         return remote_allocator.small_object_stripe_manager()
-            .snapshot_group_endpoint_bytes();
+            .observer_group_endpoint_bytes();
     }
 
     bool memory_low() {
@@ -6038,6 +6082,8 @@ private:
 #include "cache/core/rdma/rdma_completion.ipp"
 #include "cache/core/rdma/ec_batch_path.ipp"
 #include "recovery/ec_read_recovery.ipp"
+#include "recovery/ec_background_rebuild.ipp"
+#include "recovery/ec_background_rebuild_dual.ipp"
 #include "recovery/recompute_recipe_path.ipp"
 #include "cache/core/common/common_path.ipp"
 #include "hydra/page_path.ipp"

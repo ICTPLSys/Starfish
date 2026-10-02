@@ -81,7 +81,7 @@ class RecoveryCheck(unittest.TestCase):
         self.assertEqual(env["FARLIB_CAPTURE_CHAT_OUTPUT"], "/tmp/chat")
         self.assertEqual(original["FARLIB_EC_RECOVERY_VERIFY"], "bad")
 
-    def test_benchmark_origin_is_injected_for_memory_or_cpu_opt_in(self):
+    def test_process_launch_never_supplies_the_runtime_work_origin(self):
         command = [
             sys.executable, "-c",
             "import os; print(os.environ.get("
@@ -90,6 +90,8 @@ class RecoveryCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             for env, cpu_opt_in in (
                     ({"FARLIB_REMOTE_MEMORY_SAMPLES": "1"}, False),
+                    ({"FARLIB_REMOTE_MEMORY_SAMPLES": "1",
+                      "FARLIB_BENCHMARK_START_MONOTONIC_NS": "123"}, True),
                     ({}, True),
                     ({}, False)):
                 execution = {}
@@ -99,16 +101,15 @@ class RecoveryCheck(unittest.TestCase):
                         command, stdin=None, stdout=output, env=env, timeout=3,
                         capture=None, inject=None, evidence={},
                         execution_state=execution,
-                        benchmark_start_env=cpu_opt_in)
+                        record_launch_time=cpu_opt_in)
                 self.assertEqual(status, 0)
                 origin = output_path.read_text(encoding="utf-8").strip()
-                if env or cpu_opt_in:
-                    self.assertTrue(origin.isdigit())
-                    self.assertEqual(
-                        int(origin), execution["benchmark_start_monotonic_ns"])
+                self.assertEqual(origin, "")
+                self.assertNotIn("benchmark_start_monotonic_ns", execution)
+                if cpu_opt_in:
+                    self.assertGreater(execution["client_launch_monotonic_ns"], 0)
                 else:
-                    self.assertEqual(origin, "")
-                    self.assertNotIn("benchmark_start_monotonic_ns", execution)
+                    self.assertNotIn("client_launch_monotonic_ns", execution)
 
 
     def test_first_answer_triggers_exactly_one_injection(self):

@@ -51,6 +51,9 @@ def prepare(path: Path, source_type="measured"):
         try:
             workload = canonical(row["workload"], WORKLOADS, "workload")
             system = canonical(row["system"], SYSTEMS, "system")
+            expected_metric = "service" if workload == "kv_b" else "total"
+            if source_type == "measured" and row.get("latency_metric") != expected_metric:
+                raise ValueError(f"measured {workload} requires latency_metric={expected_metric}")
             if (row["load_unit"], row["latency_unit"]) != UNITS[workload]:
                 raise ValueError(f"{workload} requires load/latency units {UNITS[workload]}")
             load = float(row["offered_load"])
@@ -73,6 +76,7 @@ def prepare(path: Path, source_type="measured"):
                 if "correctness" in row and row["correctness"].lower() != "pass":
                     raise ValueError("correctness must be pass")
             series[workload, system].append({"offered_load": load, "p99_latency": latency,
+                                             "latency_metric": row.get("latency_metric", "unspecified"),
                                              "source": row["source"],
                                              "exit_status": row.get("exit_status", "0"),
                                              "measurement_usable": row.get("measurement_usable", ""),
@@ -84,6 +88,9 @@ def prepare(path: Path, source_type="measured"):
         points.sort(key=lambda point: point["offered_load"])
     return {"figure": "figure10", "input": str(path.resolve()), "input_sha256": digest,
             "source_type": source_type, "metric": "P99 latency", "units": UNITS,
+            "metric_by_workload": ({"kv_b": "service: completion minus execution start",
+                                    "nq": "total: completion minus scheduled arrival"}
+                                   if source_type == "measured" else {}),
             "series": {f"{workload}/{system}": series[workload, system]
                        for workload in UNITS for system in ORDER},
             "input_rows": len(numbered_rows),
@@ -151,7 +158,8 @@ def draw(data):
             ax.set_yticklabels([r"$10^0$", r"$10^1$", r"$10^2$", r"$10^3$"])
         else:
             ax.set_yticks([])
-        ax.set_ylabel("P99 latency (us)" if idx == 0 else "P99 latency (ms)",
+        ax.set_ylabel(("P99 service (us)" if data["source_type"] == "measured"
+                       else "P99 latency (us)") if idx == 0 else "P99 latency (ms)",
                       fontsize=12.5, labelpad=2)
     handles = [Line2D([0], [0], marker=markers[i], linestyle=linestyles[i],
                       color=colors[i], linewidth=1.55, markersize=4,

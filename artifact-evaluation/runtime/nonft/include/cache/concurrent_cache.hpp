@@ -3973,13 +3973,22 @@ private:
             std::make_unique<::FarLib::benchmark_memory::Sampler>(
                 ::FarLib::get_config().server_count, "allocator_occupied_bytes",
                 "remote_global_heap", [this] {
-                    const auto &heap = ::FarLib::allocator::remote::remote_global_heap;
-                    std::vector<uint64_t> values(::FarLib::get_config().server_count);
-                    for (size_t i = 0; i < values.size(); ++i)
-                        values[i] = heap.get_server_used_bytes(i);
-                    return values;
+                    return ::FarLib::allocator::remote::remote_global_heap
+                        .get_server_used_bytes_observer();
                 });
-        benchmark_memory_sampler_->start();
+        ::FarLib::profile::benchmark_memory_observer_context =
+            benchmark_memory_sampler_.get();
+        ::FarLib::profile::benchmark_memory_begin_observer =
+            &::FarLib::benchmark_memory::Sampler::begin_work_callback;
+        ::FarLib::profile::benchmark_memory_end_observer =
+            &::FarLib::benchmark_memory::Sampler::end_work_callback;
+        ::FarLib::benchmark_memory::explicit_work_origin_context =
+            benchmark_memory_sampler_.get();
+        ::FarLib::benchmark_memory::explicit_work_begin_observer =
+            &::FarLib::benchmark_memory::Sampler::begin_work_at_callback;
+        ::FarLib::benchmark_memory::explicit_work_end_observer =
+            &::FarLib::benchmark_memory::Sampler::end_work_at_callback;
+        benchmark_memory_sampler_->arm();
     }
 
 public:
@@ -4205,7 +4214,21 @@ public:
     }
 
     ~ConcurrentArrayCache() {
-        if (benchmark_memory_sampler_) benchmark_memory_sampler_->stop();
+        if (benchmark_memory_sampler_) {
+            if (::FarLib::profile::benchmark_memory_observer_context ==
+                benchmark_memory_sampler_.get()) {
+                ::FarLib::profile::benchmark_memory_begin_observer = nullptr;
+                ::FarLib::profile::benchmark_memory_end_observer = nullptr;
+                ::FarLib::profile::benchmark_memory_observer_context = nullptr;
+            }
+            if (::FarLib::benchmark_memory::explicit_work_origin_context ==
+                benchmark_memory_sampler_.get()) {
+                ::FarLib::benchmark_memory::explicit_work_begin_observer = nullptr;
+                ::FarLib::benchmark_memory::explicit_work_end_observer = nullptr;
+                ::FarLib::benchmark_memory::explicit_work_origin_context = nullptr;
+            }
+            benchmark_memory_sampler_->shutdown();
+        }
         stop_read_supply_timeline();
         quiesce_background_evacuation();
         ::FarLib::allocator::release_all_thread_heap_regions_for_shutdown();

@@ -13,12 +13,14 @@ COLLECT_PY="$ROOT/scripts/figure9/collect.py"
 PLOT_PY="$ROOT/scripts/figure9/plot.py"
 
 APPS=llama,bfs,mg,wordcount,kv-b,kv-a,kv-s,nq
-SYSTEMS=nonft,starfish,hydra,carbink
+SYSTEMS=nonft,nonft-backup-off,starfish,hydra,carbink
 RATIOS=13,25,50,75,100
 REPEATS=1
 TIMEOUT=1800
 SITE="$ROOT/data/site.json"
 OUT="$ROOT/results/figure9/batch-$(date -u +%Y%m%dT%H%M%SZ)"
+BUILD_ROOT=""
+STOP_ON_ERROR=0
 DRY_RUN=0
 LIST_SUPPORTED=0
 
@@ -27,17 +29,21 @@ usage() {
 Usage: scripts/figure9/run.sh [options]
   --apps llama,bfs,mg,wordcount,kv-b,kv-a,kv-s,nq
                                     applications (default: full Figure 9 matrix)
-  --systems nonft,starfish,hydra,carbink
+  --systems nonft,nonft-backup-off,starfish,hydra,carbink
                                     systems to select (default: all, in this order)
   --ratios 13,25,50,75,100          local memory percentages
   --repeats N                       independent runs per condition (default: 1)
   --site FILE                       local, ignored server/input configuration
   --out DIR                         new batch directory under results/
+  --build-root DIR                 optional isolated build root passed to run_case
+  --stop-on-error                  stop after the first safe failed case
   --timeout SEC                     client timeout (default: 1800)
   --dry-run                         show plans; do not write or contact servers
   --list-supported                  list source/recipe/adapter support, not runtime validation
 Only verified measurements enter the CSV; accepted teardown warnings remain
-visible. Install plot dependencies before running an actual batch.
+visible. DATA_COMPLETE additionally requires correctness, Work traffic, remote
+CPU and Work memory. It does not imply a matching NonFT-backup-off normalization
+baseline exists. Install plot dependencies before running an actual batch.
 EOF
 }
 
@@ -49,6 +55,8 @@ while (($#)); do
     --repeats) REPEATS=$2; shift 2 ;;
     --site) SITE=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
+    --build-root) BUILD_ROOT=$2; shift 2 ;;
+    --stop-on-error) STOP_ON_ERROR=1; shift ;;
     --timeout) TIMEOUT=$2; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --list-supported) LIST_SUPPORTED=1; shift ;;
@@ -56,6 +64,9 @@ while (($#)); do
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+if [[ -n "$BUILD_ROOT" && "$BUILD_ROOT" != /* ]]; then
+  BUILD_ROOT="$PWD/$BUILD_ROOT"
+fi
 
 if [[ "$LIST_SUPPORTED" = 1 ]]; then
   exec "$PYTHON_BIN" "$ROOT/scripts/common/figure9_support.py" \
@@ -109,6 +120,9 @@ done
   exit 2
 }
 
+runner_scope_args=()
+[[ -n "$BUILD_ROOT" ]] && runner_scope_args+=(--build-root "$BUILD_ROOT")
+
 system_label() {
   case "$1" in
     nonft) printf '%s' 'NonFT' ;;
@@ -116,6 +130,28 @@ system_label() {
     hydra) printf '%s' 'Hydra' ;;
     carbink) printf '%s' 'Carbink' ;;
     nonft-backup-off) printf '%s' 'NonFT-backup-off' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+plot_workload() {
+  case "$1" in
+    llama) printf '%s' 'llama' ;;
+    bfs) printf '%s' 'bfs' ;;
+    mg) printf '%s' 'mg' ;;
+    wordcount) printf '%s' 'wc' ;;
+    kv-b) printf '%s' 'kv_b' ;;
+    kv-a) printf '%s' 'kv_a' ;;
+    kv-s) printf '%s' 'kv_s' ;;
+    nq) printf '%s' 'nq' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+plot_system() {
+  case "$1" in
+    nonft|starfish|hydra|carbink) printf '%s' "$1" ;;
+    nonft-backup-off) printf '%s' 'nonft' ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -148,8 +184,8 @@ if [[ "$DRY_RUN" = 1 ]]; then
           set +e
           "$PYTHON_BIN" "$RUN_CASE_PY" \
             --app "$app" --system "$runner_system" ${baseline_args[@]} \
-            --collect-remote-cpu --ratio "$ratio" \
-            --site "$SITE" --out "$OUT/runs/$run_id" \
+            --collect-remote-cpu --collect-remote-memory --ratio "$ratio" --repeat "$rep" \
+            --site "$SITE" --out "$OUT/runs/$run_id" "${runner_scope_args[@]}" \
             --timeout "$TIMEOUT" --dry-run >/dev/null 2>&1
           plan_rc=$?
           set -e
@@ -185,6 +221,8 @@ passed=0
 timeouts=0
 errors=0
 usable_warnings=0
+data_complete_cases=0
+data_incomplete_cases=0
 unsafe_cleanup=0
 stop_batch=0
 for system in "${system_list[@]}"; do
@@ -206,8 +244,9 @@ for system in "${system_list[@]}"; do
         case_out="$OUT/runs/$run_id"
         runner_log="$OUT/logs/$run_id.runner.log"
         args=(--app "$app" --system "$runner_system" ${baseline_args[@]}
-              --collect-remote-cpu --ratio "$ratio"
-              --site "$SITE" --out "$case_out" --timeout "$TIMEOUT")
+              --collect-remote-cpu --collect-remote-memory --ratio "$ratio" --repeat "$rep"
+              --site "$SITE" --out "$case_out" "${runner_scope_args[@]}"
+              --timeout "$TIMEOUT")
         {
           printf '\n=== RUN %s (%s/%s/%s%%/r%s) ===\n' \
             "$run_id" "$system" "$app" "$ratio" "$rep"
@@ -244,9 +283,15 @@ for system in "${system_list[@]}"; do
         set -e
         printf 'BATCH_STATUS %s: %s\n' "$run_id" "$details" >> "$OUT/batch.log"
         reason=""
+        data_complete=0
+        data_reason="data completeness classifier failed"
         if ((details_rc == 0)); then
           reason=$(printf '%s\n' "$details" | "$PYTHON_BIN" -c \
             'import json,sys; print(json.load(sys.stdin).get("reason", ""))' 2>/dev/null) || reason=""
+          data_complete=$(printf '%s\n' "$details" | "$PYTHON_BIN" -c \
+            'import json,sys; print(int(json.load(sys.stdin).get("data_complete") is True))' 2>/dev/null) || data_complete=0
+          data_reason=$(printf '%s\n' "$details" | "$PYTHON_BIN" -c \
+            'import json,sys; print(json.load(sys.stdin).get("data_complete_reason", "missing completeness verdict"))' 2>/dev/null) || data_reason="data completeness classifier failed"
         fi
         if ((status_rc != 0 || details_rc != 0)); then
           status=error
@@ -280,11 +325,26 @@ for system in "${system_list[@]}"; do
               "${system^^}" "${app^^}" "$ratio" "$reason"
             ;;
         esac
+        if [[ "$data_complete" = 1 ]]; then
+          data_complete_cases=$((data_complete_cases + 1))
+          printf 'DATA_COMPLETE %s: %s\n' "$run_id" "$data_reason"
+        else
+          data_incomplete_cases=$((data_incomplete_cases + 1))
+          [[ "$status" != "passed" ]] || app_failures=$((app_failures + 1))
+          printf 'DATA_INCOMPLETE %s: %s (Figure 9 usability is reported separately)\n' \
+            "$run_id" "$data_reason"
+        fi
         if [[ "$safe" != 1 ]]; then
           unsafe_cleanup=$((unsafe_cleanup + 1))
           stop_batch=1
           printf 'ERROR: stopping Figure 9 batch after %s; cleanup is unsafe (%s)\n' \
             "$run_id" "${reason:-cleanup evidence unavailable}" >&2
+          break
+        fi
+        if ((STOP_ON_ERROR)) && [[ "$status" != "passed" || "$data_complete" != 1 ]]; then
+          stop_batch=1
+          printf 'ERROR: stopping Figure 9 batch after %s (--stop-on-error)\n' \
+            "$run_id" >&2
           break
         fi
       done
@@ -319,9 +379,26 @@ if ((collect_rc != 0)); then
   postprocess_failures=$((postprocess_failures + 1))
   echo "ERROR: Figure 9 collection failed (see $OUT/logs/collect.log)" >&2
 else
+  plot_args=(--input "$OUT/figure9.csv" --output-dir "$OUT/figure"
+             --ratios "${ratio_list[@]}")
+  plot_workloads=()
+  for app in "${app_list[@]}"; do
+    plot_workloads+=("$(plot_workload "$app")")
+  done
+  plot_systems=()
+  declare -A seen_plot_systems=()
+  for system in "${system_list[@]}"; do
+    if plotted=$(plot_system "$system"); then
+      if [[ ! ${seen_plot_systems[$plotted]+present} ]]; then
+        plot_systems+=("$plotted")
+        seen_plot_systems[$plotted]=1
+      fi
+    fi
+  done
+  plot_args+=(--workloads "${plot_workloads[@]}"
+              --systems "${plot_systems[@]}")
   set +e
-  "$PLOT_PYTHON" "$PLOT_PY" \
-    --input "$OUT/figure9.csv" --output-dir "$OUT/figure" \
+  "$PLOT_PYTHON" "$PLOT_PY" "${plot_args[@]}" \
     >"$OUT/logs/plot.log" 2>&1
   plot_rc=$?
   set -e
@@ -332,7 +409,9 @@ else
   fi
 fi
 
-# A wholly failed batch must not replace a previously useful public input.
+# A batch publishes into this clone's own data/ directory. Different clones
+# have different ROOT values; remote case paths are additionally hashed from
+# the resolved local batch root by run_case.py.
 if ((collect_rc == 0)) && [[ -f "$OUT/figure9.csv" ]] &&
    (( $(wc -l < "$OUT/figure9.csv") > 1 )); then
   mkdir -p "$ROOT/data"
@@ -351,8 +430,10 @@ fi
 
 printf 'Figure 9 summary: passed=%d timeouts=%d errors=%d usable_warnings=%d unsafe_cleanup=%d postprocess_failures=%d\n' \
   "$passed" "$timeouts" "$errors" "$usable_warnings" "$unsafe_cleanup" "$postprocess_failures"
-echo "figure9 batch: $OUT (failed_cases=$((timeouts + errors + usable_warnings)))"
-if ((timeouts + errors + usable_warnings + unsafe_cleanup + postprocess_failures > 0)); then
+echo "figure9 batch: $OUT (execution_failed_or_warning_cases=$((timeouts + errors + usable_warnings)))"
+printf 'Raw data summary: complete=%d incomplete=%d; normalized Figure 11 additionally requires matching NonFT-backup-off baselines.\n' \
+  "$data_complete_cases" "$data_incomplete_cases"
+if ((timeouts + errors + usable_warnings + unsafe_cleanup + postprocess_failures + data_incomplete_cases > 0)); then
   exit 1
 fi
 exit 0

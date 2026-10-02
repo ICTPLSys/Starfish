@@ -28,7 +28,7 @@ COLUMNS = ("workload", "system", "offered_load", "p99_latency", "load_unit",
            "p99_service_us", "p99_dispatch_us", "repeat", "profile_id",
            "actual_offered_ops_s", "completed", "deadline_dropped", "drop_fraction",
            "max_queue_delay_us", "completed_after_deadline", "measurement_usable",
-           "execution_status", "warning")
+           "execution_status", "warning", "latency_metric", "p99_total_us")
 
 
 def point(directory):
@@ -48,8 +48,10 @@ def point(directory):
               and manifest.get("status") == "passed")
     recovered = False
     measurement_warning = ""
+    endpoints = analysis.get("endpoints", manifest.get("endpoints", []))
+    if not isinstance(endpoints, list):
+        raise ValueError("latency point endpoint records must be a list")
     if normal:
-        endpoints = analysis.get("endpoints", [])
         if not endpoints or any(endpoint.get("status") not in ("stopped", "already_exited")
                                 for endpoint in endpoints):
             raise ValueError("latency point has incomplete memory-service cleanup")
@@ -110,7 +112,10 @@ def point(directory):
     return {
         "workload": "NQ" if app == "nq" else "KV-B", "system": SYSTEM_LABEL[system],
         "offered_load": spec["offered_load_ops"] / (1e3 if app == "nq" else 1e6),
-        "p99_latency": result["p99_latency_ns"] / p99_scale,
+        "p99_latency": (int(measured["p99_service_ns"]) if app == "kv-b"
+                        else result["p99_latency_ns"]) / p99_scale,
+        "latency_metric": "service" if app == "kv-b" else "total",
+        "p99_total_us": result["p99_latency_ns"] / 1000,
         "load_unit": "Kops" if app == "nq" else "Mops",
         "latency_unit": "ms" if app == "nq" else "us",
         "source_type": "measured", "source": str((directory / "analysis.json").resolve()),

@@ -187,6 +187,13 @@ inline void Server::handle_rpc_message(const rdma::EC2PCRpcMessage &msg,
                     parity_endpoint0);
                 uint32_t reserve_retry0 = 0;
                 while (p0_slot == nullptr) {
+                    if (peer_recovery_enabled() &&
+                        !peer_is_alive(parity_endpoint0)) {
+                        fail_tracked_requests_for_peer(
+                            parity_endpoint0,
+                            rdma::kEC2PCStatusPeerDead);
+                        return;
+                    }
                     reserve_retry0++;
                     if (reserve_retry0 >= kProbeBatchRetryLimit) {
                         ERROR("server probe_req: batched parity0 reserve retry exhausted");
@@ -198,6 +205,14 @@ inline void Server::handle_rpc_message(const rdma::EC2PCRpcMessage &msg,
                     parity_endpoint1);
                 uint32_t reserve_retry1 = 0;
                 while (p1_slot == nullptr) {
+                    if (peer_recovery_enabled() &&
+                        !peer_is_alive(parity_endpoint1)) {
+                        release_reserved_probe_parity_batch_send_slot(*p0_slot);
+                        fail_tracked_requests_for_peer(
+                            parity_endpoint1,
+                            rdma::kEC2PCStatusPeerDead);
+                        return;
+                    }
                     reserve_retry1++;
                     if (reserve_retry1 >= kProbeBatchRetryLimit) {
                         p0_slot->in_use.store(false, std::memory_order_release);
@@ -279,6 +294,15 @@ inline void Server::handle_rpc_message(const rdma::EC2PCRpcMessage &msg,
                 auto post_begin = std::chrono::steady_clock::now();
                 uint32_t retry0 = 0;
                 while (!post_reserved_probe_parity_batch_send_slot(*p0_slot)) {
+                    if (peer_recovery_enabled() &&
+                        !peer_is_alive(parity_endpoint0)) {
+                        release_reserved_probe_parity_batch_send_slot(
+                            *p1_slot);
+                        fail_tracked_requests_for_peer(
+                            parity_endpoint0,
+                            rdma::kEC2PCStatusPeerDead);
+                        return;
+                    }
                     retry0++;
                     if (retry0 >= kProbeBatchRetryLimit) {
                         ERROR("server probe_req: batched parity0 send retry exhausted");
@@ -286,6 +310,13 @@ inline void Server::handle_rpc_message(const rdma::EC2PCRpcMessage &msg,
                 }
                 uint32_t retry1 = 0;
                 while (!post_reserved_probe_parity_batch_send_slot(*p1_slot)) {
+                    if (peer_recovery_enabled() &&
+                        !peer_is_alive(parity_endpoint1)) {
+                        fail_tracked_requests_for_peer(
+                            parity_endpoint1,
+                            rdma::kEC2PCStatusPeerDead);
+                        return;
+                    }
                     retry1++;
                     if (retry1 >= kProbeBatchRetryLimit) {
                         ERROR("server probe_req: batched parity1 send retry exhausted");
@@ -495,7 +526,18 @@ inline void Server::handle_rpc_message(const rdma::EC2PCRpcMessage &msg,
         if (!enqueue_runtime_parity_batch_pair_pending_for_worker(
                 worker_idx, peer_idx0, p0, chosen_shard0, peer_idx1, p1,
                 chosen_shard1)) {
-            ERROR("server data_req: runtime parity enqueue failed");
+            if (peer_recovery_enabled()) {
+                if (!peer_is_alive(peer_idx0))
+                    fail_tracked_requests_for_peer(
+                        peer_idx0, rdma::kEC2PCStatusPeerDead);
+                else if (!peer_is_alive(peer_idx1))
+                    fail_tracked_requests_for_peer(
+                        peer_idx1, rdma::kEC2PCStatusPeerDead);
+                else
+                    ERROR("server data_req: runtime parity enqueue failed");
+            } else {
+                ERROR("server data_req: runtime parity enqueue failed");
+            }
         }
         auto peer_enqueue_end = std::chrono::steady_clock::now();
         ctr_data_req_peer_enqueue_ns.fetch_add(
@@ -601,7 +643,18 @@ inline void Server::handle_rpc_message(const rdma::EC2PCRpcMessage &msg,
         if (!enqueue_runtime_parity_batch_pair_pending_for_worker(
                 worker_idx, peer_idx0, p0, chosen_shard0, peer_idx1, p1,
                 chosen_shard1)) {
-            ERROR("server compact_req: runtime parity enqueue failed");
+            if (peer_recovery_enabled()) {
+                if (!peer_is_alive(peer_idx0))
+                    fail_tracked_requests_for_peer(
+                        peer_idx0, rdma::kEC2PCStatusPeerDead);
+                else if (!peer_is_alive(peer_idx1))
+                    fail_tracked_requests_for_peer(
+                        peer_idx1, rdma::kEC2PCStatusPeerDead);
+                else
+                    ERROR("server compact_req: runtime parity enqueue failed");
+            } else {
+                ERROR("server compact_req: runtime parity enqueue failed");
+            }
         }
         auto peer_enqueue_end = std::chrono::steady_clock::now();
         ctr_compact_data_req_peer_enqueue_ns.fetch_add(
@@ -828,7 +881,22 @@ inline void Server::handle_batch_rpc_message(BatchRpcRecvSlot &slot,
     if (!post_probe_parity_batch_message_pair_external(
             peer_idx0, &p0, peer_idx1, &p1, batch_rpc_mr->lkey, &slot,
             batch_generation, chosen_shard0, chosen_shard1)) {
-        ERROR("server batch rpc: runtime parity enqueue failed");
+        // No transport-owned slot or pending pair exists on this false
+        // return; release both external owner references exactly once.
+        release_probe_parity_batch_owner(&slot, batch_generation);
+        release_probe_parity_batch_owner(&slot, batch_generation);
+        if (peer_recovery_enabled()) {
+            if (!peer_is_alive(peer_idx0))
+                fail_tracked_requests_for_peer(
+                    peer_idx0, rdma::kEC2PCStatusPeerDead);
+            else if (!peer_is_alive(peer_idx1))
+                fail_tracked_requests_for_peer(
+                    peer_idx1, rdma::kEC2PCStatusPeerDead);
+            else
+                ERROR("server batch rpc: runtime parity enqueue failed");
+        } else {
+            ERROR("server batch rpc: runtime parity enqueue failed");
+        }
     }
     auto publish_end = std::chrono::steady_clock::now();
     batch_publish_ns += elapsed_ns(publish_begin, publish_end);

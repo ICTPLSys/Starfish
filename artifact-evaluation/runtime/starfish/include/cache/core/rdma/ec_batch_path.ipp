@@ -30,8 +30,28 @@ namespace FarLib::cache::ec_batch {
 // data slots first, then the two parity slots - the order of group.segments.
 inline void *ec_batch_record_source(const EcGroupSendRecord &record,
                                     size_t segment) {
+    if (record.source_mode == EcGroupSourceMode::kSplitDirect &&
+        segment < kEcBatchDataSlots) {
+        return const_cast<void *>(record.split_data_sources[segment]);
+    }
     if (segment < kEcBatchDataSlots) return record.staging.data[segment];
     return record.staging.parity[segment - kEcBatchDataSlots];
+}
+
+inline uint32_t ec_batch_record_source_bytes(
+    const EcGroupSendRecord &record) {
+    return record.source_mode == EcGroupSourceMode::kSplitDirect
+               ? record.split_direct_write_bytes
+               : record.slot_size;
+}
+
+inline bool ec_batch_record_source_uses_staging(
+    const EcGroupSendRecord &record, size_t segment,
+    bool shared_staging_bound = false) {
+    if (record.source_mode == EcGroupSourceMode::kSplitDirect)
+        return segment >= kEcBatchDataSlots;
+    return record.split_object || record.size_class_staging ||
+           shared_staging_bound;
 }
 
 // A record is postable only when all six segments carry a usable remote target
@@ -55,6 +75,22 @@ inline bool ec_batch_record_is_postable(const EcGroupSendRecord &record,
         for (size_t i = 1; i < kEcBatchDataSlots; ++i)
             if (record.objects[i] != nullptr || record.object_sizes[i] != 0)
                 return false;
+        if (record.source_mode == EcGroupSourceMode::kSplitDirect) {
+            const uint32_t bytes = record.split_direct_write_bytes;
+            if (bytes == 0 || bytes > record.slot_size ||
+                record.object_sizes[0] !=
+                    static_cast<uint64_t>(bytes) * kEcBatchDataSlots) {
+                return false;
+            }
+            for (size_t i = 0; i < kEcBatchDataSlots; ++i) {
+                if (record.split_data_sources[i] == nullptr ||
+                    record.split_data_lengths[i] != bytes) {
+                    return false;
+                }
+            }
+        }
+    } else if (record.source_mode == EcGroupSourceMode::kSplitDirect) {
+        return false;
     }
     for (size_t i = 0; !record.split_object && i < kEcBatchDataSlots; i++) {
         if (record.objects[i] != nullptr &&
@@ -82,6 +118,41 @@ inline bool ec_batch_record_is_postable(const EcGroupSendRecord &record,
 namespace FarLib::cache {
 
 // There is no cache-wide stage guard: each EvictBufferSet has one producer.
+
+// Large split write batching is deliberately opt-in so the old per-group
+// submission remains the exact default/control. Values in (1, 32] are
+// accepted for diagnostics; the experiment uses 0 and 32.
+inline size_t ec_split_write_batch_limit() {
+    if (!ec_split::mg_optimizations_enabled) return 0;
+    static const size_t limit = [] {
+        const char *value = std::getenv("FARLIB_EC_SPLIT_WRITE_BATCH");
+        if (value == nullptr || *value == '\0') return size_t{0};
+        char *end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed <= 0) return size_t{0};
+        if (parsed > 32) return size_t{32};
+        return static_cast<size_t>(parsed);
+    }();
+    return limit;
+}
+
+// Fresh split-group allocation batching is deliberately narrower than the
+// write batch: only the bounded values 0 and 8 are accepted, and the value is
+// sampled once so the scalar default remains the exact control path.
+inline size_t ec_split_group_batch_limit() {
+    if (!ec_split::mg_optimizations_enabled) return 0;
+    static const size_t limit = [] {
+        if (::FarLib::get_config().ft_background_rebuild) return size_t{0};
+        const char *value = std::getenv("FARLIB_EC_SPLIT_GROUP_BATCH");
+        if (value == nullptr || *value == '\0') return size_t{0};
+        char *end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || (parsed != 0 && parsed != 8))
+            return size_t{0};
+        return static_cast<size_t>(parsed);
+    }();
+    return limit;
+}
 
 // ---------------------------------------------------------------------------
 // ec_batch diagnostics (observability only).
@@ -287,6 +358,37 @@ inline void ConcurrentArrayCache::ec_batch_diag_report(const char *where) {
               << " bank_init_count=" << ec_persistent_owner_count_
               << " bank_in_use=" << (ec_direct_bank_ ? ec_direct_bank_->in_use() : 0)
               << std::endl;
+    if (ec_split::mg_optimizations_enabled) {
+    std::cout << "ec_split direct_write [" << where << "] enabled="
+              << (ec_split::direct_write_enabled() ? 1 : 0)
+              << " staged="
+              << ec_split_direct_write_staged_.load(std::memory_order_relaxed)
+              << " completed="
+              << ec_split_direct_write_completed_.load(std::memory_order_relaxed)
+              << " logical_bytes="
+              << ec_split_direct_write_bytes_.load(std::memory_order_relaxed)
+              << " borrowed_in_use="
+              << ec_split_direct_write_borrowed_.load(std::memory_order_relaxed)
+              << std::endl;
+    std::cout << "ec_split batch [" << where << "] limit="
+              << ec_split_write_batch_limit()
+              << " flushes=" << ec_split_batch_flushes_.load(std::memory_order_relaxed)
+              << " groups=" << ec_split_batch_groups_.load(std::memory_order_relaxed)
+              << " max_groups=" << ec_split_batch_max_groups_.load(std::memory_order_relaxed)
+              << " endpoint_chains="
+              << ec_split_batch_endpoint_chains_.load(std::memory_order_relaxed)
+              << " accepted_wrs="
+              << ec_split_batch_accepted_wrs_.load(std::memory_order_relaxed)
+              << std::endl;
+    std::cout << "ec_split group_batch [" << where << "] limit="
+              << ec_split_group_batch_limit()
+              << " refills="
+              << ld(ec_split_group_batch_refills_)
+              << " groups=" << ld(ec_split_group_batch_groups_)
+              << " consumed=" << ld(ec_split_group_batch_consumed_)
+              << " released=" << ld(ec_split_group_batch_released_)
+              << std::endl;
+    }
     const uint64_t sealed_groups =
         ec_worker_sealed_groups_.load(std::memory_order_relaxed) +
         ec_split_groups_staged_.load(std::memory_order_relaxed);
@@ -513,9 +615,12 @@ inline bool ConcurrentArrayCache::post_ec_batch_group(
         // completions of this endpoint (including the segments already posted
         // for this group) and retry the same segment until it is accepted.
         const uint32_t *lkey_override =
-            (record.split_object || record.size_class_staging || ec_staging_pool_.shared_buffers_bound()) ? &record.staging.lkey
-                                                    : nullptr;
-        while (!client->post_write(mapped.second, src, seg.slot_size, wr_id, 0,
+            ec_batch_record_source_uses_staging(
+                record, segment, ec_staging_pool_.shared_buffers_bound())
+                ? &record.staging.lkey
+                : nullptr;
+        const uint32_t source_bytes = ec_batch_record_source_bytes(record);
+        while (!client->post_write(mapped.second, src, source_bytes, wr_id, 0,
                                    qp_idx, seg.endpoint_idx, lkey_override)) {
             (void)this->check_cq_idx_with_client_idx_endpoint(
                 qp_idx, client_idx, seg.endpoint_idx);
@@ -575,19 +680,22 @@ inline void ConcurrentArrayCache::account_ec_worker_builder(EvictBufferSet &buff
 
 inline size_t ConcurrentArrayCache::post_ec_batch_pending(
     EvictBufferSet &buffers, size_t client_idx, size_t qp_idx) {
+    size_t groups = 0;
+    if (ec_split::mg_optimizations_enabled && buffers.ec_split_builder)
+        groups += post_ec_split_pending(buffers, client_idx, qp_idx);
     if (buffers.size_class_builder)
-        return post_ec_pending_impl(buffers, *buffers.size_class_builder,
-                                    ec_split_buffers_, client_idx, qp_idx);
+        return groups + post_ec_pending_impl(buffers, *buffers.size_class_builder,
+                                             ec_split_buffers_, client_idx, qp_idx);
     if (buffers.ec_builder)
-        return post_ec_pending_impl(buffers, *buffers.ec_builder,
-                                    ec_staging_pool_, client_idx, qp_idx);
-    return 0;
+        return groups + post_ec_pending_impl(buffers, *buffers.ec_builder,
+                                             ec_staging_pool_, client_idx, qp_idx);
+    return groups;
 }
 
 template <class Builder, class Pool>
 inline size_t ConcurrentArrayCache::post_ec_pending_impl(
     EvictBufferSet &buffers, Builder &builder, Pool &pool,
-    size_t client_idx, size_t qp_idx) {
+    size_t client_idx, size_t qp_idx, bool split_batch_observe) {
     profile::evict_breakdown::Scope prepare_scope(
         buffers.breakdown, profile::evict_breakdown::Stage::SendPrepare);
     if (!ec_batch::EcBatchTokenTable::valid_owner(client_idx)) {
@@ -637,10 +745,13 @@ inline size_t ConcurrentArrayCache::post_ec_pending_impl(
             const size_t i = batch.count++;
             const auto mapped = config.map_remote_addr(seg.addr);
             ASSERT(mapped.first == seg.endpoint_idx);
+            const uint32_t source_bytes =
+                ec_batch::ec_batch_record_source_bytes(record);
             client->build_send_wr(batch.wrs[i], batch.sges[i], mapped.second,
-                ec_batch::ec_batch_record_source(record, segment), seg.slot_size,
+                ec_batch::ec_batch_record_source(record, segment), source_bytes,
                 wr_id, true, IBV_WR_RDMA_WRITE, seg.endpoint_idx);
-            if (record.size_class_staging || ec_staging_pool_.shared_buffers_bound())
+            if (ec_batch::ec_batch_record_source_uses_staging(
+                    record, segment, ec_staging_pool_.shared_buffers_bound()))
                 batch.sges[i].lkey = record.staging.lkey;
             if (i != 0) batch.wrs[i - 1].next = &batch.wrs[i];
         }
@@ -652,6 +763,8 @@ inline size_t ConcurrentArrayCache::post_ec_pending_impl(
     for (size_t ep = 0; ep < buffers.server_count; ++ep) {
         auto &batch = buffers.ec_writes[ep];
         if (batch.count == 0) continue;
+        if (split_batch_observe)
+            ec_split_batch_endpoint_chains_.fetch_add(1, std::memory_order_relaxed);
         ibv_send_wr *remaining = &batch.wrs[0];
         size_t accepted_count = batch.count;
         // On ENOMEM the provider returns the first unaccepted WR. Never
@@ -681,12 +794,37 @@ inline size_t ConcurrentArrayCache::post_ec_pending_impl(
             bytes += batch.sges[i].length;
             profile::count_rdma_write_post(batch.sges[i].length);
         }
+        if (split_batch_observe)
+            ec_split_batch_accepted_wrs_.fetch_add(
+                accepted_count, std::memory_order_relaxed);
         profile::count_evacuation_bytes(bytes);
         profile::count_evac_flush(accepted_count, accepted_count == EvictBatchSize);
         batch.count = 0;
     }
     if (groups != 0) ec_batch_groups_posted_.fetch_add(groups, std::memory_order_relaxed);
     account_ec_worker_builder(buffers);
+    return groups;
+}
+
+inline size_t ConcurrentArrayCache::post_ec_split_pending(
+    EvictBufferSet &buffers, size_t client_idx, size_t qp_idx) {
+    if (!buffers.ec_split_builder ||
+        buffers.ec_split_builder->pending_count() == 0)
+        return 0;
+    const size_t groups = post_ec_pending_impl(
+        buffers, *buffers.ec_split_builder, ec_split_buffers_, client_idx, qp_idx,
+        true);
+    if (groups != 0) {
+        ec_split_batch_flushes_.fetch_add(1, std::memory_order_relaxed);
+        ec_split_batch_groups_.fetch_add(groups, std::memory_order_relaxed);
+        uint64_t previous = ec_split_batch_max_groups_.load(
+            std::memory_order_relaxed);
+        while (previous < groups &&
+               !ec_split_batch_max_groups_.compare_exchange_weak(
+                   previous, groups, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
     return groups;
 }
 
@@ -748,6 +886,15 @@ inline void ConcurrentArrayCache::handle_ec_batch_write_complete(uint64_t wr_id,
         remote_allocator.small_object_stripe_manager().mark_slot_group_durable(record.group.id);
     for (size_t i = 0; i < ec_batch::kEcBatchDataSlots; i++) {
         if (record.objects[i] != nullptr) {
+            if (record.source_mode == ec_batch::EcGroupSourceMode::kSplitDirect) {
+                auto *block = static_cast<::FarLib::allocator::BlockHead *>(
+                    const_cast<void *>(record.objects[i])) - 1;
+                ::FarLib::allocator::release_ec_write_source(block);
+                ec_split_direct_write_borrowed_.fetch_sub(
+                    1, std::memory_order_relaxed);
+                ec_split_direct_write_completed_.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             complete_evict_writeback(const_cast<void *>(record.objects[i]));
         }
     }
@@ -785,8 +932,12 @@ inline bool ConcurrentArrayCache::ec_batch_staging_ready() {
 
 inline bool ConcurrentArrayCache::stage_ec_batch_object(
     EvictBufferSet &buffers, void *local_addr, size_t size,
-    FarObjectEntry *entry, uint32_t behavior_group) {
+    FarObjectEntry *entry, uint32_t behavior_group, bool direct_split_write) {
     buffers.last_stage_owns_old_remote = false;
+    if (direct_split_write) {
+        return stage_ec_split_object(buffers, local_addr, size, entry,
+                                     behavior_group, true);
+    }
     // Route once on admission; already-started batches keep their protocol.
     if (::FarLib::ec_benchmark_phase::enabled() &&
         !ec_batch_uses_split(size) && size <= rdma::ec_rmw::kMaxBytes) {
@@ -819,7 +970,8 @@ inline bool ConcurrentArrayCache::stage_ec_batch_object(
     ec_copy_data_bytes_.fetch_add(size, std::memory_order_relaxed);
     if (entry->is_recomputable()) ERROR("recomputable object must not enter EC");
     if (ec_batch_uses_split(size))
-        return stage_ec_split_object(local_addr, size, entry, behavior_group);
+        return stage_ec_split_object(buffers, local_addr, size, entry,
+                                     behavior_group);
     if (::FarLib::get_config().behavior_group)
         return stage_ec_size_class_object(buffers, local_addr, size, entry, behavior_group);
     if (!ec_batch_staging_ready()) {
@@ -975,53 +1127,226 @@ inline bool ConcurrentArrayCache::stage_ec_size_class_object(
 }
 
 inline bool ConcurrentArrayCache::stage_ec_split_object(
-    void *local_addr, size_t size, FarObjectEntry *entry, uint32_t behavior_group) {
+    EvictBufferSet &buffers, void *local_addr, size_t size,
+    FarObjectEntry *entry, uint32_t behavior_group, bool direct_split_write) {
+    auto *breakdown = ec_split::mg_optimizations_enabled
+                          ? buffers.breakdown : nullptr;
+    const auto release_direct_source = [&] {
+        if (!direct_split_write || local_addr == nullptr) return;
+        auto *block = static_cast<::FarLib::allocator::BlockHead *>(local_addr) - 1;
+        ::FarLib::allocator::release_ec_write_source(block);
+        ec_split_direct_write_borrowed_.fetch_sub(1,
+                                                  std::memory_order_relaxed);
+    };
     if (local_addr == nullptr || entry == nullptr || size == 0 ||
-        !ec_split_buffers_.valid()) return false;
+        !ec_split_buffers_.valid()) {
+        release_direct_source();
+        return false;
+    }
     if (size > ec_split::kMaxObjectBytes) {
         ERROR("ec_split: object exceeds the runtime's 256 KiB size limit");
+        release_direct_source();
+        return false;
+    }
+    if (direct_split_write && !ec_split::direct_write_shape(size)) {
+        release_direct_source();
         return false;
     }
     const size_t fragment_bytes = ec_split::fragment_size(size);
+    const size_t split_group_batch_limit = ec_split_group_batch_limit();
     auto &manager = remote_allocator.small_object_stripe_manager();
     const size_t client_idx = rdma::thread_info.thread_id;
     auto *client = rdma::get_client(client_idx);
-    if (client == nullptr) return false;
+    if (client == nullptr) {
+        release_direct_source();
+        return false;
+    }
+    const size_t qp_idx = client->get_qp_idx();
+    const size_t split_batch_limit = ec_split_write_batch_limit();
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(kEcBatchStageRetryTimeoutMs);
     auto progress = [&] {
-        (void)ec_batch_poll_all_cqs_once();
+        if (split_batch_limit != 0)
+            (void)post_ec_batch_pending(buffers, client_idx, qp_idx);
+        {
+            profile::evict_breakdown::Scope poll_scope(
+                breakdown, profile::evict_breakdown::Stage::CqProcess);
+            (void)ec_batch_poll_all_cqs_once();
+        }
         if (std::chrono::steady_clock::now() >= deadline)
             ERROR("ec_split: unable to allocate or post protected object within 30s");
-        uthread::yield();
+        {
+            profile::evict_breakdown::Scope yield_scope(
+                breakdown,
+                profile::evict_breakdown::Stage::BackpressureYield);
+            uthread::yield();
+        }
     };
+    auto flush_split_boundary = [&] {
+        if (split_batch_limit == 0 || !buffers.ec_split_builder) return;
+        while (buffers.ec_split_builder->pending_count() >= split_batch_limit) {
+            // The normal threshold hit is a direct submit.  Yield/global poll
+            // is reserved for a provider/token backpressure retry.
+            (void)post_ec_batch_pending(buffers, client_idx, qp_idx);
+            if (buffers.ec_split_builder->pending_count() < split_batch_limit)
+                break;
+            progress();
+        }
+    };
+    if (split_batch_limit != 0) {
+        if (!buffers.ec_split_builder)
+            buffers.ec_split_builder.reset(new EvictBufferSet::EcSplitPendingBuilder());
+        flush_split_boundary();
+    }
     SmallObjectStripeManager::SlotGroupHandle group;
-    while (!manager.allocate_slot_group(fragment_bytes, &group)) progress();
+    {
+        profile::evict_breakdown::Scope group_scope(
+            breakdown, profile::evict_breakdown::Stage::GroupAllocate);
+        if (split_group_batch_limit == 0) {
+            while (!manager.allocate_slot_group(fragment_bytes, &group))
+                progress();
+        } else {
+            auto &batch = buffers.ec_split_group_batch;
+            const size_t bin = ::FarLib::allocator::bin_from_wsize(
+                ::FarLib::allocator::wsize_from_size(fragment_bytes));
+            const uint32_t expected_slot_size = static_cast<uint32_t>(
+                ::FarLib::allocator::get_bin_size(bin));
+            if (batch.count != 0 &&
+                (batch.groups[0].bin != bin ||
+                 batch.groups[0].slot_size != expected_slot_size)) {
+                release_ec_split_group_batch(buffers);
+            }
+            while (batch.count == 0) {
+                const size_t produced = manager.allocate_slot_group_batch(
+                    fragment_bytes, batch.groups.data(), split_group_batch_limit);
+                if (produced != 0) {
+                    ASSERT(produced <= EvictBufferSet::EcSplitGroupBatch::kCapacity);
+                    batch.count = produced;
+                    ++buffers.ec_split_group_batch_refills;
+                    buffers.ec_split_group_batch_groups += produced;
+                    break;
+                }
+                progress();
+            }
+            if (!manager.group_handle_eligible_for_new_group(
+                    batch.groups[batch.count - 1])) {
+                release_ec_split_group_batch(buffers);
+                // Retry this object through the existing endpoint-aware
+                // scalar allocator after discarding stale reservations.
+                while (!manager.allocate_slot_group(fragment_bytes, &group))
+                    progress();
+            } else {
+                group = batch.groups[batch.count - 1];
+                batch.groups[batch.count - 1] =
+                    SmallObjectStripeManager::SlotGroupHandle{};
+                --batch.count;
+                ++buffers.ec_split_group_batch_consumed;
+            }
+        }
+    }
     ec_batch::EcStagingGroupSlot staging;
-    while (!ec_split_buffers_.acquire(group.slot_size, client_idx, &staging)) progress();
-    if (!ec_split::encode(local_addr, size, staging) ||
-        !manager.seal_split_slot_group(group.id, static_cast<uint32_t>(size))) {
+    {
+        profile::evict_breakdown::Scope buffer_scope(
+            breakdown, profile::evict_breakdown::Stage::StageControl);
+        while (!ec_split_buffers_.acquire(group.slot_size, client_idx, &staging))
+            progress();
+    }
+    bool encoded = false;
+    if (direct_split_write) {
+        const size_t direct_fragment_bytes = ec_split::fragment_size(size);
+        const void *sources[ec_split::kDataSlots]{};
+        for (size_t i = 0; i < ec_split::kDataSlots; ++i) {
+            ec_split::DirectReadFragment fragment;
+            if (!ec_split::direct_read_fragment(size, i, &fragment) ||
+                fragment.bytes != direct_fragment_bytes) {
+                release_direct_source();
+                (void)ec_split_buffers_.release(staging);
+                (void)manager.mark_dead_group(group.id);
+                return false;
+            }
+            sources[i] = static_cast<const uint8_t *>(local_addr) +
+                         fragment.offset;
+        }
+        encoded = ec_split::encode_direct(sources, direct_fragment_bytes,
+                                          staging, breakdown);
+    } else {
+        encoded = ec_split::encode(local_addr, size, staging);
+    }
+    bool sealed = false;
+    if (encoded) {
+        profile::evict_breakdown::Scope seal_scope(
+            breakdown, profile::evict_breakdown::Stage::SealQueue);
+        sealed = manager.seal_split_slot_group(
+            group.id, static_cast<uint32_t>(size));
+    }
+    if (!encoded || !sealed) {
         (void)ec_split_buffers_.release(staging);
         (void)manager.mark_dead_group(group.id);
+        release_direct_source();
         ERROR("ec_split: encode/seal failed; refusing unprotected fallback");
         return false;
     }
     ec_batch::EcGroupSendRecord record;
-    record.group = group;
-    record.slot_size = group.slot_size;
-    record.staging = staging;
-    record.split_object = true;
-    record.behavior_group = behavior_group;
-    record.live_mask = 1;  // One application object; all four data fragments valid.
-    record.live_count = 1;
-    record.objects[0] = local_addr;
-    record.object_sizes[0] = static_cast<uint32_t>(size);
-    record.sequence = ec_split_groups_staged_.fetch_add(1, std::memory_order_relaxed) + 1;
+    {
+        profile::evict_breakdown::Scope seal_scope(
+            breakdown, profile::evict_breakdown::Stage::SealQueue);
+        record.group = group;
+        record.slot_size = group.slot_size;
+        record.staging = staging;
+        record.split_object = true;
+        record.source_mode = direct_split_write
+                                ? ec_batch::EcGroupSourceMode::kSplitDirect
+                                : ec_batch::EcGroupSourceMode::kStaging;
+        record.behavior_group = behavior_group;
+        record.live_mask = 1;  // One application object; all four data fragments valid.
+        record.live_count = 1;
+        record.objects[0] = local_addr;
+        record.object_sizes[0] = static_cast<uint32_t>(size);
+        if (direct_split_write) {
+            const size_t direct_fragment_bytes = ec_split::fragment_size(size);
+            record.split_direct_write_bytes =
+                static_cast<uint32_t>(direct_fragment_bytes);
+            for (size_t i = 0; i < ec_split::kDataSlots; ++i) {
+                ec_split::DirectReadFragment fragment;
+                ASSERT(ec_split::direct_read_fragment(size, i, &fragment));
+                record.split_data_sources[i] =
+                    static_cast<const uint8_t *>(local_addr) + fragment.offset;
+                record.split_data_lengths[i] =
+                    static_cast<uint32_t>(fragment.bytes);
+            }
+        }
+        record.sequence = ec_split_groups_staged_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (direct_split_write) {
+            ec_split_direct_write_staged_.fetch_add(
+                1, std::memory_order_relaxed);
+            ec_split_direct_write_bytes_.fetch_add(
+                size, std::memory_order_relaxed);
+        }
+    }
     // The caller already published EVICTING and holds its write reference.
     // Publish the anchor before any WR can complete; it represents the entire
     // split group, not a contiguous single-node copy of this large object.
     entry->set_remote_addr(group.segments[0].addr);
-    while (!post_ec_batch_group(record, client_idx, client->get_qp_idx())) progress();
+    if (split_batch_limit == 0) {
+        while (!post_ec_batch_group(record, client_idx, qp_idx)) progress();
+    } else {
+        ASSERT(buffers.ec_split_builder != nullptr);
+        {
+            profile::evict_breakdown::Scope queue_scope(
+                breakdown, profile::evict_breakdown::Stage::SealQueue);
+            if (!buffers.ec_split_builder->push(record)) {
+                (void)ec_split_buffers_.release(staging);
+                (void)manager.mark_dead_group(group.id);
+                release_direct_source();
+                ERROR("ec_split: pending write batch overflow");
+                return false;
+            }
+        }
+        // Publish at the configured cross-object boundary. If token or CQ
+        // pressure prevents a full drain, progress keeps the queue bounded
+        // and preserves the existing global-poll + yield behavior.
+        flush_split_boundary();
+    }
     // No dereference of entry/local_addr after posting: completion may already
     // have released the write reference on another CQ-polling worker.
     ec_diag_stage_ok_.fetch_add(1, std::memory_order_relaxed);
@@ -1072,10 +1397,69 @@ inline void ConcurrentArrayCache::flush_ec_batch_groups(
         }
     }
     };
+    auto flush_split_builder = [&] {
+        if (!buffers->ec_split_builder) return;
+        while (buffers->ec_split_builder->pending_count() != 0) {
+            const size_t before = buffers->ec_split_builder->pending_count();
+            (void)post_ec_batch_pending(*buffers, client_idx, qp_idx);
+            if (buffers->ec_split_builder->pending_count() == 0) break;
+            {
+                profile::evict_breakdown::Scope poll_scope(
+                    buffers->breakdown, profile::evict_breakdown::Stage::CqProcess);
+                (void)check_cq_idx_with_client_idx(qp_idx, client_idx);
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                ERROR("ec_split: pending write batch could not be posted within 30s");
+            {
+                profile::evict_breakdown::Scope yield_scope(
+                    buffers->breakdown, profile::evict_breakdown::Stage::BackpressureYield);
+                uthread::yield();
+            }
+            if (buffers->ec_split_builder->pending_count() >= before &&
+                ec_batch_in_flight_group_count() == 0)
+                (void)ec_batch_poll_all_cqs_once();
+        }
+    };
+    if (ec_split::mg_optimizations_enabled) {
+        flush_split_builder();
+        release_ec_split_group_batch(*buffers);
+    }
     if (buffers->size_class_builder) flush_builder(*buffers->size_class_builder);
     else if (buffers->ec_builder) flush_builder(*buffers->ec_builder);
     buffers->ec_objects_since_post = 0;
     account_ec_worker_builder(*buffers);
+}
+
+inline void ConcurrentArrayCache::release_ec_split_group_batch(
+    EvictBufferSet &buffers) {
+    auto &batch = buffers.ec_split_group_batch;
+    auto &manager = remote_allocator.small_object_stripe_manager();
+    for (size_t i = 0; i < batch.count; ++i) {
+        if (!manager.mark_dead_group(batch.groups[i].id)) {
+            ERROR("ec_split: failed to retire unused preallocated group");
+        }
+        ++buffers.ec_split_group_batch_released;
+    }
+    if (buffers.ec_split_group_batch_groups !=
+        buffers.ec_split_group_batch_consumed +
+            buffers.ec_split_group_batch_released) {
+        ERROR("ec_split: fresh group batch ownership did not close");
+    }
+    if (buffers.ec_split_group_batch_refills != 0) {
+        ec_split_group_batch_refills_.fetch_add(
+            buffers.ec_split_group_batch_refills, std::memory_order_relaxed);
+        ec_split_group_batch_groups_.fetch_add(
+            buffers.ec_split_group_batch_groups, std::memory_order_relaxed);
+        ec_split_group_batch_consumed_.fetch_add(
+            buffers.ec_split_group_batch_consumed, std::memory_order_relaxed);
+        ec_split_group_batch_released_.fetch_add(
+            buffers.ec_split_group_batch_released, std::memory_order_relaxed);
+    }
+    batch.clear();
+    buffers.ec_split_group_batch_refills = 0;
+    buffers.ec_split_group_batch_groups = 0;
+    buffers.ec_split_group_batch_consumed = 0;
+    buffers.ec_split_group_batch_released = 0;
 }
 
 // ---------------------------------------------------------------------------

@@ -33,9 +33,12 @@ parser.add_argument("--system", required=True)
 parser.add_argument("--ratio", type=int, required=True)
 parser.add_argument("--site", required=True)
 parser.add_argument("--out", type=Path, required=True)
+parser.add_argument("--build-root")
 parser.add_argument("--timeout", required=True)
 parser.add_argument("--baseline-variant")
 parser.add_argument("--collect-remote-cpu", action="store_true")
+parser.add_argument("--collect-remote-memory", action="store_true")
+parser.add_argument("--repeat", type=int)
 parser.add_argument("--dry-run", action="store_true")
 args = parser.parse_args()
 
@@ -108,7 +111,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--runs-dir", required=True)
 parser.add_argument("--output", type=Path, required=True)
 args = parser.parse_args()
-args.output.write_text("workload,system,ratio,elapsed_s\n", encoding="utf-8")
+args.output.write_text(
+    "workload,system,ratio,elapsed_s\nLLM,Non-FT,25,1.0\n",
+    encoding="utf-8",
+)
 print("synthetic collector detail", flush=True)
 '''
 
@@ -163,12 +169,12 @@ class Figure9Batch(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "This script will run NonFT, Starfish, Hydra, Carbink sequentially.",
+            "This script will run NonFT, NonFT-backup-off, Starfish, Hydra, Carbink sequentially.",
             result.stdout,
         )
         plan_lines = [line for line in result.stdout.splitlines()
                       if line.startswith("PLAN ")]
-        systems = ("NONFT", "STARFISH", "HYDRA", "CARBINK")
+        systems = ("NONFT", "NONFT-BACKUP-OFF", "STARFISH", "HYDRA", "CARBINK")
         apps = ("LLAMA", "BFS", "MG", "WORDCOUNT", "KV-B", "KV-A", "KV-S", "NQ")
         ratios = (13, 25, 50, 75, 100)
         expected = [
@@ -196,6 +202,17 @@ class Figure9Batch(unittest.TestCase):
         self.assertIn("PLAN STARFISH LLAMA 25% r1 OK", result.stdout)
         self.assertIn("plan_errors=1", result.stdout)
         self.assertFalse(output_dir.exists(), "failed dry-run must not write output")
+
+    def test_default_batch_publishes_within_clone_root(self):
+        output_dir = self.root / "local-batch"
+        result = self.run_batch(
+            "--systems", "nonft", "--apps", "llama", "--ratios", "25",
+            "--site", str(self.site), "--out", str(output_dir),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((output_dir / "figure9.csv").is_file())
+        self.assertTrue((self.root / "data" / "figure9.csv").is_file())
+        self.assertNotIn("shared publication disabled", result.stdout)
 
     def test_timeout_and_error_are_warnings_or_errors_then_continue(self):
         output_dir = self.root / "continue-batch"

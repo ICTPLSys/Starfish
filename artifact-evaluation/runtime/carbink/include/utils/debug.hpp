@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <cstdio>
 #include <iostream>
 
 namespace FarLib {
@@ -34,7 +35,19 @@ inline void check_err(int err, const char *msg) {
 
 inline void warn(const char *msg) { std::cerr << "WARN: " << msg << std::endl; }
 
-inline void info(const char *msg) { std::cout << "INFO: " << msg << std::endl; }
+inline bool verbose_log_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("FARLIB_VERBOSE_LOG");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+inline void info(const char *msg) {
+    if (verbose_log_enabled()) {
+        std::fprintf(stdout, "INFO: %s\n", msg);
+    }
+}
 
 }  // namespace debug
 

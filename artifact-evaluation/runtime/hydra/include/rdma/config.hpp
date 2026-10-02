@@ -439,6 +439,30 @@ struct Configure {
 
         // Fault-tolerance / EC layout validation.  Everything below only runs
         // when ft_method != none, so the default path is untouched.
+        if (ft_standby_endpoint2 < -1)
+            config_error("ft_standby_endpoint2 must be -1 or an endpoint index");
+        if (ft_standby_endpoint2 >= 0 &&
+            (!ft_background_rebuild || ft_background_rebuild_failures != 2 ||
+             server_count < 8 || server_count > 64 ||
+             ft_standby_endpoint2 >= server_count ||
+             ft_standby_endpoint2 == ft_standby_endpoint))
+            config_error("second standby requires dual background recovery and at least six active endpoints");
+        if (ft_background_rebuild) {
+            if (ft_background_rebuild_failures != 1 &&
+                ft_background_rebuild_failures != 2)
+                config_error("background recovery supports one or two failures");
+            if (ft_background_rebuild_failures == 2 &&
+                (server_count < 8 || server_count > 64 || ft_standby_endpoint2 < 0))
+                config_error("dual recovery requires two reserved spare endpoints");
+
+            if (!is_hydra_mode() || !exclusive_cache || !enable_eager_evict ||
+                ft_standby_endpoint < 0 || ft_rebuild_bandwidth_mbps == 0 ||
+                ft_rebuild_bandwidth_mbps > 1000000)
+                config_error("ft_background_rebuild requires exclusive Hydra, eager eviction, standby and nonzero bandwidth");
+            const char *pool = std::getenv("FARLIB_SEPARATE_BACKGROUND_CLUSTER");
+            if (!pool || std::string(pool) != "1")
+                config_error("ft_background_rebuild requires a separate background cluster");
+        }
         if (ft_enabled()) {
             if (is_hydra_mode() &&
                 (enable_selective_backup || enable_logical_object_profile ||

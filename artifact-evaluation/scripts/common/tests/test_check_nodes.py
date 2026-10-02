@@ -45,6 +45,59 @@ class CheckNodes(unittest.TestCase):
         override = check_nodes.load_targets(self.inventory, self.site, user="another")
         self.assertEqual(override[0]["ssh_host"], "another@192.0.2.1")
 
+    def test_site_endpoint_deduplication_derives_server_port_range(self):
+        self.inventory.write_text(json.dumps({
+            "server_port": 1893,
+            "servers": [{"ip": "192.0.2.1"}, {"ip": "192.0.2.2"}],
+        }))
+        self.site.write_text(json.dumps({
+            "memory_endpoints": [
+                {"ip": "192.0.2.2", "server_port": 1901},
+                {"ip": "192.0.2.2", "server_port": 1901},
+                {"ip": "192.0.2.1", "server_port": 1902},
+            ],
+        }))
+        targets = check_nodes.load_targets(self.inventory, self.site)
+        self.assertEqual(targets[0]["expected_server_ports"], [1902])
+        self.assertEqual(targets[1]["expected_server_ports"], [1901])
+
+    def test_legacy_site_port_and_count_are_mapped_without_cross_host_range(self):
+        self.inventory.write_text(json.dumps({
+            "server_port": 2300,
+            "servers": [{"ip": "192.0.2.1"}, {"ip": "192.0.2.2"}],
+        }))
+        self.site.write_text(json.dumps({
+            "memory_ip": "192.0.2.2",
+            "memory_host": "reviewer@192.0.2.2",
+            "server_port": 1907,
+            "memory_server_count": 3,
+        }))
+        targets = check_nodes.load_targets(self.inventory, self.site)
+        self.assertEqual(targets[0]["expected_server_ports"], [])
+        self.assertEqual(targets[1]["expected_server_ports"], [1907, 1908, 1909])
+        self.site.write_text(json.dumps({
+            "server_port": 1907,
+            "memory_endpoints": [
+                {"ip": "192.0.2.1"},
+                {"ip": "192.0.2.2"},
+            ],
+        }))
+        targets = check_nodes.load_targets(self.inventory, self.site)
+        self.assertEqual(targets[0]["expected_server_ports"], [1907])
+        self.assertEqual(targets[1]["expected_server_ports"], [1907])
+
+    def test_raw_endpoint_port_defaults_to_run_case_default(self):
+        self.inventory.write_text(json.dumps({
+            "server_port": 2300,
+            "servers": [{"ip": "192.0.2.1"}, {"ip": "192.0.2.2"}],
+        }))
+        self.site.write_text(json.dumps({
+            "memory_endpoints": [{"ip": "192.0.2.2"}],
+        }))
+        targets = check_nodes.load_targets(self.inventory, self.site)
+        self.assertEqual(targets[0]["expected_server_ports"], [])
+        self.assertEqual(targets[1]["expected_server_ports"], [1893])
+
     def test_heterogeneous_accounts_and_inventory_override(self):
         self.site.write_text(json.dumps({"memory_endpoints": [
             {"ip": "192.0.2.1", "memory_host": "alice@node-one"},
@@ -145,6 +198,25 @@ class CheckNodes(unittest.TestCase):
         row["snapshot"]["cpu_percent"] = 1
         row["snapshot"]["memory"]["available_bytes"] = 1024**3
         self.assertFalse(check_nodes.availability(row)["idle"])
+
+    def test_configured_server_port_conflict_blocks_idle(self):
+        row = {"snapshot": snapshot(), "status": "NO_MATCH",
+               "expected_server_ports": [1893, 1894]}
+        state = check_nodes.availability(row)
+        self.assertIs(state["idle"], False)
+        self.assertEqual(state["port_conflicts"], [1893])
+        self.assertIn("server-port 1893", state["load"])
+
+    def test_require_idle_exit_codes_distinguish_busy_and_unknown(self):
+        base = {"timestamp_utc": "test", "nodes": []}
+        self.assertEqual(check_nodes.report_exit_code(base, require_idle=True), 0)
+        busy = {"timestamp_utc": "test",
+                "nodes": [{"snapshot": snapshot([{"pid": 4, "kind": "workload"}]),
+                           "availability": {"idle": False}}]}
+        self.assertEqual(check_nodes.report_exit_code(busy, require_idle=True), 1)
+        unknown = {"timestamp_utc": "test",
+                   "nodes": [{"status": "UNKNOWN", "error": "permission denied"}]}
+        self.assertEqual(check_nodes.report_exit_code(unknown, require_idle=True), 3)
 
     def test_clickhouse_exemption_keeps_raw_metrics_and_other_load_checks(self):
         ch = {"pid": 10, "name": "clickhouse-server", "exe": "/usr/bin/clickhouse-server",

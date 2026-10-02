@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 from pathlib import Path
 import sys
@@ -42,10 +43,15 @@ FIELDS = (
     "app_workers", "repeat", "environment", "baseline_environment",
     "environment_match", "warning", "workload_id", "measurement_phase",
     "aggregation", "window", "metric", "sampling", "samples",
+    "origin", "work_window_id", "end_monotonic_ns",
+    "scheduled_samples", "missing_samples", "expected_samples",
+    "work_duration_ns", "missing_times_s", "end_status",
     "raw_value", "normalizer", "raw_unit", "normalizer_unit",
     "scheduled_times_s", "sample_times_s",
     "baseline_samples", "baseline_sampling",
     "baseline_variant", "backup_enabled", "normalizer_variant",
+    "off_policy", "local_resident_budget_bytes", "normalizer_off_policy",
+    "normalizer_resident_budget_bytes",
 )
 
 
@@ -167,6 +173,15 @@ def _positive_baseline(record, field):
 
 def _make_row(record, baseline, component, *, ratio, repeat,
               environment_match, warning):
+    if component != "remote_cpu_cores" and (
+            baseline.get("off_policy") != "backup_and_resident_off"
+            or baseline.get("local_resident_budget_bytes") != 0):
+        raise ValueError(
+            f"{record['workload']}: normalization requires verified NonFT backup+resident OFF; "
+            f"baseline policy={baseline.get('off_policy', 'unverified')}, "
+            f"resident budget={baseline.get('local_resident_budget_bytes')}")
+    if record["system"] == "nonft" and record.get("off_policy") != "backup_and_resident_off":
+        raise ValueError("formal Figure 11 NonFT series requires backup+resident OFF")
     if component == "fetch_traffic":
         field, unit, raw_unit = "fetch_bytes", "x", "bytes"
         raw = float(record[field])
@@ -210,6 +225,15 @@ def _make_row(record, baseline, component, *, ratio, repeat,
         source = record["_source"] + "; nonft=" + baseline["_source"]
         sampling = record["remote_memory_sampling"]
         samples = str(record["remote_memory_samples"])
+        for label, measured in (("record", record), ("baseline", baseline)):
+            if measured["remote_memory_samples"] < measured["remote_memory_expected_samples"]:
+                coverage = (
+                    f"{label} memory uses {measured['remote_memory_samples']}/"
+                    f"{measured['remote_memory_expected_samples']} successful samples; "
+                    f"scheduled={measured['remote_memory_scheduled_samples']}, "
+                    f"missing={measured['remote_memory_missing_samples']}, "
+                    f"end_status={measured['remote_memory_end_status']}")
+                warning = "; ".join(part for part in (warning, coverage) if part)
         if record["remote_memory_samples"] != baseline["remote_memory_samples"]:
             count_warning = (
                 f"memory sample counts differ: record={record['remote_memory_samples']} "
@@ -245,6 +269,25 @@ def _make_row(record, baseline, component, *, ratio, repeat,
         "metric": metric,
         "sampling": sampling,
         "samples": samples,
+        "origin": record.get("remote_memory_origin", "")
+            if component == "remote_memory" else "",
+        "work_window_id": record.get("remote_memory_work_window_id", "")
+            if component == "remote_memory" else "",
+        "end_monotonic_ns": record.get("remote_memory_end_monotonic_ns", "")
+            if component == "remote_memory" else "",
+        "scheduled_samples": record.get("remote_memory_scheduled_samples", "")
+            if component == "remote_memory" else "",
+        "missing_samples": record.get("remote_memory_missing_samples", "")
+            if component == "remote_memory" else "",
+        "expected_samples": record.get("remote_memory_expected_samples", "")
+            if component == "remote_memory" else "",
+        "work_duration_ns": record.get("remote_memory_work_duration_ns", "")
+            if component == "remote_memory" else "",
+        "missing_times_s": ",".join(map(str, record.get(
+            "remote_memory_missing_times_s", [])))
+            if component == "remote_memory" else "",
+        "end_status": record.get("remote_memory_end_status", "")
+            if component == "remote_memory" else "",
         "raw_value": raw,
         "normalizer": denominator,
         "raw_unit": raw_unit,
@@ -261,6 +304,12 @@ def _make_row(record, baseline, component, *, ratio, repeat,
         "backup_enabled": str(record["backup_enabled"]).lower()
             if "backup_enabled" in record else "",
         "normalizer_variant": baseline.get("baseline_variant", baseline["system"])
+            if component != "remote_cpu_cores" else "",
+        "off_policy": record.get("off_policy", ""),
+        "local_resident_budget_bytes": record.get("local_resident_budget_bytes", ""),
+        "normalizer_off_policy": baseline.get("off_policy", "")
+            if component != "remote_cpu_cores" else "",
+        "normalizer_resident_budget_bytes": baseline.get("local_resident_budget_bytes", "")
             if component != "remote_cpu_cores" else "",
     }
 
@@ -326,6 +375,8 @@ def main():
     parser.add_argument("--allow-unmatched-environments", action="store_true",
                         help="allow but annotate environment mismatches")
     parser.add_argument("--output", type=Path, default=AE_ROOT / "data/figure11.csv")
+    parser.add_argument("--raw-output", type=Path,
+                        help="export absolute all-four-component measured records from raw run directories as JSON; no baseline normalization")
     parser.add_argument("--show-log-format", action="store_true")
     args = parser.parse_args()
     if args.show_log_format:
@@ -334,6 +385,24 @@ def main():
     if args.logs_root is None:
         parser.error("--logs-root is required unless --show-log-format is selected")
     try:
+        if args.raw_output is not None:
+            if requested_components(args.components) != COMPONENTS:
+                raise ValueError("--raw-output requires all four measured components")
+            if raw_runs is None:
+                raise ValueError("raw_runs.collect_records is unavailable")
+            records = raw_runs.collect_records(
+                args.logs_root, pattern=args.pattern, ratio=args.ratio,
+                repeat=args.repeat, components=COMPONENTS,
+                include_regular_nonft=True)
+            args.raw_output.parent.mkdir(parents=True, exist_ok=True)
+            with args.raw_output.open("x", encoding="utf-8") as stream:
+                json.dump({"schema_version": log_contract.SCHEMA_VERSION,
+                           "data_kind": "absolute_measured_records",
+                           "normalized": False, "records": records},
+                          stream, indent=2)
+                stream.write("\n")
+            print(f"wrote {len(records)} absolute unnormalized records to {args.raw_output}")
+            return 0
         rows = collect_rows(
             args.logs_root, pattern=args.pattern, ratio=args.ratio,
             repeat=args.repeat, components=args.components,

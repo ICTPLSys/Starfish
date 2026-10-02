@@ -499,14 +499,14 @@ inline void ConcurrentArrayCache::evacuate_work() {
         const size_t mark_workers = configured_mark_workers;
         // One stdio call keeps the startup record intact while the
         // application and allocator print from other threads.
-        std::fprintf(stderr,
-                     "\nruntime.exclusive_owned_batch=%d mark_workers=%zu evict_workers=%zu\n",
+        std::fprintf(stdout,
+                     "runtime.exclusive_owned_batch=%d mark_workers=%zu evict_workers=%zu\n",
                      static_cast<int>(optimized_enabled &&
                          optimized_legacy_exclusive_pipeline_enabled() &&
                          exclusive_owned_batch_reclaim_enabled()),
                      mark_workers, evict_workers);
         if (::FarLib::get_config().is_hydra_mode()) {
-            std::fprintf(stderr, "\nhydra.reclaim batch_regions=%zu early_notify=%d\n",
+            std::fprintf(stdout, "hydra.reclaim batch_regions=%zu early_notify=%d\n",
                          static_cast<size_t>(hydra_owned_reclaim_batch_limit()),
                          static_cast<int>(hydra_reclaim_notify_enabled()));
         }

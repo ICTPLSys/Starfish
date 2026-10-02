@@ -20,8 +20,6 @@ def builtin_identity(template):
     if path.parent.parent != CONFIGS.resolve() or path.parent.name not in FOOTPRINT_BYTES:
         return None
     name = path.stem
-    if name == "starfish_ec" and path.parent.name == "llama":
-        name = "starfish"
     if name not in SYSTEMS:
         return None
     return path.parent.name, name
@@ -38,6 +36,9 @@ def builtin_defaults(template):
     values = {
         "max_thread_cnt": "24", "evict_batch_size": "65536",
     }
+    if ((app, system) == ("mg", "starfish") or
+            (app.startswith("kv-") and system in {"nonft", "starfish"})):
+        values.update(mark_thread_cnt="2", evacuate_thread_cnt="10")
     if system in {"nonft", "starfish"}:
         values.update({
             "remote_backup_mode": "object_profiled",

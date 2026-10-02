@@ -106,6 +106,19 @@ retry:
     }
 }
 
+inline bool ec_split_direct_write_mr_eligible(void *local_addr,
+                                               size_t object_bytes) {
+    if (!ec_split::direct_write_enabled() ||
+        !ec_split::direct_write_shape(object_bytes)) {
+        return false;
+    }
+    const auto *control = rdma::ClientControl::get_default();
+    if (control == nullptr) return false;
+    return ec_split::address_range_within(
+        local_addr, object_bytes, control->get_buffer(),
+        ::FarLib::get_config().client_buffer_size);
+}
+
 inline EntryState ConcurrentArrayCache::try_evict(
     ::FarLib::allocator::BlockHead *block, EvictBufferSet &buffer_set) {
     profile::count_evac_try_evict();
@@ -306,6 +319,20 @@ retry:
                 !ec_batch_uses_split(obj.size) && obj.size <= 4096 &&
                 ::FarLib::allocator::try_borrow_ec_write_source(
                     block, ft_config.ft_rmw_read_failure_fallback);
+            const bool split_direct_eligible =
+                ec_batch_candidate && ec_batch_uses_split(obj.size) &&
+                ec_split_direct_write_mr_eligible(block->get_object_ptr(),
+                                                  obj.size);
+            const bool split_direct_source =
+                split_direct_eligible &&
+                ::FarLib::allocator::try_borrow_ec_write_source(
+                    block, true);
+            if (split_direct_eligible && !split_direct_source) {
+                auto unlocked = lock_state;
+                unlocked.invalid = 0;
+                ASSERT(entry->cas_state_strong(lock_state, unlocked));
+                return BUSY;
+            }
             if (ft_config.ft_rmw_read_failure_fallback && ec_batch_candidate &&
                 buffer_set.direct_builder && !ec_batch_uses_split(obj.size) &&
                 obj.size <= 4096 && !direct_source) {
@@ -327,8 +354,12 @@ retry:
                 entry->set_six_pending_evict(old_state.dirty);
             if (!entry->cas_state_strong(lock_state, evict_state)) [[unlikely]] {
                 if (direct_source) ::FarLib::allocator::release_ec_write_source(block);
+                if (split_direct_source) ::FarLib::allocator::release_ec_write_source(block);
                 goto retry;
             }
+            if (split_direct_source)
+                ec_split_direct_write_borrowed_.fetch_add(
+                    1, std::memory_order_relaxed);
             record_backup_group_eviction(obj.size, old_state.dirty);
             record_logical_object_eviction(*entry, obj.size,
                                            old_state.dirty);
@@ -340,7 +371,7 @@ retry:
             const bool ec_batch_grouped =
                 ec_batch_candidate &&
                 stage_ec_batch_object(buffer_set, block->get_object_ptr(), obj.size, entry,
-                                      behavior_group);
+                                      behavior_group, split_direct_source);
             // Diagnostics only: candidate true, but staging/grouping failed.
             if (ec_batch_candidate && !ec_batch_grouped) {
                 ec_diag_stage_failed_.fetch_add(1, std::memory_order_relaxed);
@@ -430,6 +461,16 @@ retry:
             ec_batch_uses_split(obj.size) &&
             reuse_ec_recovery_endpoint_is_dead(entry->remote_addr(), obj.size);
         if (old_state.dirty || repair_split_backup) {
+            const bool split_direct_eligible =
+                inclusive_ft_config.is_ec_batch_mode() && !recomputable &&
+                ec_batch_uses_split(obj.size) &&
+                ec_split_direct_write_mr_eligible(block->get_object_ptr(),
+                                                  obj.size);
+            const bool split_direct_source =
+                split_direct_eligible &&
+                ::FarLib::allocator::try_borrow_ec_write_source(
+                    block, true);
+            if (split_direct_eligible && !split_direct_source) return BUSY;
             if (old_state.dirty) profile::count_evac_try_evict_marked_dirty();
             else profile::count_evac_try_evict_marked_clean();
             uint64_t remote_addr = entry->remote_addr();
@@ -439,8 +480,11 @@ retry:
                 // case: the failed WRITE may have partially modified a
                 // healthy slot, so no old remote bytes are trusted.
                 transition_state.invalid = 1;
-                if (!entry->cas_state_weak(old_state, transition_state))
+                if (!entry->cas_state_weak(old_state, transition_state)) {
+                    if (split_direct_source)
+                        ::FarLib::allocator::release_ec_write_source(block);
                     goto retry;
+                }
                 if (entry->has_remote_backup_reservation()) {
                     entry->set_remote_backup_reservation(false);
                     release_remote_backup_budget(obj.size);
@@ -463,8 +507,13 @@ retry:
             if (six_dirty_routing_enabled())
                 entry->set_six_pending_evict(old_state.dirty);
             if (!entry->cas_state_weak(transition_state, new_state)) [[unlikely]] {
+                if (split_direct_source)
+                    ::FarLib::allocator::release_ec_write_source(block);
                 goto retry;
             }
+            if (split_direct_source)
+                ec_split_direct_write_borrowed_.fetch_add(
+                    1, std::memory_order_relaxed);
             const auto &ft_config = ::FarLib::get_config();
             // EC (ft_method=ec_batch): a dirty object is re-homed into a fresh
             // group slot instead of being rewritten in place, so the RS(4,2)
@@ -485,7 +534,7 @@ retry:
             const bool ec_batch_grouped =
                 ec_batch_candidate &&
                 stage_ec_batch_object(buffer_set, block->get_object_ptr(), obj.size, entry,
-                                      behavior_group);
+                                      behavior_group, split_direct_source);
             if (ec_batch_candidate && !ec_batch_grouped) {
                 ec_diag_stage_failed_.fetch_add(1, std::memory_order_relaxed);
                 ERROR("ec_batch: candidate staging failed; refusing flat fallback");

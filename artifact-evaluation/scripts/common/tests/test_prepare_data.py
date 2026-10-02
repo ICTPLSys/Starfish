@@ -147,7 +147,28 @@ class DataPreparationTests(unittest.TestCase):
             data.register_inputs(site, {"llama": "/new/model", "bfs": "/new/graph"})
             actual = json.loads(site.read_text())
             self.assertEqual(actual["memory_host"], "my-memory")
-            self.assertEqual(actual["inputs"], {"llama": "/existing/model", "bfs": "/new/graph"})
+            self.assertEqual(actual["inputs"], {
+                "llama": "/existing/model", "bfs": "/new/graph", "nq": "/new/graph"})
+
+    def test_graph_registration_preserves_explicit_nq_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory) / "site.json"
+            site.write_text(json.dumps({"inputs": {"nq": "/existing/nq"}}))
+            supplied = {"bfs": "/shared/friendster/graph"}
+            data.register_inputs(site, supplied)
+            actual = json.loads(site.read_text())
+            self.assertEqual(actual["inputs"]["bfs"], supplied["bfs"])
+            self.assertEqual(actual["inputs"]["nq"], "/existing/nq")
+            self.assertNotIn("nq", supplied)
+
+    def test_graph_registration_uses_preserved_bfs_for_default_nq(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory) / "site.json"
+            site.write_text(json.dumps({"inputs": {"bfs": "/existing/graph"}}))
+            data.register_inputs(site, {"bfs": "/new/graph"})
+            actual = json.loads(site.read_text())
+            self.assertEqual(actual["inputs"], {
+                "bfs": "/existing/graph", "nq": "/existing/graph"})
 
 
 if __name__ == "__main__":

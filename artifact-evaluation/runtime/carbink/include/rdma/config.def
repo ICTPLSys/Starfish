@@ -56,6 +56,11 @@ CONFIG(size_t, ft_ec_parity_shards, 2)
 // allocations until a live endpoint is reported dead.  -1 keeps the legacy
 // no-standby placement policy.
 CONFIG(int, ft_standby_endpoint, -1)
+CONFIG(int, ft_standby_endpoint2, -1)
+CONFIG(size_t, ft_background_rebuild_failures, 1)
+// Opt-in fault-safe Carbink compaction and full background reconstruction.
+CONFIG(bool, ft_background_rebuild, false)
+CONFIG(size_t, ft_rebuild_bandwidth_mbps, 2500)
 
 // Configure of Server & Client
 CONFIG(uint16_t, qp_count, 1)

@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <deque>
 
@@ -457,6 +458,8 @@ private:
     std::atomic<size_t> pending_peer_send_total{0};
     size_t peer_endpoint_count = 0;
     size_t local_server_index = 0;
+    bool peer_failure_recovery_enabled_ = false;
+    std::unique_ptr<std::atomic<uint8_t>[]> peer_alive_;
     static constexpr size_t kWorkerTaskBatchPopLimit = 8;
 
     enum class RpcTaskKind : uint8_t {
@@ -494,9 +497,12 @@ private:
         uint64_t parity_peer1_post_time_ns = 0;
         uint64_t parity_peer0_ack_time_ns = 0;
         uint64_t parity_peer1_ack_time_ns = 0;
+        bool failed = false;
+        uint32_t failure_status = rdma::kEC2PCStatusOK;
     };
     std::mutex server_ec2pc_track_mutex_;
     std::unordered_map<uint64_t, ServerEC2PCTrackedRequest> server_ec2pc_track_;
+    std::unordered_set<uint64_t> server_ec2pc_canceled_;
 
     std::atomic<uint64_t> probe_parity_bind_generation_{0};
 
@@ -1483,7 +1489,128 @@ public:
                                   << work_completion.wr_id << std::dec
                                   << " qp_num=" << work_completion.qp_num
                                   << std::endl;
-                        ERROR("server peer completion failed");
+                        if (peer_recovery_enabled()) {
+                            size_t failed_peer =
+                                std::numeric_limits<size_t>::max();
+                            auto *rpc_send = reinterpret_cast<PeerRpcSendSlot *>(
+                                work_completion.wr_id);
+                            if (rpc_send != nullptr &&
+                                rpc_send->magic == 0xEC2C2002u) {
+                                failed_peer = rpc_send->peer_idx;
+                            } else {
+                                auto *ack_send =
+                                    reinterpret_cast<PeerAckSendSlot *>(
+                                        work_completion.wr_id);
+                                if (ack_send != nullptr &&
+                                    ack_send->magic == 0xEC2C2006u) {
+                                    failed_peer = ack_send->peer_idx;
+                                } else {
+                                    auto *lane_send =
+                                        reinterpret_cast<PeerLaneSendSlot *>(
+                                            work_completion.wr_id);
+                                    if (lane_send != nullptr &&
+                                        lane_send->magic == 0xEC2C2003u) {
+                                        failed_peer = lane_send->peer_idx;
+                                    } else {
+                                        auto *probe_send =
+                                            reinterpret_cast<
+                                                ProbeParityBatchSendSlot *>(
+                                                work_completion.wr_id);
+                                        if (probe_send != nullptr &&
+                                            probe_send->magic == 0xEC2C2005u) {
+                                            failed_peer = probe_send->peer_idx;
+                                        } else {
+                                            auto *rpc_recv =
+                                                reinterpret_cast<PeerRpcRecvSlot *>(
+                                                    work_completion.wr_id);
+                                            if (rpc_recv != nullptr &&
+                                                rpc_recv->magic == 0xEC2C2001u) {
+                                                failed_peer = rpc_recv->peer_idx;
+                                            } else {
+                                                auto *payload_recv =
+                                                    reinterpret_cast<
+                                                        PeerPayloadRecvSlot *>(
+                                                        work_completion.wr_id);
+                                                if (payload_recv != nullptr &&
+                                                    payload_recv->magic ==
+                                                        0xEC2C2004u) {
+                                                    failed_peer =
+                                                        payload_recv->peer_idx;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (failed_peer < peer_endpoint_count) {
+                                mark_peer_dead(
+                                    failed_peer,
+                                    rdma::kEC2PCStatusPeerDead);
+                                // Error CQEs may carry an undefined opcode.
+                                // Retire the slot from its owner class and
+                                // never interpret a failed receive buffer.
+                                auto *failed_rpc_send =
+                                    reinterpret_cast<PeerRpcSendSlot *>(
+                                        work_completion.wr_id);
+                                if (failed_rpc_send != nullptr &&
+                                    failed_rpc_send->magic == 0xEC2C2002u) {
+                                    size_t reclaimed =
+                                        reclaim_inflight_peer_send_slots_upto(
+                                            static_cast<size_t>(
+                                                failed_rpc_send->queue_index),
+                                            failed_rpc_send);
+                                    if (reclaimed == 0)
+                                        release_peer_send_slot(*failed_rpc_send);
+                                    continue;
+                                }
+                                auto *failed_ack_send =
+                                    reinterpret_cast<PeerAckSendSlot *>(
+                                        work_completion.wr_id);
+                                if (failed_ack_send != nullptr &&
+                                    failed_ack_send->magic == 0xEC2C2006u) {
+                                    failed_ack_send->post_time_ns = 0;
+                                    failed_ack_send->in_use.store(
+                                        false, std::memory_order_release);
+                                    continue;
+                                }
+                                auto *failed_lane_send =
+                                    reinterpret_cast<PeerLaneSendSlot *>(
+                                        work_completion.wr_id);
+                                if (failed_lane_send != nullptr &&
+                                    failed_lane_send->magic == 0xEC2C2003u) {
+                                    failed_lane_send->in_use.store(
+                                        false, std::memory_order_release);
+                                    continue;
+                                }
+                                auto *failed_probe_send =
+                                    reinterpret_cast<ProbeParityBatchSendSlot *>(
+                                        work_completion.wr_id);
+                                if (failed_probe_send != nullptr &&
+                                    failed_probe_send->magic == 0xEC2C2005u) {
+                                    (void)complete_probe_parity_batch_send_slot(
+                                        *failed_probe_send,
+                                        steady_clock_now_ns());
+                                    continue;
+                                }
+                                auto *failed_rpc_recv =
+                                    reinterpret_cast<PeerRpcRecvSlot *>(
+                                        work_completion.wr_id);
+                                if (failed_rpc_recv != nullptr &&
+                                    failed_rpc_recv->magic == 0xEC2C2001u)
+                                    continue;
+                                auto *failed_payload_recv =
+                                    reinterpret_cast<PeerPayloadRecvSlot *>(
+                                        work_completion.wr_id);
+                                if (failed_payload_recv != nullptr &&
+                                    failed_payload_recv->magic == 0xEC2C2004u)
+                                    continue;
+                                continue;
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            ERROR("server peer completion failed");
+                        }
                     }
                     if (work_completion.opcode == IBV_WC_SEND) {
                         ctr_peer_send_wc.fetch_add(1,
@@ -3997,9 +4124,18 @@ private:
         completion_msg_type = rdma::EC2PC_MSG_ACK_BATCH;
         target_endpoint = 0;
         request_start_time_ns = 0;
+        if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+            return false;
         std::lock_guard<std::mutex> lock(server_ec2pc_track_mutex_);
         auto it = server_ec2pc_track_.find(wr_id);
         if (it == server_ec2pc_track_.end()) {
+            if (peer_recovery_enabled()) {
+                auto canceled = server_ec2pc_canceled_.find(wr_id);
+                if (canceled != server_ec2pc_canceled_.end()) {
+                    server_ec2pc_canceled_.erase(canceled);
+                    return false;
+                }
+            }
             static std::atomic<uint64_t> peer_ack_track_miss_seen{0};
             uint64_t miss_seq =
                 peer_ack_track_miss_seen.fetch_add(
@@ -4015,6 +4151,8 @@ private:
             }
             return false;
         }
+        if (it->second.failed)
+            return false;
         uint64_t now_ns = steady_clock_now_ns();
         uint64_t anchor_ns = it->second.fanout_ready_time_ns != 0
                                  ? it->second.fanout_ready_time_ns
@@ -4158,6 +4296,21 @@ private:
         }
         return true;
     }
+
+    bool peer_recovery_enabled() const {
+        return peer_failure_recovery_enabled_;
+    }
+    bool peer_is_alive(size_t peer_idx) const {
+        if (peer_idx >= peer_endpoint_count) return false;
+        if (!peer_failure_recovery_enabled_ || peer_alive_ == nullptr)
+            return true;
+        return peer_alive_[peer_idx].load(std::memory_order_acquire) != 0;
+    }
+    bool mark_peer_dead(
+        size_t peer_idx, uint32_t status = rdma::kEC2PCStatusPeerDead);
+    void drop_unposted_peer_work(size_t peer_idx);
+    void fail_tracked_requests_for_peer(
+        size_t peer_idx, uint32_t status = rdma::kEC2PCStatusPeerDead);
 
     size_t rpc_task_worker_idx(const rdma::EC2PCRpcMessage &msg) const {
         if (rpc_worker_count <= 1) {
@@ -4880,6 +5033,8 @@ private:
     void post_peer_payload_recv_slot(PeerPayloadRecvSlot &slot);
 
     void release_peer_send_slot(PeerRpcSendSlot &slot);
+    void release_probe_parity_batch_owner(
+        BatchRpcRecvSlot *owner, uint64_t generation);
 
     size_t reclaim_inflight_peer_send_slots_upto(size_t peer_idx,
                                                  PeerRpcSendSlot *completed_slot);
@@ -5135,6 +5290,18 @@ private:
         peer_endpoint_count = config.all_server_addr_list.empty()
                                   ? static_cast<size_t>(config.server_count)
                                   : config.all_server_addr_list.size();
+        const char *recovery_env = std::getenv("FARLIB_CARBINK_RECOVERY");
+        peer_failure_recovery_enabled_ =
+            recovery_env != nullptr && std::strcmp(recovery_env, "1") == 0;
+        peer_alive_.reset();
+        if (peer_endpoint_count != 0) {
+            peer_alive_ = std::make_unique<std::atomic<uint8_t>[]>(
+                peer_endpoint_count);
+            for (size_t peer_idx = 0; peer_idx < peer_endpoint_count;
+                 ++peer_idx)
+                peer_alive_[peer_idx].store(
+                    1, std::memory_order_relaxed);
+        }
         local_server_index =
             peer_endpoint_count == 0
                 ? 0
@@ -5657,6 +5824,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(server_ec2pc_track_mutex_);
             server_ec2pc_track_.clear();
+            server_ec2pc_canceled_.clear();
         }
         if (peer_rpc_mr != nullptr) {
             ibv_dereg_mr(peer_rpc_mr);
@@ -5688,6 +5856,8 @@ private:
         probe_parity_batch_send_depth = 0;
         probe_parity_batch_pending_depth = 0;
         peer_ack_send_depth = 0;
+        peer_alive_.reset();
+        peer_failure_recovery_enabled_ = false;
         peer_lane_pending_mem.reset();
         probe_parity_batch_pending_mem.reset();
         peer_lane_mutexes.reset();

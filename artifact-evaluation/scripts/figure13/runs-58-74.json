@@ -1,0 +1,36 @@
+{
+  "schema": "figure13-native-runs-v1",
+  "runs": [
+    {
+      "system": "hydra",
+      "scenario": "1-node",
+      "result": "/home/xiayanwen/research/hydra-kv-recovery-20260930/runs/hydra-background-v2-r1/revalidation-background-result.json"
+    },
+    {
+      "system": "carbink",
+      "scenario": "1-node",
+      "result": "/mnt/nfs/xiayanwen/research/carbink-kv-recovery-20260930/runs/carbink-background-v11-r1/run-result.json"
+    },
+    {
+      "system": "starfish",
+      "scenario": "1-node",
+      "result": "/home/xiayanwen/research/starfish-kv-recovery-20260930/runs/background-fault-v13-fast-r1/recovery-result.json"
+    },
+    {
+      "system": "starfish",
+      "scenario": "2-node",
+      "result": "/home/xiayanwen/research/starfish-kv-two-node-20261001/runs/dual-background-v1-r1/dual-result.json"
+    },
+    {
+      "system": "carbink",
+      "scenario": "2-node",
+      "result": "/mnt/nfs/xiayanwen/research/carbink-kv-two-node-20261001/runs/carbink-dual-v12-r1/run-result.json"
+    },
+    {
+      "system": "hydra",
+      "scenario": "2-node",
+      "result": "/home/xiayanwen/research/hydra-kv-two-node-20261001/runs/hydra-dual-v1-r2/revalidated-dual-result.json"
+    }
+  ],
+  "pending": []
+}

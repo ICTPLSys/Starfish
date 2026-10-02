@@ -52,7 +52,7 @@ def _runtime_keys(system: str) -> set[str]:
 
 
 def _system(recipe: Path) -> str:
-    if recipe.name in {"recomputable_ec.config", "starfish_ec.config"}:
+    if recipe.name == "recomputable_ec.config":
         return "starfish"
     return recipe.stem
 

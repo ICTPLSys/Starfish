@@ -498,14 +498,14 @@ inline void ConcurrentArrayCache::evacuate_work() {
         const size_t evict_workers = get_evict_worker_count(configured_mark_workers);
         const size_t mark_workers = configured_mark_workers;
         // Emit the complete record together while other workers start.
-        std::fprintf(stderr,
-                     "\nruntime.exclusive_owned_batch=%d mark_workers=%zu evict_workers=%zu\n",
+        std::fprintf(stdout,
+                     "runtime.exclusive_owned_batch=%d mark_workers=%zu evict_workers=%zu\n",
                      static_cast<int>(optimized_enabled &&
                          optimized_legacy_exclusive_pipeline_enabled() &&
                          exclusive_owned_batch_reclaim_enabled()),
                      mark_workers, evict_workers);
         if (::FarLib::get_config().is_hydra_mode()) {
-            std::fprintf(stderr, "\nhydra.reclaim batch_regions=%zu early_notify=%d\n",
+            std::fprintf(stdout, "hydra.reclaim batch_regions=%zu early_notify=%d\n",
                          static_cast<size_t>(hydra_owned_reclaim_batch_limit()),
                          static_cast<int>(hydra_reclaim_notify_enabled()));
         }
@@ -1520,7 +1520,12 @@ inline void ConcurrentArrayCache::evict_ready_worker_logic(
                                  ::FarLib::allocator::BlockHead *b) {
                     return this->try_evict(b, buffer_set);
                 };
+                const size_t used_before = region->used_count;
                 region->evict(evict);
+                alloc_reclaim_rate_diag::record_owned_pass(
+                    alloc_reclaim_rate_diag::ReclaimKind::Evict,
+                    used_before, region->used_count,
+                    ::FarLib::allocator::get_bin_size(region->bin));
                 task.epoch = region_epoch;
                 processed_tasks.push_back(task);
             }
@@ -1575,7 +1580,12 @@ inline void ConcurrentArrayCache::evict_ready_worker_logic(
                 deferred_tasks.push_back(task);
                 continue;
             }
+            const size_t used_before = region->used_count;
             region->evict(gc);
+            alloc_reclaim_rate_diag::record_owned_pass(
+                alloc_reclaim_rate_diag::ReclaimKind::GC,
+                used_before, region->used_count,
+                ::FarLib::allocator::get_bin_size(region->bin));
             if (region->marked_list == nullptr) {
                 region->note_evict_drained_epoch(region_epoch);
                 // Read before publication: an allocating mutator can acquire

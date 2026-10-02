@@ -141,9 +141,17 @@ def ensure_tools(deps):
 
 def register_inputs(site, inputs):
     """Fill only empty/example paths. Never replace a user's configured input."""
+    # BFS and NQ use the same prepared Friendster shards unless NQ was
+    # explicitly configured. Record the alias for non-default data directories.
+    inputs = dict(inputs)
     template = HERE / "site.eight-server.example.json"
     document = json.loads(site.read_text() if site.exists() else template.read_text())
     current = document.setdefault("inputs", {})
+    if "bfs" in inputs:
+        existing_bfs = current.get("bfs")
+        graph = (existing_bfs if existing_bfs and not existing_bfs.startswith("/path/to/")
+                 else inputs["bfs"])
+        inputs.setdefault("nq", graph)
     for key, value in inputs.items():
         if current.get(key) and not current[key].startswith("/path/to/"):
             if current[key] != value:

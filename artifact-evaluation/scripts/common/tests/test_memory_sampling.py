@@ -24,6 +24,13 @@ class MemorySampling(unittest.TestCase):
                     env = client_environment(app, SITE, system)
                     self.assertEqual(env["FARLIB_REMOTE_MEMORY_SAMPLES"], "1")
                     self.assertEqual(env["FARLIB_REMOTE_MEMORY_OBSERVER_CPU"], "6")
+                    self.assertEqual(
+                        env["FARLIB_REMOTE_MEMORY_SAMPLING_PROFILE"],
+                        "bfs_work_3s" if app == "bfs" else "work_10_20_30_40_50s")
+                    self.assertEqual(
+                        env["FARLIB_REMOTE_MEMORY_WORK_ORIGIN"],
+                        "kvs_request_start" if app in ("kv-b", "kv-a", "kv-s")
+                        else "profile_start_work")
                     self.assertNotIn("FARLIB_KVS_MEMORY_SAMPLES", env)
                     self.assertNotIn("FARLIB_KVS_MEMORY_METRIC", env)
 
@@ -40,10 +47,14 @@ class MemorySampling(unittest.TestCase):
             "FARLIB_REMOTE_MEMORY_SAMPLES": "0",
             "FARLIB_REMOTE_MEMORY_OBSERVER_CPU": "99",
             "FARLIB_BENCHMARK_START_MONOTONIC_NS": "1",
+            "FARLIB_REMOTE_MEMORY_SAMPLING_PROFILE": "stale_profile",
+            "FARLIB_REMOTE_MEMORY_WORK_ORIGIN": "kvs_request_start",
         }
         env = client_process_environment("bfs", SITE, "hydra", stale)
         self.assertEqual(env["FARLIB_REMOTE_MEMORY_SAMPLES"], "1")
         self.assertEqual(env["FARLIB_REMOTE_MEMORY_OBSERVER_CPU"], "6")
+        self.assertEqual(env["FARLIB_REMOTE_MEMORY_SAMPLING_PROFILE"], "bfs_work_3s")
+        self.assertEqual(env["FARLIB_REMOTE_MEMORY_WORK_ORIGIN"], "profile_start_work")
         self.assertNotIn("FARLIB_KVS_MEMORY_SAMPLES", env)
         self.assertNotIn("FARLIB_BENCHMARK_START_MONOTONIC_NS", env)
 

@@ -5,7 +5,8 @@ set -euo pipefail
 # The build directory is deliberately separate for each system so that a
 # reviewer cannot accidentally reuse a CMake cache from another variant.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-SYSTEM="${STARFISH_SYSTEM:-nonft}"
+ORIGINAL_ARGS=("$@")
+SYSTEM="${STARFISH_SYSTEM:-all}"
 RUNTIME_DIR=""
 BUILD_DIR=""
 JOBS="${JOBS:-4}"
@@ -19,7 +20,7 @@ usage() {
 Usage: build.sh [options]
 
 Options:
-  --system NAME       runtime variant (default: nonft)
+  --system NAME       runtime variant or all (default: all)
   --runtime-dir DIR   explicit runtime source directory
   --build-dir DIR     explicit CMake build directory
   --jobs N             parallel build jobs (default: 4)
@@ -46,6 +47,17 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ "$SYSTEM" = all ]]; then
+  [[ -z "$RUNTIME_DIR" && -z "$BUILD_DIR" && "$BUILD_TESTS" = OFF ]] || {
+    echo 'custom runtime/build directories and tests require --system NAME' >&2
+    exit 2
+  }
+  for runtime in nonft starfish hydra carbink; do
+    bash "$ROOT/scripts/common/build.sh" "${ORIGINAL_ARGS[@]}" --system "$runtime"
+  done
+  exit 0
+fi
 
 case "$SYSTEM" in
   nonft|starfish|carbink|hydra) ;;
@@ -161,7 +173,12 @@ if [[ "$SYSTEM" = hydra || "$SYSTEM" = carbink ]]; then
 fi
 for target in "${TARGETS[@]}"; do
   case "$target" in
-    mg|test_mg_iterator_boundaries) APP_OPTIONS+=(-DFARLIB_BUILD_MG=ON) ;;
+    mg|test_mg_iterator_boundaries)
+      APP_OPTIONS+=(-DFARLIB_BUILD_MG=ON)
+      if [[ "$SYSTEM" = starfish ]]; then
+        APP_OPTIONS+=(-DMG_UTHREAD_COUNT=48 -DMG_OBJECT_ALLOCATION_BYTES=8192)
+      fi
+      ;;
     kvs_throughput) APP_OPTIONS+=(-DFARLIB_BUILD_KVS=ON) ;;
     nhop_graph) APP_OPTIONS+=(-DFARLIB_BUILD_NQ=ON) ;;
     bandwidth_microbenchmark|bandwidth_microbenchmark_512|object_size|object_size_512)

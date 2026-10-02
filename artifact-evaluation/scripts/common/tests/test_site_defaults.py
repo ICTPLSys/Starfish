@@ -46,7 +46,7 @@ class SiteDefaults(unittest.TestCase):
         self.assertEqual(site["memory_addr"], "10.208.130.76")
         self.assertEqual(site["server_port"], 1893)
         self.assertEqual(site["inputs"]["llama"],
-                         "/data/starfish-ae/llama/llama2_7b_chat.bin")
+                         str(AE / "data/inputs/llama/llama2_7b_chat.bin"))
         self.assertEqual(site["memory_server_bins"]["starfish"],
                          str(AE / "build/starfish/server"))
 
@@ -137,9 +137,52 @@ class SiteDefaults(unittest.TestCase):
             plan = json.loads(output.getvalue())
             self.assertEqual(len({item["memory_host"] for item in plan["memory_endpoints"]}), 7)
             self.assertEqual(plan["client_command"][:2], ["numactl", "--membind=0"])
+            self.assertEqual(plan["numa_node"], 0)
+            self.assertEqual(plan["compute_memory_policy"], "bind")
+            self.assertEqual(plan["nic_numa_node"], 0)
+            for endpoint in plan["memory_endpoints"]:
+                node = endpoint["memory_numa_node"]
+                self.assertIn(f"--membind={node}", endpoint["start_command"])
+                self.assertIn(f"--cpunodebind={node}", endpoint["start_command"])
             self.assertEqual(plan["memory_endpoints"][0]["memory_numa_node"], 1)
             self.assertEqual(plan["memory_endpoints"][5]["memory_ib_device"], "mlx5_0")
             self.assertFalse(args.out.exists())
+
+    def test_only_graph_clients_omit_numa_binding(self):
+        sites = fast_check.case_sites(
+            AE / "scripts/common/site.eight-server.example.json", dry_run=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            for system, site in sites.items():
+                site_path = Path(tmp) / f"{system}.json"
+                site_path.write_text(json.dumps(site))
+                for app in ("llama", "bfs", "mg", "wordcount", "kv-b", "kv-a", "kv-s", "nq"):
+                    with self.subTest(system=system, app=app):
+                        args = fast_check.case_args(
+                            "llama-starfish-recovery-25", system, 0, site_path,
+                            Path(tmp) / f"{app}-{system}", 1800, dry_run=True)
+                        args.app = app
+                        args.recover_endpoint = None
+                        args.capture_chat = False
+                        args.reference_chat = None
+                        with patch.object(run_case, "ssh") as ssh, \
+                                contextlib.redirect_stdout(io.StringIO()) as output:
+                            self.assertEqual(run_case.run(args), 0)
+                        ssh.assert_not_called()
+                        plan = json.loads(output.getvalue())
+                        if app in ("bfs", "nq"):
+                            self.assertEqual(plan["client_command"][0], plan["client_bin"])
+                            self.assertIsNone(plan["numa_node"])
+                            self.assertEqual(plan["compute_memory_policy"], "inherited")
+                        else:
+                            self.assertEqual(plan["client_command"][:2],
+                                             ["numactl", "--membind=0"])
+                            self.assertEqual(plan["numa_node"], 0)
+                            self.assertEqual(plan["compute_memory_policy"], "bind")
+                        for endpoint in plan["memory_endpoints"]:
+                            node = endpoint["memory_numa_node"]
+                            self.assertIn(f"--membind={node}", endpoint["start_command"])
+                            self.assertIn(f"--cpunodebind={node}", endpoint["start_command"])
+                        self.assertFalse(args.out.exists())
 
     def test_ib_port_override_reaches_the_generated_runtime_config(self):
         site = site_defaults.resolve({"memory_ip": "10.208.130.76",

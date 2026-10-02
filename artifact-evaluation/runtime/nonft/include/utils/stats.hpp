@@ -848,8 +848,17 @@ inline bool suspend_work() {
     }
     return false;
 }
+
+// Installed by the cache after its remote-memory accessor is ready. The
+// callbacks only publish a timestamped boundary event; they must not sample
+// or perform output on the Work thread.
+inline void *benchmark_memory_observer_context = nullptr;
+inline void (*benchmark_memory_begin_observer)(void *) = nullptr;
+inline void (*benchmark_memory_end_observer)(void *) = nullptr;
 inline void start_work() {
     assert(!working);
+    if (benchmark_memory_begin_observer)
+        benchmark_memory_begin_observer(benchmark_memory_observer_context);
     work_traffic::begin();
     working = true;
     global_start_cycles = get_cycles();
@@ -860,6 +869,8 @@ inline void end_work() {
     work_phase_active.store(false, std::memory_order_release);
     working = false;
     global_cycles = get_cycles() - global_start_cycles;
+    if (benchmark_memory_end_observer)
+        benchmark_memory_end_observer(benchmark_memory_observer_context);
     work_traffic::print(work_traffic::end());
 }
 inline bool is_working() {

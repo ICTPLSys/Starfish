@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 from datetime import datetime, timezone
 import json
 import math
@@ -26,9 +27,11 @@ CONTEXT_FIELDS = log_contract.CONTEXT_FIELDS
 COMMON_FIELDS = (
     "source_type", "source", "exit_status", "correctness", "run_id", "workload",
     "environment", "workload_id", "ratio", "app_workers", "repeat", "phase", "time_origin",
+    "comparison_kind", "failure_scope", "source_validation",
 )
 RECOVERY_FIELDS = (
     "scenario", "system", "recovery_s", "failure_elapsed_s", "recovered_elapsed_s",
+    "rebuild_start_elapsed_s", "recovery_definition",
 ) + COMMON_FIELDS
 TRACE_FIELDS = (
     "system", "elapsed_s", "throughput_ops_per_s", "event", "normalization",
@@ -36,6 +39,7 @@ TRACE_FIELDS = (
     "original_window_start_s", "original_window_end_s", "completed_ops",
     "original_failure_elapsed_s", "original_recovered_elapsed_s",
     "reference_run_id", "reference_source", "sample_kind", "window_scope", "original_time_origin",
+    "recovery_definition", "original_rebuild_start_elapsed_s",
 ) + COMMON_FIELDS
 
 
@@ -141,24 +145,108 @@ def base_row(run):
     row = {key: run[key] for key in CONTEXT_FIELDS}
     row.update(source_type="measured", source=run["_source"], exit_status="0",
                correctness="pass", run_id=run["run_id"],
-               system=log_contract.SYSTEMS[run["system"]], scenario=run["scenario"])
+               system=log_contract.SYSTEMS[run["system"]], scenario=run["scenario"],
+               comparison_kind=run.get("comparison_kind", "unspecified"),
+               failure_scope=run.get("failure_scope", "unspecified"),
+               source_validation=run.get("source_validation", "verified_explicit_protocol"))
     return row
 
 
 def collect_rows(logs_root, *, pattern="*.log", ratio=25, repeat=1,
-                 trace_scenario="1-node", failure_at_s=20.0):
+                 trace_scenario="1-node", failure_at_s=20.0, panels="both"):
+    results, samples = read_logs(logs_root, pattern)
+    return collect_records(results, samples, ratio=ratio, repeat=repeat,
+                           trace_scenario=trace_scenario, failure_at_s=failure_at_s,
+                           panels=panels)
+
+
+def collect_native(result_paths, *, ratio=25, repeat=1, trace_scenario="1-node",
+                   failure_at_s=20.0, steady_before_s=10.0, panels="both"):
+    if __package__:
+        from .raw_runs import read_run
+    else:
+        from raw_runs import read_run
+    results, samples, details = {}, {}, {}
+    site_indexed = False
+    source_kinds = set()
+    for path in result_paths:
+        run, windows, evidence = read_run(Path(path), steady_before_s=steady_before_s)
+        site_input = (
+            evidence.get("adapter") == "figure13.site_runs"
+            or evidence.get("source_type") == "site_result_json"
+        )
+        source_kinds.add(site_input)
+        site_indexed = site_indexed or site_input
+        run.update(
+            comparison_kind="diagnostic",
+            failure_scope="logical_service_process",
+            source_validation=(
+                "verified_site_evidence" if site_input
+                else "verified_native_evidence"
+            ),
+        )
+        # Shared workload identity does not imply identical runtime resources.
+        # Carbink has additional compaction workers. Preserve the full native
+        # identity/placement, but compare only identical workload + host fields.
+        payload = evidence["workload_id_payload"]
+        common_payload = {key: value for key, value in payload.items()
+                          if key not in ("app_cpus", "background_cpus")}
+        evidence["native_workload_id"] = run["workload_id"]
+        run["workload_id"] = hashlib.sha256(json.dumps(
+            common_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        evidence["comparison_workload_payload"] = common_payload
+        if run["run_id"] in results:
+            raise ValueError(f"duplicate selected native run_id: {run['run_id']}")
+        results[run["run_id"]] = run
+        samples[run["run_id"]] = windows
+        details[run["run_id"]] = evidence
+    if len(source_kinds) > 1:
+        raise ValueError("do not mix historical native results and new site results")
+    recovery, trace, info = collect_records(
+        results, samples, ratio=ratio, repeat=repeat, trace_scenario=trace_scenario,
+        failure_at_s=failure_at_s, native=True, indexed=site_indexed, panels=panels)
+    info.update(input_format="native_recovery_result", native_runs=details,
+                comparison_kind="diagnostic",
+                recovery_definition="background_start_to_done",
+                workload_id_scope="same workload and hosts; CPU placement retained per run, not equated",
+                placements={name: {key: record["workload_id_payload"][key]
+                                   for key in ("app_cpus", "background_cpus")
+                                   if key in record["workload_id_payload"]}
+                            for name, record in details.items()},
+                note="Owned logical memory-service failures; not physical-node failure measurements.")
+    if site_indexed:
+        info["repeat_source"] = "figure13-site-result-v1"
+    return recovery, trace, info
+
+
+def collect_records(results, samples, *, ratio=25, repeat=1,
+                    trace_scenario="1-node", failure_at_s=20.0, native=False,
+                    indexed=False,
+                    panels="both"):
     if not 1 <= ratio <= 100 or repeat < 1:
         raise ValueError("ratio must be 1..100 and repeat must be positive")
     if trace_scenario not in log_contract.SCENARIOS:
         raise ValueError("unknown trace scenario")
     if not math.isfinite(failure_at_s) or failure_at_s < 0:
         raise ValueError("display failure anchor must be finite and nonnegative")
-    results, samples = read_logs(logs_root, pattern)
+    if panels not in ("both", "recovery", "throughput"):
+        raise ValueError("unknown panel selection")
+    if native and not indexed and repeat != 1:
+        raise ValueError("native result files are unindexed; --repeat cannot relabel them")
     selected = [run for run in results.values()
-                if run["ratio"] == ratio and run["repeat"] == repeat]
+                if run["ratio"] == ratio and (
+                    (indexed and run["repeat"] == repeat)
+                    or (native and not indexed and run["repeat"] == "unindexed")
+                    or (not native and run["repeat"] == repeat)
+                )]
+    if native and not indexed and len(selected) != len(results):
+        raise ValueError("explicit native result ratio does not match the selected ratio")
     if not selected:
         raise ValueError("no final Figure 13 records for selected ratio/repeat")
     context = {key: selected[0][key] for key in CONTEXT_FIELDS}
+    definitions = {run.get("recovery_definition", "failure_to_reconstruction") for run in selected}
+    if len(definitions) != 1:
+        raise ValueError("do not mix background duration and failure-to-completion definitions")
     recovery_runs, trace_runs = {}, {}
     for run in selected:
         if (run["exit_status"] != 0 or run["correctness"] != "pass"
@@ -168,11 +256,12 @@ def collect_rows(logs_root, *, pattern="*.log", ratio=25, repeat=1,
         if mismatched:
             raise ValueError(f"{run['run_id']}: mixed context: " + ", ".join(mismatched))
         key = run["scenario"], run["system"]
-        if run["panel"] in ("both", "recovery"):
+        if run["panel"] in ("both", "recovery") and panels != "throughput":
             if key in recovery_runs:
                 raise ValueError(f"duplicate recovery condition: {key}")
             recovery_runs[key] = run
-        if run["panel"] in ("both", "trace") and run["scenario"] == trace_scenario:
+        if (run["panel"] in ("both", "trace") and run["scenario"] == trace_scenario
+                and panels != "recovery"):
             if run["system"] in trace_runs:
                 raise ValueError(f"duplicate throughput condition: {key}")
             trace_runs[run["system"]] = run
@@ -181,10 +270,16 @@ def collect_rows(logs_root, *, pattern="*.log", ratio=25, repeat=1,
     for key in sorted(recovery_runs):
         run = recovery_runs[key]
         row = base_row(run)
+        definition = run.get("recovery_definition", "failure_to_reconstruction")
+        start = (run["rebuild_start_elapsed_s"] if definition == "background_start_to_done"
+                 else run["failure_elapsed_s"])
         row.update(
-            recovery_s=number(run["recovered_elapsed_s"] - run["failure_elapsed_s"]),
+            recovery_s=number(run["recovered_elapsed_s"] - start),
             failure_elapsed_s=number(run["failure_elapsed_s"]),
-            recovered_elapsed_s=number(run["recovered_elapsed_s"]))
+            recovered_elapsed_s=number(run["recovered_elapsed_s"]),
+            rebuild_start_elapsed_s=number(run["rebuild_start_elapsed_s"])
+                if "rebuild_start_elapsed_s" in run else "",
+            recovery_definition=definition)
         recovery_rows.append(row)
     if not recovery_rows and not trace_runs:
         raise ValueError("no records belong to the selected panels/scenario")
@@ -199,7 +294,9 @@ def collect_rows(logs_root, *, pattern="*.log", ratio=25, repeat=1,
     return recovery_rows, trace_rows, {
         "context": context, "trace_scenario": trace_scenario,
         "reference": reference, "time_alignment": "failure_aligned",
-        "display_failure_s": failure_at_s, "ratio": ratio, "repeat": repeat,
+        "display_failure_s": failure_at_s, "ratio": ratio,
+        "repeat": repeat if indexed else ("unindexed" if native else repeat),
+        "panels": panels,
     }
 
 
@@ -218,7 +315,10 @@ def build_trace_rows(runs, windows, reference, failure_at_s):
             time_alignment="failure_aligned", display_offset_s=number(offset),
             time_origin="failure_aligned_display", original_time_origin=run["time_origin"],
             original_failure_elapsed_s=number(run["failure_elapsed_s"]),
-            original_recovered_elapsed_s=number(run["recovered_elapsed_s"]))
+            original_recovered_elapsed_s=number(run["recovered_elapsed_s"]),
+            recovery_definition=run.get("recovery_definition", "failure_to_reconstruction"),
+            original_rebuild_start_elapsed_s=number(run["rebuild_start_elapsed_s"])
+                if "rebuild_start_elapsed_s" in run else "")
         previous_end = None
         for item in windows[system]:
             start, end = item["window_start_s"], item["window_end_s"]
@@ -254,6 +354,11 @@ def build_trace_rows(runs, windows, reference, failure_at_s):
         # Annotation only. It must not become a blank data point that breaks
         # the throughput line if recovery falls between sampling boundaries.
         event = dict(base)
+        if "rebuild_start_elapsed_s" in run:
+            event.update(elapsed_s=number(run["rebuild_start_elapsed_s"] + offset),
+                         throughput_ops_per_s="", event="rebuild_start", sample_kind="event")
+            rows.append(event)
+            event = dict(base)
         event.update(elapsed_s=number(run["recovered_elapsed_s"] + offset),
                      throughput_ops_per_s="", event="recovered", sample_kind="event")
         rows.append(event)
@@ -280,13 +385,20 @@ def write_csv(path, fields, rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--logs-root", type=Path)
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--manifest", type=Path, help="explicit six-condition native manifest or indexed batch runs.json")
+    inputs.add_argument("--logs-root", type=Path, help="explicit result/sample protocol logs")
+    inputs.add_argument("--run-result", type=Path, action="append",
+                        help="Select exact native recovery/revalidation JSON files; repeat per run.")
     parser.add_argument("--pattern", default="*.log")
     parser.add_argument("--ratio", type=int, default=25)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--trace-scenario", choices=log_contract.SCENARIOS, default="1-node")
     parser.add_argument("--failure-at-s", type=float, default=20,
                         help="display coordinate for aligned observed failures; not injection time")
+    parser.add_argument("--steady-before-s", type=float, default=10,
+                        help="Native input: measured pre-failure reference interval in seconds.")
+    parser.add_argument("--panels", choices=("both", "recovery", "throughput"), default="both")
     parser.add_argument("--output-dir", type=Path, default=AE_ROOT / "results/figure13" /
                         ("collected-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")))
     parser.add_argument("--show-log-format", action="store_true")
@@ -294,22 +406,47 @@ def main():
     if args.show_log_format:
         print(log_contract.__doc__)
         return 0
-    if args.logs_root is None:
-        parser.error("--logs-root is required unless --show-log-format is selected")
+    if args.logs_root is None and not args.run_result and args.manifest is None:
+        parser.error("--manifest, --logs-root or --run-result is required")
     try:
-        recovery, trace, info = collect_rows(
-            args.logs_root, pattern=args.pattern, ratio=args.ratio, repeat=args.repeat,
-            trace_scenario=args.trace_scenario, failure_at_s=args.failure_at_s)
+        manifest_path = args.manifest
+        if args.logs_root and (args.logs_root / "runs.json").is_file():
+            manifest_path = args.logs_root / "runs.json"
+        indexed = False
+        if manifest_path:
+            from inputs import load_manifest
+            manifest, entries, indexed = load_manifest(manifest_path, args.repeat)
+            args.run_result = [Path(e["result"]) for e in entries]
+        native_repeat = (
+            args.repeat
+            if indexed and manifest.get("_batch_schema") == "figure13-site-batch-v1"
+            else (1 if indexed else args.repeat)
+        )
+        options = dict(ratio=args.ratio, repeat=native_repeat, trace_scenario=args.trace_scenario,
+                       failure_at_s=args.failure_at_s, panels=args.panels)
+        if args.run_result:
+            recovery, trace, info = collect_native(args.run_result,
+                steady_before_s=args.steady_before_s, **options)
+        else:
+            recovery, trace, info = collect_rows(args.logs_root, pattern=args.pattern, **options)
+        if indexed:
+            for row in recovery + trace:
+                row["repeat"] = str(args.repeat)
+        if manifest_path:
+            info.update(manifest=str(manifest_path.resolve()), selected_repeat=args.repeat if indexed else None,
+                        repeat_source="batch-plan.json" if indexed else "historical_unindexed")
         args.output_dir.mkdir(parents=True, exist_ok=False)
         write_csv(args.output_dir / "figure13-recovery.csv", RECOVERY_FIELDS, recovery)
         write_csv(args.output_dir / "figure13-throughput.csv", TRACE_FIELDS, trace)
-        info.update(logs_root=str(args.logs_root.resolve()), log_pattern=args.pattern,
+        info.update(logs_root=str(args.logs_root.resolve()) if args.logs_root else None,
+                    run_results=[str(path.resolve()) for path in args.run_result or []],
+                    log_pattern=args.pattern,
                     recovery_rows=recovery, throughput_rows=trace)
         (args.output_dir / "collection.json").write_text(
             json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"wrote {len(recovery)} recovery rows and {len(trace)} trace/event rows to {args.output_dir}")
         return 0
-    except (OSError, ValueError, OverflowError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
         parser.exit(2, f"error: {exc}\n")
 
 

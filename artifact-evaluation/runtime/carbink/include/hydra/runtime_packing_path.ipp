@@ -49,6 +49,12 @@ inline int ConcurrentArrayCache::hydra_packing_root_enter() {
                           << std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()
                           << " includes_drain=1 includes_repack=1\n" << std::flush;
                 p->phase.store(hydra::RuntimePacking::Done, std::memory_order_seq_cst);
+                if (::FarLib::get_config().ft_background_rebuild) {
+                    std::ostringstream event;
+                    event << "carbink.runtime_packing_ready monotonic_ns="
+                          << ec_recovery_profile_now_ns();
+                    std::cout << (event.str() + "\n") << std::flush;
+                }
                 return -1;
             }
             continue;

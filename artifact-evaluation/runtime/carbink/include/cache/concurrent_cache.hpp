@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <deque>
 #include "cache/carbink/write_fence.hpp"
+#include "utils/read_owner_diag.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -47,6 +48,8 @@
 #include "cache/alloc/remote_allocator.hpp"
 #include "cache/alloc/ec_batch_write.hpp"
 #include "recovery/ec_read_recovery.hpp"
+#include "recovery/ec_background_rebuild.hpp"
+#include "cache/carbink/shadow_io.hpp"
 #include "recovery/ec_read_context.hpp"
 #include "recovery/ec_recovery_scratch.hpp"
 #include "cache/alloc/ec_split_buffers.hpp"
@@ -61,6 +64,7 @@
 #include "utils/signal.hpp"
 #include "utils/stats.hpp"
 #include "utils/uthreads.hpp"
+#include "utils/background_affinity.hpp"
 #include "cache/core/common/sharded_scope_counters.hpp"
 #include "utils/wait_trace.hpp"
 #include "utils/inclusive_reclaim_diag.hpp"
@@ -232,6 +236,8 @@ class ConcurrentArrayCache {
     };
     struct alignas(64) CarbinkWorkerCounters {
         CarbinkCounter drained, reclaimed, moved, rollback, claim_failed;
+        uint64_t shadow_durable = 0, shadow_quarantined = 0;
+        uint64_t shadow_moved_after_failure = 0;
     };
     std::unique_ptr<CarbinkQueue[]> carbink_queues_;
     std::unique_ptr<CarbinkWorkerCounters[]> carbink_counters_;
@@ -247,6 +253,7 @@ class ConcurrentArrayCache {
     std::unique_ptr<CarbinkWorkerLaunch[]> carbink_worker_launch_;
     void carbink_start_workers();
     void carbink_stop_workers();
+    void carbink_compact_work_shadow(size_t worker_id);
     void carbink_scan_work();
     void carbink_compact_work(size_t worker_id);
     void carbink_publish_ready(const ec_batch::EcGroupSendRecord &record);
@@ -264,8 +271,11 @@ class ConcurrentArrayCache {
     std::unique_ptr<hydra::WriteRing> carbink_write_ring_;
     std::unique_ptr<carbink::WriteFenceTable> carbink_write_fences_;
     hydra::RegisteredParity carbink_zero_page_{};
+    std::unique_ptr<hydra::RegisteredParity[]> carbink_recovery_data_;
+    std::atomic<uint64_t> carbink_safe_captures_{0}, carbink_safe_cancels_{0};
     void init_carbink_evict_buffers();
-    bool stage_carbink_span(void *local, FarObjectEntry *entry, size_t owner);
+    bool stage_carbink_span(void *local, FarObjectEntry *entry, size_t owner,
+                            bool *snapshot_canceled);
     void seal_carbink_group(size_t owner);
     void flush_carbink_writes(size_t owner);
     void flush_carbink_owner(size_t owner, bool drain = false);
@@ -316,6 +326,8 @@ public:
             ::FarLib::allocator::RegionPlacement::Unclassified,
         uint32_t requested_group_id = 0,
         uint32_t requested_behavior_group_id = 0) {
+        const uint64_t supply_alloc_begin =
+            alloc_reclaim_rate_diag::enabled() ? get_cycles() : 0;
         auto *wc_sample = wc_object_diag::find_object(obj.obj_id);
         const uint64_t wc_alloc_begin = wc_sample ? wc_object_diag::stamp() : 0;
         if (alloc_scope_checkpoint_enabled()) {
@@ -404,7 +416,8 @@ public:
         assert(obj == block->obj_meta_data);
         wc_object_diag::allocation_done(wc_sample, wc_alloc_begin);
         alloc_reclaim_rate_diag::record_allocation(
-            ::FarLib::allocator::get_bin_size(alloc_bin));
+            ::FarLib::allocator::get_bin_size(alloc_bin),
+            supply_alloc_begin ? get_cycles() - supply_alloc_begin : 0);
         return {block, ::FarLib::allocator::six_group::enabled() ||
                            ::FarLib::simple_region_budget::six_enabled()};
     }
@@ -655,6 +668,18 @@ private:
     // cluster intentionally has process lifetime after all fibres are joined.
     uthread::Cluster *background_cluster_ = nullptr;
     std::unique_ptr<UThread> master_evacuation_thread;
+    std::array<std::unique_ptr<UThread>, ec_background::kWorkers> background_rebuild_threads_;
+    uthread::Mutex background_rebuild_mutex_;
+    uthread::Condition background_rebuild_cond_;
+    std::atomic<bool> background_rebuild_stop_{false};
+    std::atomic<int> background_rebuild_failed_endpoint_{-1};
+    std::atomic<uint64_t> background_rebuild_redirected_reads_{0};
+    ec_background::SharedState background_rebuild_state_;
+    void start_background_rebuild();
+    void stop_background_rebuild();
+    void background_rebuild_work();
+    void background_rebuild_work_dual();
+    bool handle_background_rebuild_complete(const ibv_wc &wc);
     size_t evacuate_thread_cnt;
     std::atomic_flag flag;
     std::atomic_bool stw_active{false};
@@ -3597,7 +3622,7 @@ public:
     // is a logical allocator ledger and does not include six-segment groups.
     std::vector<uint64_t> remote_memory_endpoint_bytes() const {
         return remote_allocator.small_object_stripe_manager()
-            .live_group_bytes_by_endpoint();
+            .observer_group_endpoint_bytes();
     }
 
     // Simple annotation contract: call within the allocation scope, before
@@ -4022,6 +4047,13 @@ public:
                   " size=" + std::to_string(obj.size)).c_str());
         }
         
+        read_owner_diag::Record *owner_sample = nullptr;
+        if constexpr (IsReadRequest) {
+            if (!use_read_batch)
+                owner_sample = read_owner_diag::begin(
+                    wr_id, client_idx, endpoint_idx,
+                    reinterpret_cast<uint64_t>(fibre_self()));
+        }
     retry:
         profile::add_post_retry_count();
         bool posted;
@@ -4066,6 +4098,7 @@ public:
             this->check_cq_idx_with_client_idx_endpoint(qp_idx, client_idx, endpoint_idx);
             goto retry;
         }
+        read_owner_diag::accepted(owner_sample);
 
         if constexpr (IsReadRequest) {
             if (recomputable_diag_enabled_ && entry.is_recomputable())
@@ -4565,9 +4598,13 @@ public:
         case REMOTE:
             ASSERT(!entry.is_resident_local());
             ASSERT(!entry.has_remote_backup_reservation());
-            new_state.state = FREE;
-            if (!entry.cas_state_weak(old_state, new_state)) [[unlikely]] {
-                goto retry;
+            if constexpr (!OldAccessor) {
+                if (!entry.try_free_unreferenced_remote(old_state)) [[unlikely]]
+                    goto retry_load;
+            } else {
+                new_state.state = FREE;
+                if (!entry.cas_state_weak(old_state, new_state)) [[unlikely]]
+                    goto retry_load;
             }
             six_free(entry, size);
             // REMOTE teardown also publishes FREE directly; make recipe
@@ -4644,7 +4681,19 @@ private:
                 "ec_stripe_allocator", [this] {
                     return this->remote_memory_endpoint_bytes();
                 });
-        benchmark_memory_sampler_->start();
+        ::FarLib::profile::benchmark_memory_observer_context =
+            benchmark_memory_sampler_.get();
+        ::FarLib::profile::benchmark_memory_begin_observer =
+            &::FarLib::benchmark_memory::Sampler::begin_work_callback;
+        ::FarLib::profile::benchmark_memory_end_observer =
+            &::FarLib::benchmark_memory::Sampler::end_work_callback;
+        ::FarLib::benchmark_memory::explicit_work_origin_context =
+            benchmark_memory_sampler_.get();
+        ::FarLib::benchmark_memory::explicit_work_begin_observer =
+            &::FarLib::benchmark_memory::Sampler::begin_work_at_callback;
+        ::FarLib::benchmark_memory::explicit_work_end_observer =
+            &::FarLib::benchmark_memory::Sampler::end_work_at_callback;
+        benchmark_memory_sampler_->arm();
     }
 
 public:
@@ -4849,14 +4898,17 @@ public:
                 std::memory_order_release);
         }
         if (hydra::runtime_packing_enabled()) {
-            if (!config.is_hydra_mode())
-                throw std::invalid_argument("runtime hot packing requires Hydra");
+            // Carbink shares stable page owners and packed handles with Hydra.
+            // Fetch/free retain the active mode's eviction and compaction path.
+            if (!config.is_page_mode())
+                throw std::invalid_argument("runtime hot packing requires Hydra or Carbink");
             hydra_runtime_packing_ = std::make_unique<hydra::RuntimePacking>();
             hydra_runtime_packing_->hot_byte_budget = local_buf_size / 8;
             std::cout << "hydra.runtime_packing enabled=1 oracle=0 learn_references="
                       << hydra::RuntimePacking::LearnReferences
                       << " hot_byte_budget=" << local_buf_size / 8
-                      << " policy=one_shot_demand_rank scope_gate=root_lifetime\n";
+                      << " policy=one_shot_demand_rank scope_gate=root_lifetime"
+                      << " runtime=" << (config.is_carbink_mode() ? "carbink" : "hydra") << '\n';
         } else {
             std::cout << "hydra.runtime_packing enabled=0\n";
         }
@@ -4915,18 +4967,14 @@ public:
         evacuate_thread_cnt = ::FarLib::get_config().evacuate_thread_cnt;
         if (uthread::separate_background_cluster_enabled()) {
             const size_t background_workers = config.background_worker_count();
-            const char *cpu_base_text =
-                std::getenv("FARLIB_BACKGROUND_CPU_BASE");
-            if (cpu_base_text == nullptr || cpu_base_text[0] == '\0') {
-                ERROR("FARLIB_BACKGROUND_CPU_BASE is required");
-            }
-            char *cpu_base_end = nullptr;
-            const unsigned long cpu_base =
-                std::strtoul(cpu_base_text, &cpu_base_end, 10);
-            if (cpu_base_end == cpu_base_text || *cpu_base_end != '\0' ||
-                cpu_base >= CPU_SETSIZE ||
-                background_workers > CPU_SETSIZE - cpu_base) {
-                ERROR("invalid FARLIB_BACKGROUND_CPU_BASE");
+            std::vector<unsigned> background_cpus;
+            try {
+                background_cpus = uthread::background_cpu_assignment(
+                    std::getenv("FARLIB_BACKGROUND_CPU_BASE"),
+                    std::getenv("FARLIB_BACKGROUND_CPU_LIST"),
+                    background_workers);
+            } catch (const std::invalid_argument &error) {
+                ERROR(error.what());
             }
             std::vector<pthread_t> app_tids(
                 ::FarLib::get_config().max_thread_cnt);
@@ -4945,8 +4993,7 @@ public:
                 CPU_OR(&app_cpu_union, &app_cpu_union, &worker_set);
             }
             for (size_t i = 0; i < background_workers; ++i) {
-                if (CPU_ISSET(static_cast<int>(cpu_base + i),
-                              &app_cpu_union)) {
+                if (CPU_ISSET(background_cpus[i], &app_cpu_union)) {
                     ERROR("background CPU overlaps app cluster affinity");
                 }
             }
@@ -4960,7 +5007,7 @@ public:
             for (size_t i = 0; i < background_workers; ++i) {
                 cpu_set_t set;
                 CPU_ZERO(&set);
-                CPU_SET(static_cast<int>(cpu_base + i), &set);
+                CPU_SET(background_cpus[i], &set);
                 if (pthread_setaffinity_np(background_tids[i], sizeof(set),
                                            &set) != 0) {
                     ERROR("failed to pin background cluster worker");
@@ -4970,7 +5017,7 @@ public:
                 if (pthread_getaffinity_np(background_tids[i],
                                            sizeof(observed), &observed) != 0 ||
                     CPU_COUNT(&observed) != 1 ||
-                    !CPU_ISSET(static_cast<int>(cpu_base + i), &observed)) {
+                    !CPU_ISSET(background_cpus[i], &observed)) {
                     ERROR("background cluster affinity verification failed");
                 }
                 rdma::register_thread_id(
@@ -4985,6 +5032,7 @@ public:
                 evict_fn, this, std::string("evacuation master"));
         }
         carbink_start_workers();
+        start_background_rebuild();
         ::FarLib::allocator::global_heap.set_on_memory_low(
             [this] {
                 uthread::notify_all(&eviction_cond, &eviction_mutex);
@@ -5005,12 +5053,32 @@ public:
     ~ConcurrentArrayCache() {
         // Print the saved final Work-boundary snapshot, never post-cleanup zero.
         runtime_metadata_reporter_.reset();
-        if (benchmark_memory_sampler_) benchmark_memory_sampler_->stop();
+        if (benchmark_memory_sampler_) {
+            if (::FarLib::profile::benchmark_memory_observer_context ==
+                benchmark_memory_sampler_.get()) {
+                ::FarLib::profile::benchmark_memory_begin_observer = nullptr;
+                ::FarLib::profile::benchmark_memory_end_observer = nullptr;
+                ::FarLib::profile::benchmark_memory_observer_context = nullptr;
+            }
+            if (::FarLib::benchmark_memory::explicit_work_origin_context ==
+                benchmark_memory_sampler_.get()) {
+                ::FarLib::benchmark_memory::explicit_work_begin_observer = nullptr;
+                ::FarLib::benchmark_memory::explicit_work_end_observer = nullptr;
+                ::FarLib::benchmark_memory::explicit_work_origin_context = nullptr;
+            }
+            benchmark_memory_sampler_->shutdown();
+        }
         ::FarLib::simple_region_heat::end_work();
         ec_batch_diag_report("cache_dtor_begin");
         quiesce_background_evacuation();
         ec_read_recovery_diag_report("cache_quiesced");
         hydra_shutdown_pages();
+        if (::FarLib::get_config().ft_background_rebuild) {
+            remote_allocator.small_object_stripe_manager()
+                .release_background_targets_for_shutdown();
+            remote_allocator.small_object_stripe_manager()
+                .release_quarantined_shadows_for_shutdown();
+        }
         report_carbink_writes();
         release_carbink_evict_buffers();
         if (::FarLib::allocator::six_group::enabled()) {
@@ -5035,6 +5103,7 @@ public:
     }
 
     void quiesce_background_evacuation() {
+        stop_background_rebuild();
         ec_batch_diag_step("quiesce_background_evacuation_begin");
         // ft_method=ec_batch: one bounded drain of the write round *before* the
         // workers stop, so every group that is still observable gets its real
@@ -5763,7 +5832,8 @@ public:
     bool ec_batch_staging_ready();
     bool stage_ec_batch_object(void *local_addr, size_t size,
                               FarObjectEntry *entry, uint32_t behavior_group = 0,
-                              size_t hydra_owner_id = SIZE_MAX);
+                              size_t hydra_owner_id = SIZE_MAX,
+                              bool *snapshot_canceled = nullptr);
     static bool ec_batch_uses_split(size_t size) {
         // A permissive cutoff (e.g. legacy 8192) must not send >4 KiB objects
         // into the fixed-size small-object staging buffers.
@@ -6160,6 +6230,8 @@ private:
 #include "cache/core/rdma/rdma_completion.ipp"
 #include "cache/core/rdma/ec_batch_path.ipp"
 #include "recovery/ec_read_recovery.ipp"
+#include "recovery/ec_background_rebuild.ipp"
+#include "recovery/ec_background_rebuild_dual.ipp"
 #include "recovery/recompute_recipe_path.ipp"
 #include "cache/core/common/common_path.ipp"
 #include "hydra/page_path.ipp"

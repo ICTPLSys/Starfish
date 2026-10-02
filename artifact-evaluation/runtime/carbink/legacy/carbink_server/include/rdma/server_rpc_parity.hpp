@@ -187,7 +187,68 @@ inline bool Server::poll_peer_payload_cq_only_once(size_t max_batches) {
                               << work_completion.wr_id << std::dec
                               << " qp_num=" << work_completion.qp_num
                               << std::endl;
-                    ERROR("server peer payload completion failed");
+                    if (peer_recovery_enabled()) {
+                        size_t failed_peer =
+                            std::numeric_limits<size_t>::max();
+                        auto *lane_slot =
+                            reinterpret_cast<PeerLaneSendSlot *>(
+                                work_completion.wr_id);
+                        if (lane_slot != nullptr &&
+                            lane_slot->magic == 0xEC2C2003u) {
+                            failed_peer = lane_slot->peer_idx;
+                        } else {
+                            auto *probe_slot =
+                                reinterpret_cast<ProbeParityBatchSendSlot *>(
+                                    work_completion.wr_id);
+                            if (probe_slot != nullptr &&
+                                probe_slot->magic == 0xEC2C2005u) {
+                                failed_peer = probe_slot->peer_idx;
+                            } else {
+                                auto *recv_slot =
+                                    reinterpret_cast<PeerPayloadRecvSlot *>(
+                                        work_completion.wr_id);
+                                if (recv_slot != nullptr &&
+                                    recv_slot->magic == 0xEC2C2004u)
+                                    failed_peer = recv_slot->peer_idx;
+                            }
+                        }
+                        if (failed_peer < peer_endpoint_count) {
+                            mark_peer_dead(
+                                failed_peer,
+                                rdma::kEC2PCStatusPeerDead);
+                            auto *failed_lane =
+                                reinterpret_cast<PeerLaneSendSlot *>(
+                                    work_completion.wr_id);
+                            if (failed_lane != nullptr &&
+                                failed_lane->magic == 0xEC2C2003u) {
+                                failed_lane->in_use.store(
+                                    false, std::memory_order_release);
+                                continue;
+                            }
+                            auto *failed_probe =
+                                reinterpret_cast<ProbeParityBatchSendSlot *>(
+                                    work_completion.wr_id);
+                            if (failed_probe != nullptr &&
+                                failed_probe->magic == 0xEC2C2005u) {
+                                (void)complete_probe_parity_batch_send_slot(
+                                    *failed_probe, steady_clock_now_ns());
+                                continue;
+                            }
+                            auto *failed_recv =
+                                reinterpret_cast<PeerPayloadRecvSlot *>(
+                                    work_completion.wr_id);
+                            if (failed_recv != nullptr &&
+                                failed_recv->magic == 0xEC2C2004u)
+                                continue;
+                            continue;
+                        } else {
+                            // An unknown failed CQE is not proof of a peer
+                            // failure; preserve the legacy assertion.
+                            ERROR("server peer payload completion failed");
+                        }
+                    } else {
+                        ERROR("server peer payload completion failed");
+                    }
                 }
                 if (work_completion.opcode == IBV_WC_SEND) {
                     ctr_peer_send_wc.fetch_add(1, std::memory_order_relaxed);
@@ -455,6 +516,8 @@ inline void Server::dispatch_peer_probe_parity_batch_task(
 inline void Server::handle_peer_rpc_message(const rdma::EC2PCRpcMessage &msg,
                                             size_t peer_idx,
                                             uint64_t recv_wc_time_ns) {
+    if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+        return;
     if (msg.type == rdma::EC2PC_MSG_PARITY_APPLY) {
         if (msg.wr_id == 0) {
             ERROR("parity apply recv zero wr_id");
@@ -484,11 +547,17 @@ inline void Server::handle_peer_rpc_message(const rdma::EC2PCRpcMessage &msg,
         std::memcpy(ack.payload, &msg.wr_id, sizeof(uint64_t));
         static constexpr uint32_t kPeerRetryLimit = 1u << 24;
         if (!post_peer_ack_message(peer_idx, ack)) {
+            if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+                return;
             uint32_t retry = 0;
             while (!enqueue_peer_ack_send(peer_idx, ack)) {
+                if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+                    return;
                 retry++;
                 if (retry >= kPeerRetryLimit) {
-                    ERROR("server parity_apply: peer ack enqueue retry exhausted");
+                    if (!peer_recovery_enabled() || peer_is_alive(peer_idx))
+                        ERROR("server parity_apply: peer ack enqueue retry exhausted");
+                    return;
                 }
             }
         }
@@ -498,7 +567,13 @@ inline void Server::handle_peer_rpc_message(const rdma::EC2PCRpcMessage &msg,
     if (msg.type == rdma::EC2PC_MSG_ACK || msg.type == rdma::EC2PC_MSG_ACK_BATCH) {
         uint64_t ack_dispatch_begin_ns =
             recv_wc_time_ns != 0 ? recv_wc_time_ns : steady_clock_now_ns();
+        if (msg.target_endpoint >= peer_endpoint_count)
+            ERROR("server peer ack target endpoint is invalid");
         if (msg.status != rdma::kEC2PCStatusOK) {
+            if (peer_recovery_enabled()) {
+                fail_tracked_requests_for_peer(peer_idx, msg.status);
+                return;
+            }
             ERROR("server peer ack reported error status");
         }
         if ((msg.flags & rdma::kEC2PCFlagParityWrite) != 0) {
@@ -729,11 +804,17 @@ inline void Server::handle_peer_probe_parity_batch_message(
     static constexpr uint32_t kPeerRetryLimit = 1u << 24;
     auto ack_post_begin = std::chrono::steady_clock::now();
     if (!post_peer_ack_message(peer_idx, ack)) {
+        if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+            return;
         uint32_t retry = 0;
         while (!enqueue_peer_ack_send(peer_idx, ack)) {
+            if (peer_recovery_enabled() && !peer_is_alive(peer_idx))
+                return;
             retry++;
             if (retry >= kPeerRetryLimit) {
-                ERROR("server peer probe parity batch: peer ack enqueue retry exhausted");
+                if (!peer_recovery_enabled() || peer_is_alive(peer_idx))
+                    ERROR("server peer probe parity batch: peer ack enqueue retry exhausted");
+                return;
             }
         }
     }

@@ -3,6 +3,37 @@
 import argparse
 import json
 from pathlib import Path
+import sys
+
+
+def data_completeness(run_dir, analysis, manifest, measurement_usable):
+    """Validate absolute raw metrics, without requiring a normalization pair."""
+    if not measurement_usable:
+        return False, "verified performance measurement is unavailable"
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from figure11.raw_runs import collect_records
+        plan = manifest.get("plan", {})
+        ratio = int(analysis.get("ratio", plan.get("ratio", 0)))
+        repeat = int(analysis.get("repeat", plan.get("repeat", 1)))
+        records = collect_records(run_dir, ratio=ratio, repeat=repeat,
+                                  include_regular_nonft=True)
+        own_records = [record for record in records
+                       if Path(record.get("_raw_run_dir", "")).resolve()
+                       == Path(run_dir).resolve()]
+        if len(own_records) != 1:
+            raise ValueError("exactly one complete record for this case is required")
+    except (ImportError, OSError, KeyError, TypeError, ValueError) as error:
+        return False, str(error)
+    record = own_records[0]
+    return True, (
+        "performance, correctness, Work traffic, remote CPU and Work memory usable; "
+        f"memory samples={record['remote_memory_samples']}/"
+        f"{record['remote_memory_expected_samples']}, "
+        f"scheduled={record['remote_memory_scheduled_samples']}, "
+        f"missing={record['remote_memory_missing_samples']}, "
+        f"end_status={record['remote_memory_end_status']}; "
+        "mean uses successful samples only")
 
 
 def classify_case(run_dir, returncode):
@@ -10,7 +41,8 @@ def classify_case(run_dir, returncode):
     run_dir = Path(run_dir)
     result = {"status": "error", "safe_to_continue": True, "reason": "",
               "exit_status": returncode, "client_exit_status": None,
-              "measurement_usable": False}
+              "measurement_usable": False, "data_complete": False,
+              "data_complete_reason": "case has not reached verified completion"}
     try:
         def read(path):
             if not path.exists():
@@ -34,8 +66,13 @@ def classify_case(run_dir, returncode):
             status = state.get("status")
             if status in ("stopped", "already_exited"):
                 continue
-            if (status in ("planned", "preflight_pass", "not_started") and state.get("pid") is None
+            if (status in ("planned", "preflight_pass")
+                    and state.get("pid") is None
+                    and state.get("launch_attempted") is not True
                     and not state.get("remote_dir_created")):
+                continue
+            if (status == "not_started" and state.get("pid") is None
+                    and state.get("launch_attempted") is False):
                 continue
             result.update(safe_to_continue=False,
                           reason="memory-service cleanup is incomplete or unverified")
@@ -76,6 +113,8 @@ def classify_case(run_dir, returncode):
         else:
             result["reason"] = analysis.get("error") or (
                 f"runner exited {returncode} without a verified successful result")
+        result["data_complete"], result["data_complete_reason"] = data_completeness(
+            run_dir, analysis, manifest, result["measurement_usable"])
     except (OSError, ValueError, TypeError) as error:
         result.update(safe_to_continue=False, reason=f"invalid cleanup evidence: {error}")
     return result
