@@ -311,16 +311,43 @@ def _validate_figure12_metrics(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     if len(rows) != len(expected) or set(actual) != set(expected):
         raise ValueError(
             f"expected Figure12 metrics {expected}, got {actual or 'none'}")
+    for row in rows:
+        if row["metric"] == "local_ec_cpu_cycles" and (
+                row.get("ec_schema_version") != 2 or
+                row.get("ec_measurement_basis") != "initialization_plus_work"):
+            raise ValueError("new Figure12 runs require initialization + Work EC "
+                             "instrumentation; rebuild the selected client")
     return rows
 
 
 def _invoke_case(plan: Dict[str, Any], log_path: Path) -> Dict[str, Any]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    node_log = log_path.with_suffix(".nodes-before.json")
+    try:
+        probe = subprocess.run(
+            ["bash", str(AE_ROOT / "scripts/check_nodes.sh"), "--site",
+             str(plan["site"]), "--require-idle", "--json"],
+            cwd=AE_ROOT, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, check=False)
+        nodes = json.loads(probe.stdout)
+        _write_json(node_log, {"exit_status": probe.returncode,
+                               "stderr": probe.stderr, "result": nodes})
+        if (probe.returncode != 0 or not nodes.get("nodes") or
+                not all(node.get("availability", {}).get("idle") is True
+                        for node in nodes["nodes"])):
+            raise ValueError("strict node-idle check did not pass")
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+        return {**plan, "status": "error", "safe_to_continue": False,
+                "measurement_usable": False, "exit_status": 2,
+                "runner_exit_status": None, "runner_log": str(log_path),
+                "reason": f"case not started: node-idle check failed: {error}"}
     invocation_error = ""
     returncode = 2
     try:
+        workdir = Path(plan["run_dir"]).parent.parent / "workdirs" / plan["run_id"]
+        workdir.mkdir(parents=True, exist_ok=False)
         with log_path.open("w", encoding="utf-8") as output:
-            result = subprocess.run(plan["command"], cwd=AE_ROOT,
+            result = subprocess.run(plan["command"], cwd=workdir,
                                     stdin=subprocess.DEVNULL, stdout=output,
                                     stderr=subprocess.STDOUT, check=False)
         returncode = result.returncode
@@ -464,8 +491,7 @@ def execute(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                     batch["passed"] = sum(row.get("status") == "passed"
                                           for row in completed)
                     batch["failed"] = len(completed) - batch["passed"]
-                    if (record.get("status") != "passed"
-                            and not record.get("safe_to_continue", True)):
+                    if record.get("safe_to_continue") is not True:
                         stop_batch = True
                         batch["aborted"] = True
                     status = record.get("status", "error")

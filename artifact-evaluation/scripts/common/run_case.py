@@ -43,6 +43,9 @@ AE_ROOT = Path(__file__).resolve().parents[2]
 SERVER_KEYS = ("server_count", "server_addr", "server_port",
                "server_buffer_size", "ib_device_name", "ib_port")
 
+NONFT_RESIDENT_REQUIRED_KEYS = (
+    "enable_region_resident_placement",
+)
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -558,7 +561,7 @@ def run(args: argparse.Namespace) -> int:
             "resident": args.system == "starfish",
         })
     if baseline_variant == "nonft-backup-off":
-        feature_overrides.update(backup=False, resident=False)
+        feature_overrides.update(backup=False, resident=True)
     effective = render(config, system=args.system, ratio=args.ratio,
                        footprint_bytes=FOOTPRINT_BYTES[args.app],
                        ib_device=site["ib_device"], ib_port=site["ib_port"],
@@ -584,13 +587,19 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError(
             "nonft-backup-off did not render enable_selective_backup=0 "
             "and zero remote backup budgets")
-    if baseline_variant == "nonft-backup-off" and any(
-            config_value(effective, key) != "0" for key in (
-                "local_resident_budget_bytes", "enable_region_resident_placement",
-                "enable_resident_profile_planner", "resident_profile_apply_plan",
-                "enable_region_hotness_placement", "enable_region_fetch_hotness_placement",
-                "region_placement_bind_groups", "enable_logical_object_profile")):
-        raise ValueError("nonft-backup-off did not disable Resident and its placement policies")
+    if baseline_variant == "nonft-backup-off":
+        resident_budget = config_value(effective, "local_resident_budget_bytes")
+        try:
+            resident_budget_value = int(resident_budget) if resident_budget is not None else 0
+        except ValueError as exc:
+            raise ValueError("nonft-backup-off did not render a numeric Resident budget") from exc
+        if resident_budget_value <= 0:
+            raise ValueError("nonft-backup-off requires a positive Resident budget")
+        disabled = [key for key in NONFT_RESIDENT_REQUIRED_KEYS
+                    if config_value(effective, key) != "1"]
+        if disabled:
+            raise ValueError("nonft-backup-off disabled Resident placement/policy: "
+                             + ", ".join(disabled))
     if ec or hydra:
         lines = effective.splitlines(keepends=True)
         standby = int(config_value(effective, "ft_standby_endpoint") or "-1")

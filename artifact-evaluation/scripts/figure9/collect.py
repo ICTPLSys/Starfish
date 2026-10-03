@@ -27,6 +27,13 @@ CANONICAL_VARIANT = "canonicalruntime"
 OFF_VARIANT = "nonft-backup-off"
 OFF_SYSTEM_LABEL = "Non-FT (backup off)"
 METADATA_OBJECTS = ("analysis", "manifest", "plan")
+RESIDENT_CONFIG_KEYS = frozenset((
+    "local_resident_budget_bytes", "enable_region_resident_placement",
+    "enable_resident_profile_planner", "resident_profile_apply_plan",
+    "enable_region_hotness_placement", "enable_region_fetch_hotness_placement",
+    "region_placement_bind_groups", "enable_logical_object_profile"))
+RESIDENT_REQUIRED_ON_KEYS = frozenset((
+    "enable_region_resident_placement",))
 KNOWN_VARIANTS = frozenset((CANONICAL_VARIANT, OFF_VARIANT,
                             "nonft", "starfish", "hydra", "carbink"))
 
@@ -103,8 +110,8 @@ def _config_values(text: str) -> dict[str, str]:
         if len(fields) < 2:
             continue
         key, value = fields[0], fields[1]
-        if key not in {"enable_selective_backup", "remote_backup_budget_bytes",
-                       "remote_backup_budget_pct"}:
+        if key not in ({"enable_selective_backup", "remote_backup_budget_bytes",
+                        "remote_backup_budget_pct"} | RESIDENT_CONFIG_KEYS):
             continue
         if key in values and values[key] != value:
             raise ValueError(f"duplicate {key} setting has conflicting values")
@@ -120,6 +127,30 @@ def _require_backup_off_config(text: str, source: str) -> None:
         raise ValueError(f"backup-OFF {source} lacks zero byte budget")
     if values.get("remote_backup_budget_pct") != "0":
         raise ValueError(f"backup-OFF {source} lacks zero percentage budget")
+    resident_budget = values.get("local_resident_budget_bytes")
+    try:
+        resident_budget_value = int(resident_budget) if resident_budget is not None else 0
+    except ValueError as exc:
+        raise ValueError(f"backup-OFF {source} has a nonnumeric Resident budget") from exc
+    if resident_budget_value <= 0:
+        raise ValueError(f"backup-OFF {source} lacks a positive Resident budget")
+    missing = sorted(key for key in RESIDENT_REQUIRED_ON_KEYS
+                     if values.get(key) != "1")
+    if missing:
+        raise ValueError(f"backup-OFF {source} lacks verified Resident ON: "
+                         + ", ".join(missing))
+
+
+def _require_backup_on_resident_on_config(text: str, source: str) -> None:
+    values = _config_values(text)
+    if values.get("enable_selective_backup") != "1":
+        raise ValueError(f"canonical NonFT {source} requires backup ON")
+    if values.get("enable_region_resident_placement") != "1":
+        raise ValueError(f"canonical NonFT {source} requires Resident ON")
+    for key in ("remote_backup_budget_bytes", "local_resident_budget_bytes"):
+        value = values.get(key, "")
+        if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+            raise ValueError(f"canonical NonFT {source} requires positive {key}")
 
 
 def _validate_backup_declaration(analysis_path: Path,
@@ -222,6 +253,10 @@ def collect(runs_dir: Path) -> tuple[list[dict], int]:
         _validate_backup_declaration(analysis_path, backup_enabled)
         if baseline_variant == OFF_VARIANT:
             _validate_backup_off(analysis_path, manifest, plan)
+        elif plan.get("system") == "nonft":
+            _require_backup_on_resident_on_config(
+                analysis_path.with_name("effective.config").read_text(),
+                str(analysis_path.parent))
         try:
             elapsed = float(measurement["elapsed_s"])
         except (KeyError, TypeError, ValueError) as exc:

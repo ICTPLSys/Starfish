@@ -13,6 +13,9 @@ from figure12 import collect_metadata as metadata
 from figure12 import log_contract as contract
 
 FIELDS = (*metadata.FIELDS, "repeat", "cycle_clock", "ec_work_intervals", "ec_scopes",
+          "ec_schema_version", "ec_measurement_basis", "ec_boundary_semantics",
+          "ec_initialization_cycles", "ec_work_cycles", "ec_total_cycles",
+          "ec_initialization_scopes", "ec_work_scopes", "ec_total_scopes",
           "measurement_usable", "execution_status", "measurement_warning")
 
 
@@ -22,6 +25,7 @@ def read_ec_cpu(context):
         raise ValueError("manifest must record FARLIB_RUNTIME_EC_CPU=1; old logs "
                          "cannot reconstruct raw EC cycles")
     records = []
+    schema_version = None
     with log.open(encoding="utf-8", errors="replace") as stream:
         for number, line in enumerate(stream, 1):
             if not line.lstrip().startswith(contract.EC_PREFIX + " "):
@@ -29,23 +33,68 @@ def read_ec_cpu(context):
             record = contract.parse_line(line)
             if record["system"] != plan["system"]:
                 raise ValueError("EC runtime/manifest system mismatch")
-            if record["boundary_sequence"] != len(records) + 1:
-                raise ValueError("EC Work sequences must be contiguous, starting at 1")
+            if schema_version is None:
+                schema_version = record["schema_version"]
+            elif record["schema_version"] != schema_version:
+                raise ValueError("EC schema 1 and schema 2 records cannot be mixed")
             record["_source"] = f"{log.resolve()}:{number}"
             records.append(record)
     if not records:
         raise ValueError(f"{log}: missing runtime_ec_cpu completed-Work records")
+    if schema_version == 1:
+        initialization = None
+        work_records = records
+        basis = "work_only_legacy"
+        boundary_semantics = ""
+        if any(record["phase"] != "work" for record in work_records):
+            raise ValueError("schema 1 may contain only Work records")
+    else:
+        initialization_records = [record for record in records
+                                  if record["phase"] == "initialization"]
+        if len(initialization_records) != 1:
+            raise ValueError("schema 2 requires exactly one initialization record")
+        initialization = initialization_records[0]
+        if records[0] is not initialization:
+            raise ValueError("schema 2 initialization must precede all Work records")
+        work_records = records[1:]
+        if any(record["phase"] != "work" for record in work_records):
+            raise ValueError("schema 2 must contain initialization followed by Work")
+        basis = "initialization_plus_work"
+        boundary_semantics = contract.EC_BOUNDARY_SEMANTICS
+    if not work_records:
+        raise ValueError(f"{log}: missing runtime_ec_cpu completed-Work records")
+    for expected, record in enumerate(work_records, 1):
+        if record["boundary_sequence"] != expected:
+            raise ValueError("EC Work sequences must be contiguous, starting at 1")
+    work_cycles = sum(record["cycles"] for record in work_records)
+    work_scopes = sum(record["scopes"] for record in work_records)
+    initialization_cycles = initialization["cycles"] if initialization is not None else ""
+    initialization_scopes = initialization["scopes"] if initialization is not None else ""
+    total_cycles = (initialization_cycles + work_cycles
+                    if initialization is not None else work_cycles)
+    total_scopes = (initialization_scopes + work_scopes
+                    if initialization is not None else work_scopes)
     return {
         "workload": contract.WORKLOADS[plan["app"]],
         "system": contract.SYSTEMS[plan["system"]],
         "metric": "local_ec_cpu_cycles", "unit": "cycles",
-        "value": sum(record["cycles"] for record in records),
+        "value": total_cycles,
         "source_type": "measured",
         "source": ";".join(record["_source"] for record in records),
-        "measurement_phase": "all_completed_work", "cycle_clock": "tsc",
-        "ec_work_intervals": len(records),
-        "ec_scopes": sum(record["scopes"] for record in records),
-        "boundary_sequence": len(records), "scope": "compute_ec",
+        "measurement_phase": ("initialization_and_all_completed_work"
+                              if initialization is not None else "all_completed_work"),
+        "cycle_clock": "tsc", "ec_work_intervals": len(work_records),
+        "ec_scopes": work_scopes,
+        "ec_schema_version": schema_version,
+        "ec_measurement_basis": basis,
+        "ec_boundary_semantics": boundary_semantics,
+        "ec_initialization_cycles": initialization_cycles,
+        "ec_work_cycles": work_cycles,
+        "ec_total_cycles": total_cycles,
+        "ec_initialization_scopes": initialization_scopes,
+        "ec_work_scopes": work_scopes,
+        "ec_total_scopes": total_scopes,
+        "boundary_sequence": len(work_records), "scope": "compute_ec",
     }
 
 
@@ -160,11 +209,21 @@ def main(argv=None):
                            if row["measurement_warning"]})
         if args.summary:
             args.summary.parent.mkdir(parents=True, exist_ok=True)
+            summary = {"schema_version": 3, "figure": "figure12",
+                       "metrics": args.metrics, "repeat": rows[0]["repeat"],
+                       "cycle_clock": "tsc", "metadata_numerator": "accounted_bytes",
+                       "warnings": warnings, "rows": rows}
+            ec_rows = [row for row in rows if row["metric"] == "local_ec_cpu_cycles"]
+            if ec_rows:
+                summary.update(
+                    ec_schema_versions=sorted({row["ec_schema_version"] for row in ec_rows}),
+                    ec_measurement_bases=sorted({row["ec_measurement_basis"]
+                                                 for row in ec_rows}),
+                    ec_boundary_semantics=sorted({row["ec_boundary_semantics"]
+                                                  for row in ec_rows if row["ec_boundary_semantics"]}),
+                )
             with args.summary.open("x") as stream:
-                json.dump({"schema_version": 3, "figure": "figure12",
-                           "metrics": args.metrics, "repeat": rows[0]["repeat"],
-                           "cycle_clock": "tsc", "metadata_numerator": "accounted_bytes",
-                           "warnings": warnings, "rows": rows}, stream, indent=2)
+                json.dump(summary, stream, indent=2)
                 stream.write("\n")
         for warning in warnings:
             print(f"WARNING: {warning}", file=sys.stderr)

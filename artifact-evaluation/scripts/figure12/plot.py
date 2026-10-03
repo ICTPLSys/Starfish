@@ -20,7 +20,8 @@ AE_ROOT = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "common"))
 from plotting import SYSTEM_STYLES, export_figure, get_pyplot, read_csv
-from figure12.log_contract import METRIC_UNITS, METRIC_SELECTIONS, nonnegative_integer
+from figure12.log_contract import (EC_BOUNDARY_SEMANTICS, METRIC_UNITS,
+                                   METRIC_SELECTIONS, nonnegative_integer)
 
 REQUIRED = {"workload", "system", "metric", "value", "unit", "source_type", "source"}
 WORKLOADS = ("BFS", "LLM", "MG", "WC", "KV-B", "KV-A", "KV-S", "NQ")
@@ -31,6 +32,12 @@ ALIASES = {"bfs": "BFS", "llm": "LLM", "llama": "LLM", "mg": "MG",
 SYSTEMS = ("carbink", "starfish")
 METRICS = METRIC_UNITS
 SOURCE_TYPES = {"measured", "paper_reference", "synthetic"}
+EC_BASIS_LEGACY = "work_only_legacy"
+EC_BASIS_INIT_WORK = "initialization_plus_work"
+EC_COMPONENT_FIELDS = (
+    "ec_initialization_cycles", "ec_work_cycles", "ec_total_cycles",
+    "ec_initialization_scopes", "ec_work_scopes", "ec_total_scopes",
+)
 
 
 def prepare(path: Path, source_type="measured", *, apps=WORKLOADS, metrics="all"):
@@ -62,6 +69,7 @@ def prepare_rows(numbered_rows, digest, input_name, source_type="measured",
     if not apps or len(set(apps)) != len(apps) or set(apps) - set(WORKLOADS):
         raise ValueError("select distinct known applications")
     values, footprints, contexts = {}, {}, {}
+    ec_bases, ec_schema_versions, ec_boundary_semantics = set(), set(), set()
     blanks = []
     for line, row in numbered_rows:
         try:
@@ -78,10 +86,11 @@ def prepare_rows(numbered_rows, digest, input_name, source_type="measured",
             key = workload, system, metric
             if key in values or key in blanks:
                 raise ValueError(f"duplicate condition: {key}")
-            if not row["value"]:
+            raw_value = row["value"]
+            if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
                 blanks.append(key)
                 continue
-            value = float(row["value"])
+            value = float(raw_value)
             if not math.isfinite(value) or value < 0:
                 raise ValueError("value must be finite and nonnegative")
             if row["source_type"] != source_type or not row["source"]:
@@ -108,6 +117,7 @@ def prepare_rows(numbered_rows, digest, input_name, source_type="measured",
                     current = str(row.get(field, "1" if field == "repeat" else ""))
                     if not current or contexts.setdefault(field, current) != current:
                         raise ValueError(f"mixed/missing {field}; select one condition")
+            ec_record = {}
             if metric == "local_ec_cpu_cycles":
                 value = nonnegative_integer(str(row["value"]), "EC cycles")
                 if row.get("cycle_clock") != "tsc":
@@ -116,12 +126,97 @@ def prepare_rows(numbered_rows, digest, input_name, source_type="measured",
                     intervals = nonnegative_integer(str(row.get("ec_work_intervals", "")),
                                                     "ec_work_intervals")
                     scopes = nonnegative_integer(str(row.get("ec_scopes", "")), "ec_scopes")
-                    if (row.get("measurement_phase") != "all_completed_work" or
+                    verified_scopes = scopes
+                    def text(key):
+                        raw = row.get(key, "")
+                        if raw is None:
+                            return ""
+                        return raw.strip() if isinstance(raw, str) else str(raw)
+                    basis = text("ec_measurement_basis")
+                    schema_text = text("ec_schema_version")
+                    boundary_semantics = text("ec_boundary_semantics")
+                    phase = text("measurement_phase")
+                    if not basis:
+                        if phase != "all_completed_work":
+                            raise ValueError("EC measurement basis is missing")
+                        basis = EC_BASIS_LEGACY
+                    if basis not in (EC_BASIS_LEGACY, EC_BASIS_INIT_WORK):
+                        raise ValueError(f"unknown EC measurement basis: {basis}")
+                    if basis == EC_BASIS_LEGACY:
+                        if phase != "all_completed_work":
+                            raise ValueError("legacy EC rows require all_completed_work")
+                        if schema_text and schema_text != "1":
+                            raise ValueError("legacy EC rows require schema_version=1")
+                        if boundary_semantics:
+                            raise ValueError("legacy EC rows must not declare boundary semantics")
+                        if any(text(field) for field in
+                               ("ec_initialization_cycles", "ec_initialization_scopes")):
+                            raise ValueError("legacy EC initialization components must be empty")
+                        optional = ("ec_work_cycles", "ec_total_cycles",
+                                    "ec_work_scopes", "ec_total_scopes")
+                        present = [bool(text(field)) for field in optional]
+                        if any(present) and not all(present):
+                            raise ValueError("legacy EC component fields are incomplete")
+                        if all(present):
+                            work_cycles = nonnegative_integer(text("ec_work_cycles"),
+                                                              "ec_work_cycles")
+                            total_cycles = nonnegative_integer(text("ec_total_cycles"),
+                                                               "ec_total_cycles")
+                            work_scopes = nonnegative_integer(text("ec_work_scopes"),
+                                                              "ec_work_scopes")
+                            total_scopes = nonnegative_integer(text("ec_total_scopes"),
+                                                               "ec_total_scopes")
+                            if (work_cycles != value or total_cycles != value or
+                                    work_scopes != scopes or total_scopes != scopes):
+                                raise ValueError("legacy EC component totals do not close")
+                            verified_scopes = total_scopes
+                        schema_version = int(schema_text) if schema_text else 1
+                    else:
+                        if phase != "initialization_and_all_completed_work":
+                            raise ValueError("initialization-plus-Work EC phase is required")
+                        if schema_text != "2":
+                            raise ValueError("initialization-plus-Work EC rows require schema_version=2")
+                        if boundary_semantics != EC_BOUNDARY_SEMANTICS:
+                            raise ValueError("unknown or missing EC boundary semantics")
+                        init_cycles = nonnegative_integer(
+                            text("ec_initialization_cycles"), "ec_initialization_cycles")
+                        work_cycles = nonnegative_integer(
+                            text("ec_work_cycles"), "ec_work_cycles")
+                        total_cycles = nonnegative_integer(
+                            text("ec_total_cycles"), "ec_total_cycles")
+                        init_scopes = nonnegative_integer(
+                            text("ec_initialization_scopes"), "ec_initialization_scopes")
+                        work_scopes = nonnegative_integer(
+                            text("ec_work_scopes"), "ec_work_scopes")
+                        total_scopes = nonnegative_integer(
+                            text("ec_total_scopes"), "ec_total_scopes")
+                        if (init_cycles and not init_scopes or
+                                work_cycles and not work_scopes or
+                                total_cycles != init_cycles + work_cycles or
+                                total_scopes != init_scopes + work_scopes or
+                                total_cycles != value or work_scopes != scopes):
+                            raise ValueError("initialization-plus-Work EC totals do not close")
+                        verified_scopes = total_scopes
+                        schema_version = 2
+                    ec_bases.add(basis)
+                    ec_schema_versions.add(schema_version)
+                    if boundary_semantics:
+                        ec_boundary_semantics.add(boundary_semantics)
+                    ec_record = {field: row.get(field, "") for field in
+                                 ("ec_schema_version", "ec_measurement_basis",
+                                  "ec_boundary_semantics", *EC_COMPONENT_FIELDS)}
+                    ec_record.update(ec_schema_version=schema_version,
+                                     ec_measurement_basis=basis,
+                                     ec_boundary_semantics=boundary_semantics)
+                    expected_phase = ("initialization_and_all_completed_work"
+                                      if basis == EC_BASIS_INIT_WORK
+                                      else "all_completed_work")
+                    if (row.get("measurement_phase") != expected_phase or
                             row.get("scope") != "compute_ec" or not intervals or
                             str(row.get("boundary_sequence")) != str(intervals) or
                             str(row.get("measurement_usable")) != "1" or
                             row.get("execution_status") not in ("passed", "teardown_failed") or
-                            (value and not scopes)):
+                            (value and not verified_scopes)):
                         raise ValueError("EC requires verified compute-only completed Work scopes")
             elif source_type == "measured":
                 if (row.get("metadata_numerator") != "accounted_bytes" or
@@ -135,7 +230,8 @@ def prepare_rows(numbered_rows, digest, input_name, source_type="measured",
                         not math.isclose(value, 100 * total / footprint, rel_tol=1e-9, abs_tol=1e-10)):
                     raise ValueError("metadata numerator/component/percentage mismatch")
             values[key] = {"value": value, "source": row["source"],
-                           "measurement_warning": row.get("measurement_warning", "")}
+                           "measurement_warning": row.get("measurement_warning", ""),
+                           **ec_record}
         except (KeyError, ValueError) as exc:
             raise ValueError(f"input row {line}: {exc}") from exc
     missing = [[w, s, m] for w in apps for s in SYSTEMS
@@ -143,12 +239,23 @@ def prepare_rows(numbered_rows, digest, input_name, source_type="measured",
     if missing:
         raise ValueError(f"missing {len(missing)} selected conditions: {missing}; "
                          "select --apps/--metrics explicitly; missing is not zero")
-    return {"figure": "figure12", "input": input_name, "input_sha256": digest,
-            "source_type": source_type, "metric_units": {m: METRICS[m] for m in selected},
-            "workloads": apps, "metrics": selected, "cycle_clock": "tsc",
-            "input_rows": len(numbered_rows), "blank_rows": blanks,
-            "missing_conditions": missing,
-            "values": {"/".join(key): record for key, record in values.items()}}
+    result = {"figure": "figure12", "input": input_name, "input_sha256": digest,
+              "source_type": source_type, "metric_units": {m: METRICS[m] for m in selected},
+              "workloads": apps, "metrics": selected, "cycle_clock": "tsc",
+              "input_rows": len(numbered_rows), "blank_rows": blanks,
+              "missing_conditions": missing,
+              "values": {"/".join(key): record for key, record in values.items()}}
+    if "local_ec_cpu_cycles" in selected:
+        result.update(
+            ec_measurement_basis=(next(iter(ec_bases)) if len(ec_bases) == 1 else None),
+            ec_measurement_bases=sorted(ec_bases),
+            ec_schema_versions=sorted(ec_schema_versions),
+            ec_boundary_semantics=sorted(ec_boundary_semantics),
+            ec_scopes_semantics=("completed_work_only" if ec_bases else None),
+            ec_total_value=(next(iter(ec_bases)) if len(ec_bases) == 1
+                            else "per_record" if ec_bases else None),
+        )
+    return result
 
 
 def draw(data):
@@ -167,8 +274,10 @@ def draw(data):
         "metadata_space_pct": ("Metadata space", "% app memory", 10., [0, 5, 10]),
     }
     displayed = {}
+    denominators = {}
     for ax, metric in zip(axes, metrics):
         title, ylabel, upper, ticks = labels[metric]
+        maximum = 0.
         for s_idx, system in enumerate(SYSTEMS):
             for app_idx, workload in enumerate(apps):
                 record = data["values"][f"{workload}/{system}/{metric}"]
@@ -178,16 +287,18 @@ def draw(data):
                     if denominator <= 0:
                         plt.close(fig)
                         raise ValueError(f"{workload}: Carbink EC cycles must be positive for normalization")
+                    denominators[workload] = denominator
                     value /= denominator
-                if value > upper:
-                    plt.close(fig)
-                    raise ValueError(f"{workload}/{system}/{metric}: value {value:g} exceeds "
-                                     f"the paper axis limit {upper:g}; refusing to clip data")
+                maximum = max(maximum, value)
                 displayed[f"{workload}/{system}/{metric}"] = value
                 position = x[app_idx] + (-width / 2 if s_idx == 0 else width / 2)
                 ax.bar(position, value, width=width,
                        color=SYSTEM_STYLES[system]["facecolor"],
                        edgecolor="black", linewidth=.7)
+        if maximum > upper:
+            step = .5 if metric == "local_ec_cpu_cycles" else 5.
+            upper = math.ceil(maximum / step) * step
+            ticks = np.arange(0., upper + step / 2, step)
         for name, spine in ax.spines.items():
             spine.set_visible(True)
             spine.set_linewidth(1.4)
@@ -211,7 +322,13 @@ def draw(data):
                    ncol=2, frameon=False, fontsize=10.5)
     fig.subplots_adjust(left=.19, right=.995, bottom=.25, top=.82, hspace=.45)
     data["display_values"] = displayed
-    data["ec_display_normalization"] = "same_workload_carbink_raw_ec_cycles"
+    data["ec_display_normalization"] = "same_workload_carbink_ec_cycles"
+    data["ec_display_denominator_bases"] = {
+        workload: data["values"][f"{workload}/carbink/local_ec_cpu_cycles"].get(
+            "ec_measurement_basis")
+        for workload in denominators
+    }
+    data["ec_display_denominators"] = denominators
     return fig
 
 

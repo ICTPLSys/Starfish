@@ -38,6 +38,7 @@ private:
 
 public:
     RemoteAllocator(size_t buffer_size) {
+        ::FarLib::profile::runtime_ec_cpu::begin_initialization("carbink");
         remote_global_heap.register_remote(buffer_size);
         const auto &config = ::FarLib::get_config();
         ft_enabled_ = config.ft_enabled();

@@ -43,6 +43,7 @@ private:
 
 public:
     RemoteAllocator(size_t buffer_size) {
+        ::FarLib::profile::runtime_ec_cpu::begin_initialization("starfish");
         // The backing remote heap is process-global and already requires one
         // live allocator. Keep the diagnostic callback contract in Release too.
         if (profile::memory_usage_observer_context != nullptr) {

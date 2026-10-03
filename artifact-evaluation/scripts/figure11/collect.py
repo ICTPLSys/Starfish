@@ -52,6 +52,7 @@ FIELDS = (
     "baseline_variant", "backup_enabled", "normalizer_variant",
     "off_policy", "local_resident_budget_bytes", "normalizer_off_policy",
     "normalizer_resident_budget_bytes",
+    "resident_enabled", "normalizer_resident_enabled",
 )
 
 
@@ -173,15 +174,15 @@ def _positive_baseline(record, field):
 
 def _make_row(record, baseline, component, *, ratio, repeat,
               environment_match, warning):
-    if component != "remote_cpu_cores" and (
-            baseline.get("off_policy") != "backup_and_resident_off"
-            or baseline.get("local_resident_budget_bytes") != 0):
+    if (baseline.get("off_policy") != log_contract.NONFT_REFERENCE_POLICY
+            or baseline.get("local_resident_budget_bytes", 0) <= 0
+            or baseline.get("resident_enabled") is not True):
         raise ValueError(
-            f"{record['workload']}: normalization requires verified NonFT backup+resident OFF; "
+            f"{record['workload']}: normalization requires verified NonFT backup OFF, Resident ON; "
             f"baseline policy={baseline.get('off_policy', 'unverified')}, "
             f"resident budget={baseline.get('local_resident_budget_bytes')}")
-    if record["system"] == "nonft" and record.get("off_policy") != "backup_and_resident_off":
-        raise ValueError("formal Figure 11 NonFT series requires backup+resident OFF")
+    if record["system"] == "nonft" and record.get("off_policy") != log_contract.NONFT_REFERENCE_POLICY:
+        raise ValueError("formal Figure 11 NonFT series requires backup OFF, Resident ON")
     if component == "fetch_traffic":
         field, unit, raw_unit = "fetch_bytes", "x", "bytes"
         raw = float(record[field])
@@ -307,9 +308,12 @@ def _make_row(record, baseline, component, *, ratio, repeat,
             if component != "remote_cpu_cores" else "",
         "off_policy": record.get("off_policy", ""),
         "local_resident_budget_bytes": record.get("local_resident_budget_bytes", ""),
+        "resident_enabled": record.get("resident_enabled", ""),
         "normalizer_off_policy": baseline.get("off_policy", "")
             if component != "remote_cpu_cores" else "",
         "normalizer_resident_budget_bytes": baseline.get("local_resident_budget_bytes", "")
+            if component != "remote_cpu_cores" else "",
+        "normalizer_resident_enabled": baseline.get("resident_enabled", "")
             if component != "remote_cpu_cores" else "",
     }
 
@@ -317,6 +321,8 @@ def _make_row(record, baseline, component, *, ratio, repeat,
 def collect_rows(logs_root, *, pattern="*.log", ratio=25, repeat=1,
                  components=None, allow_unmatched_environments=False,
                  raw_collector=None):
+    if ratio != 25:
+        raise ValueError("Figure 11 is fixed at ratio=25; do not substitute another ratio")
     selected = requested_components(components)
     records = collect_records(
         logs_root, pattern=pattern, ratio=ratio, repeat=repeat,

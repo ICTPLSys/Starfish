@@ -265,6 +265,9 @@ def client_environment(app: str, site: dict, system: str = "nonft") -> dict[str,
                 "FARLIB_REMOTE_USAGE_SHARDS": "1",
                 "FARLIB_LOCK_WAIT_SCOPE_YIELD": "1",
             })
+        if app == "wordcount":
+            env.update(FARLIB_WORDCOUNT_RECIPES="1",
+                       FARLIB_WORDCOUNT_RECOMPUTABLE="0")
         if app in ("kv-b", "kv-a", "kv-s"):
             env["FARLIB_EC_BENCHMARK_PHASED"] = "1"
             policy = site.get("starfish_kv_backup_policy", {
@@ -745,13 +748,129 @@ def _parse_mg(log: str) -> dict:
     }
 
 
+def _wc_result_with_known_interleave(log: str, result: re.Match[str]) -> tuple[int, str]:
+    """Rejoin one known sampler-interleaved WC result without consuming logs."""
+    prefix = result.group(0).rstrip("\r")
+    fields = _fields(prefix)
+    if all(name in fields for name in (
+            "file", "bytes", "threads", "total_words", "unique_words",
+            "hashmap_size", "checksum")):
+        return result.start(), prefix
+
+    lines = log.splitlines(keepends=True)
+    line_index = log.count("\n", 0, result.start())
+    if line_index >= len(lines):
+        return result.start(), prefix
+    if lines[line_index].rstrip("\r\n") != prefix:
+        return result.start(), prefix
+
+    def is_known_sampler(line: str) -> bool:
+        tokens = line.split()
+        if not tokens:
+            return False
+        marker = tokens[0]
+        if marker not in (
+                "runtime_remote_memory", "runtime_remote_memory_missing",
+                "runtime_remote_memory_end"):
+            return False
+        fields = {}
+        for token in tokens[1:]:
+            key, separator, value = token.partition("=")
+            if (not separator or not value
+                    or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                    or key in fields):
+                return False
+            fields[key] = value
+        schema = fields.get("schema_version")
+        required_fields = {
+            ("runtime_remote_memory", "2"):
+                "schema_version sample scheduled_elapsed_s observed_elapsed_s "
+                "occupied_bytes metric source start_monotonic_ns window "
+                "snapshot_start_monotonic_ns snapshot_ns endpoint_count "
+                "endpoint_bytes consistency".split(),
+            ("runtime_remote_memory", "3"):
+                "schema_version sample work_window_id origin scheduled_elapsed_s "
+                "observed_elapsed_s occupied_bytes metric source start_monotonic_ns "
+                "window sampling snapshot_start_monotonic_ns snapshot_ns "
+                "endpoint_count endpoint_bytes consistency".split(),
+            ("runtime_remote_memory_missing", "2"):
+                "schema_version sample scheduled_elapsed_s observed_elapsed_s "
+                "status metric source start_monotonic_ns window".split(),
+            ("runtime_remote_memory_missing", "3"):
+                "schema_version sample work_window_id origin scheduled_elapsed_s "
+                "observed_elapsed_s status metric source start_monotonic_ns "
+                "window sampling".split(),
+            ("runtime_remote_memory_end", "2"):
+                "schema_version samples sampling metric source start_monotonic_ns "
+                "expected_samples missed_notready missing".split(),
+            ("runtime_remote_memory_end", "3"):
+                "schema_version work_window_id origin end_monotonic_ns samples "
+                "scheduled_samples missing sampling window metric source "
+                "start_monotonic_ns expected_samples missed_notready status".split(),
+        }
+        required = required_fields.get((marker, schema))
+        if required is None:
+            return False
+        # Unknown additive key=value fields remain allowed for forward
+        # compatibility; required fields and duplicate keys stay strict.
+        return set(required) <= fields.keys()
+    end = line_index + 1
+    sampler_records = 0
+    while end < len(lines):
+        line = lines[end].strip()
+        if not line:
+            end += 1
+            continue
+        if is_known_sampler(line):
+            sampler_records += 1
+            end += 1
+            continue
+        break
+    if sampler_records == 0 or end >= len(lines):
+        return result.start(), prefix
+
+    prefix_complete = re.fullmatch(
+        r"wordcount_far_result file=\S+ bytes=\d+ threads=\d+ "
+        r"total_words=\d+ unique_words=\d+ hashmap_size=\d+",
+        prefix)
+    prefix_unique_split = re.fullmatch(
+        r"wordcount_far_result file=\S+ bytes=\d+ threads=\d+ "
+        r"total_words=\d+ unique_words=",
+        prefix)
+    suffix = lines[end].strip()
+    suffix_checksum = re.compile(
+        r"checksum=0x[0-9a-fA-F]+ too_long_words=\d+ "
+        r"max_word_len=\d+ remote_used_bytes=\d+$")
+    suffix_unique = re.compile(
+        r"\d+ hashmap_size=\d+ checksum=0x[0-9a-fA-F]+ "
+        r"too_long_words=\d+ max_word_len=\d+ remote_used_bytes=\d+$")
+    suffix_candidates = []
+    for line in lines:
+        candidate = line.strip()
+        if suffix_checksum.fullmatch(candidate):
+            suffix_candidates.append(("checksum", candidate))
+        if suffix_unique.fullmatch(candidate):
+            suffix_candidates.append(("unique", candidate))
+    if len(suffix_candidates) != 1:
+        raise ValueError("WC result: expected exactly one complete suffix")
+    suffix_kind, suffix_candidate = suffix_candidates[0]
+    if suffix_candidate != suffix:
+        return result.start(), prefix
+    if prefix_complete and suffix_kind == "checksum":
+        return result.start(), prefix + " " + suffix
+    if prefix_unique_split and suffix_kind == "unique":
+        return result.start(), prefix + suffix
+    return result.start(), prefix
+
+
 def _parse_wc(log: str, expected_checksum: str | None) -> dict:
     start = _one(log, r"^wordcount_far_work_phase_start phase=map_local\s*$",
                  "WC work start")
     end = _one(log, r"^wordcount_far_work_phase_end phase=reduce_checksum\s*$",
                "WC work end")
     result = _one(log, r"^wordcount_far_result\b[^\n]*$", "WC result")
-    if not start.start() < end.start() < result.start():
+    result_start, result_line = _wc_result_with_known_interleave(log, result)
+    if not start.start() < end.start() < result_start:
         raise ValueError("WC work/result markers are out of order")
     phases = {}
     phase_positions = {}
@@ -765,7 +884,10 @@ def _parse_wc(log: str, expected_checksum: str | None) -> dict:
     if not (phase_positions["map_local"] < phase_positions["merge_global"]
             < phase_positions["reduce_checksum"]):
         raise ValueError("WC work phases are out of order")
-    fields = _fields(result.group(0))
+    result_keys = re.findall(r"(\w+)=", result_line)
+    if len(result_keys) != len(set(result_keys)):
+        raise ValueError("WC result: duplicate field marker")
+    fields = _fields(result_line)
     size = _count(fields, "bytes")
     total = _count(fields, "total_words")
     unique = _count(fields, "unique_words")
@@ -787,7 +909,7 @@ def _parse_wc(log: str, expected_checksum: str | None) -> dict:
         "measurement_phase": "wc_map_merge_reduce_work",
         "measurement_method": "sum of application phase elapsed_s; excludes native_preagg",
         "correctness_scope": "word count and checksum for the declared input",
-        "correctness_evidence": result.group(0),
+        "correctness_evidence": result_line,
         "input_bytes": size,
     }
 
@@ -938,11 +1060,25 @@ def parse_result(app: str, log: str, *, expected_requests: int = 1_000_000_000,
     except KeyError as exc:
         raise ValueError(f"{app} log lacks required field {exc}") from exc
     if app == "llama":
-        times = re.findall(r"^wall time:\s*(" + NUMBER + r")\s+us\s*$",
-                           log, re.MULTILINE)
+        inline_times = re.findall(
+            r"^wall time:\s*(" + NUMBER + r")\s+us\s*$",
+            log, re.MULTILINE)
+        # The remote-memory sampler may fwrite only its known records between
+        # the benchmark's two wall-time output fragments. Keep this fallback
+        # narrow so unrelated numeric output cannot become a wall-time value.
+        split_times = re.findall(
+            r"^wall time:[ \t]*\n"
+            r"(?=(?:[ \t]*\n|runtime_remote_memory(?:_missing|_end)?\b[^\n]*\n)*"
+            r"runtime_remote_memory(?:_missing|_end)?\b)"
+            r"(?:[ \t]*\n|runtime_remote_memory(?:_missing|_end)?\b[^\n]*\n)*"
+            r"[ \t]*(" + NUMBER + r")\s+us[ \t]*$",
+            log, re.MULTILINE)
+        times = inline_times + split_times
         throughputs = re.findall(r"^achieved tok/s:\s*(" + NUMBER + r")\s*$",
                                  log, re.MULTILINE)
-        if len(times) != 1 or not throughputs or "Assistant:" not in log:
+        wall_markers = re.findall(r"^wall time:", log, re.MULTILINE)
+        if (len(wall_markers) != 1 or len(times) != 1
+                or not throughputs or "Assistant:" not in log):
             raise ValueError("LLaMA lacks a complete chat response or one wall-time marker")
         _positive(throughputs[-1], "LLaMA token throughput")
         return {

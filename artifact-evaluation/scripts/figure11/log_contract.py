@@ -14,6 +14,7 @@ from collections.abc import Mapping
 
 PREFIX = "figure11_result"
 SCHEMA_VERSION = 3
+NONFT_REFERENCE_POLICY = "backup_off_resident_on"
 COMPONENTS = (
     "fetch_traffic",
     "eviction_traffic",
@@ -265,16 +266,27 @@ def validate_record(record, *, source=None):
         if (result["baseline_variant"] == "nonft-backup-off"
                 and result["backup_enabled"]):
             raise ValueError("NonFT backup-off variant has backup enabled")
-        if "off_policy" in result:
+        if result["baseline_variant"] == "nonft-backup-off":
+            _required(result, ("off_policy", "local_resident_budget_bytes", "resident_enabled"))
+            if result["off_policy"] != NONFT_REFERENCE_POLICY:
+                raise ValueError(
+                    "NonFT reference requires backup OFF with Resident ON")
+            result["local_resident_budget_bytes"] = _integer(
+                result["local_resident_budget_bytes"],
+                "local_resident_budget_bytes")
+            result["resident_enabled"] = backup_flag(result["resident_enabled"])
+            if (result["local_resident_budget_bytes"] <= 0 or
+                    not result["resident_enabled"]):
+                raise ValueError("Resident ON requires placement enabled and a positive budget")
+        elif "off_policy" in result:
             if result["off_policy"] not in (
-                    "backup_and_resident_off", "backup_only_off", "resident_unverified"):
+                    "backup_and_resident_off", "backup_only_off", "resident_unverified",
+                    NONFT_REFERENCE_POLICY):
                 raise ValueError("unknown NonFT off_policy")
             if result.get("local_resident_budget_bytes") is not None:
                 result["local_resident_budget_bytes"] = _integer(
-                    result["local_resident_budget_bytes"], "local_resident_budget_bytes")
-            if (result["off_policy"] == "backup_and_resident_off"
-                    and result.get("local_resident_budget_bytes") != 0):
-                raise ValueError("double-OFF requires an explicit zero resident budget")
+                    result["local_resident_budget_bytes"],
+                    "local_resident_budget_bytes")
 
     selected = normalize_components(result["components"])
     result["components"] = ",".join(selected)

@@ -167,6 +167,8 @@ struct SmallObjectStripeParityCodecCache {
     SmallObjectStripeShardParityLut shard[kStripeCodecDataShards];
 
     SmallObjectStripeParityCodecCache() {
+        profile::runtime_ec_cpu::Scope setup_scope(
+            profile::runtime_ec_cpu::Operation::Setup);
         uint8_t matrix[kStripeCodecShardCount * kStripeCodecDataShards] = {};
         SmallObjectStripeGf256::build_generator_matrix(matrix);
         for (size_t data_shard = 0; data_shard < kStripeCodecDataShards;
@@ -459,6 +461,8 @@ public:
 
 private:
     static std::array<Plan, kMaskCount> build_all() {
+        profile::runtime_ec_cpu::Scope setup_scope(
+            profile::runtime_ec_cpu::Operation::Setup);
         std::array<Plan, kMaskCount> plans{};
         for (size_t mask = 0; mask < kMaskCount; mask++) {
             build_plan(static_cast<uint8_t>(mask), &plans[mask]);

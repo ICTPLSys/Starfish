@@ -25,6 +25,8 @@ struct PageCodecTables {
                                                kPageCodecParityShards> bytes;
 
     PageCodecTables() noexcept {
+        profile::runtime_ec_cpu::Scope setup_scope(
+            profile::runtime_ec_cpu::Operation::Setup);
         unsigned char coefficients[] = {1, 1, 1, 1, 1, 2, 4, 8};
         ec_init_tables(kPageCodecDataShards, kPageCodecParityShards,
                        coefficients, bytes.data());

@@ -36,6 +36,10 @@ def builtin_defaults(template):
     values = {
         "max_thread_cnt": "24", "evict_batch_size": "65536",
     }
+    if system in {"hydra", "carbink"}:
+        # Selected policy: fixed Resident placement for every application;
+        # retained backup and the adaptive planner remain disabled.
+        values["enable_region_resident_placement"] = "1"
     if ((app, system) == ("mg", "starfish") or
             (app.startswith("kv-") and system in {"nonft", "starfish"})):
         values.update(mark_thread_cnt="2", evacuate_thread_cnt="10")
@@ -99,11 +103,6 @@ rational fraction rather than silently changing small rounding differences.
     app, system = identity
     if system not in {"hydra", "carbink"}:
         return None
-    resident_apps = {"bfs", "mg", "nq"}
-    if system == "hydra":
-        resident_apps.add("llama")
-    if app not in resident_apps:
-        return 0
     anchor = FOOTPRINT_BYTES[app] // 4
     if system == "hydra" and app in {"llama", "bfs"}:
         anchor = (6 if app == "llama" else 8) * 1024**3

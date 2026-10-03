@@ -982,10 +982,13 @@ def _resident_provenance(run_dir):
             if len(parts) != 2 or parts[0] in values:
                 raise ValueError(f"ambiguous resident configuration: {run_dir}")
             values[parts[0]] = _int(parts[1], parts[0])
-    policy = ("backup_and_resident_off" if len(values) == len(keys)
-              and not any(values.values()) else "backup_only_off"
-              if any(values.values()) else "resident_unverified")
+    resident_enabled = (values.get("enable_region_resident_placement") == 1
+                        and values.get("local_resident_budget_bytes", 0) > 0)
+    policy = (log_contract.NONFT_REFERENCE_POLICY if resident_enabled else
+              "backup_and_resident_off" if len(values) == len(keys)
+              and not any(values.values()) else "resident_unverified")
     return {"off_policy": policy, "resident_config": values,
+            "resident_enabled": resident_enabled,
             "local_resident_budget_bytes": values.get("local_resident_budget_bytes")}
 
 

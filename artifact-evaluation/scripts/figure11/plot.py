@@ -103,14 +103,18 @@ def prepare_logs(logs_root: Path, *, pattern="*.log", ratio=25, repeat=1,
 
 
 def _validate_measured(row, system, component):
+    if str(row.get("ratio")) != "25":
+        raise ValueError("Figure 11 requires ratio=25 for every measured row")
     if system == "nonft" and (
-            row.get("off_policy") != "backup_and_resident_off"
-            or str(row.get("local_resident_budget_bytes")) != "0"):
-        raise ValueError("formal Figure 11 NonFT requires verified backup+resident OFF")
+            row.get("off_policy") != log_contract.NONFT_REFERENCE_POLICY
+            or log_contract._integer(row.get("local_resident_budget_bytes"), "local_resident_budget_bytes") <= 0
+            or not log_contract.backup_flag(row.get("resident_enabled"))):
+        raise ValueError("formal Figure 11 NonFT requires verified backup OFF, Resident ON")
     if component != "remote_cpu_cores" and (
-            row.get("normalizer_off_policy") != "backup_and_resident_off"
-            or str(row.get("normalizer_resident_budget_bytes")) != "0"):
-        raise ValueError("formal Figure 11 normalization requires backup+resident OFF")
+            row.get("normalizer_off_policy") != log_contract.NONFT_REFERENCE_POLICY
+            or log_contract._integer(row.get("normalizer_resident_budget_bytes"), "normalizer_resident_budget_bytes") <= 0
+            or not log_contract.backup_flag(row.get("normalizer_resident_enabled"))):
+        raise ValueError("formal Figure 11 normalization requires backup OFF, Resident ON")
     if system == "nonft":
         if (row.get("baseline_variant") != "nonft-backup-off"
                 or log_contract.backup_flag(row.get("backup_enabled"))):

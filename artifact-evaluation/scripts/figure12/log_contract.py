@@ -1,14 +1,18 @@
-"""Figure 12 current raw-runtime contract (successful AE run directories).
+"""Figure 12 raw-runtime contract (successful AE run directories).
 
 Two independent opt-ins are recorded in manifest.plan.client_env:
   FARLIB_RUNTIME_EC_CPU=1
   FARLIB_RUNTIME_METADATA=1
 
-The compute client emits one EC record for every complete profile Work:
+The legacy compute client emits one EC record for every complete profile Work:
   runtime_ec_cpu schema_version=1 system=starfish phase=work scope=compute_ec clock=tsc boundary_sequence=1 cycles=123 scopes=1
-cycles is a raw measured TSC/reference-cycle count for EC computation scopes,
-not CPU seconds, PMU core cycles, whole-worker time, RDMA wait, or a ratio to
-Carbink. The collector sums contiguous Work records and preserves the clock.
+Schema 2 additionally emits one initialization record with boundary_sequence=0,
+followed by the contiguous completed-Work records. Every schema-2 record must
+declare boundary_semantics=admitted_scope_drain. The collector keeps
+initialization and Work components separate and uses their sum for the Figure
+12 value. cycles is a raw measured TSC/reference-cycle count for EC computation
+scopes, not CPU seconds, PMU core cycles, whole-worker time, RDMA wait, or a
+ratio to Carbink.
 The sample number documents the syntax; it is not an experiment result.
 
 The client also emits exactly one existing runtime_metadata schema_version=1
@@ -27,6 +31,8 @@ from __future__ import annotations
 import shlex
 
 EC_PREFIX = "runtime_ec_cpu"
+EC_SCHEMA_VERSIONS = (1, 2)
+EC_BOUNDARY_SEMANTICS = "admitted_scope_drain"
 WORKLOADS = {
     "bfs": "BFS", "llama": "LLM", "mg": "MG", "wordcount": "WC",
     "kv-b": "KV-B", "kv-a": "KV-A", "kv-s": "KV-S", "nq": "NQ",
@@ -66,12 +72,28 @@ def parse_line(line):
         raise ValueError("missing EC fields: " + ", ".join(sorted(missing)))
     for key in ("schema_version", "boundary_sequence", "cycles", "scopes"):
         fields[key] = nonnegative_integer(fields[key], key)
-    if fields["schema_version"] != 1 or fields["boundary_sequence"] < 1:
-        raise ValueError("unsupported EC schema or no completed Work")
+    schema = fields["schema_version"]
+    if schema not in EC_SCHEMA_VERSIONS:
+        raise ValueError("unsupported EC schema")
+    if schema == 1:
+        if fields["phase"] != "work" or fields["boundary_sequence"] < 1:
+            raise ValueError("schema 1 requires a completed Work boundary")
+        if "boundary_semantics" in fields:
+            raise ValueError("schema 1 must not declare boundary semantics")
+    else:
+        if fields.get("boundary_semantics") != EC_BOUNDARY_SEMANTICS:
+            raise ValueError("unknown or missing schema 2 boundary semantics")
+        if fields["phase"] == "initialization":
+            if fields["boundary_sequence"] != 0:
+                raise ValueError("schema 2 initialization must use boundary_sequence=0")
+        elif fields["phase"] == "work":
+            if fields["boundary_sequence"] < 1:
+                raise ValueError("schema 2 Work must use boundary_sequence>=1")
+        else:
+            raise ValueError("schema 2 phase must be initialization or work")
     if fields["system"] not in SYSTEMS:
         raise ValueError("unsupported EC runtime")
-    for key, expected in (("phase", "work"), ("scope", "compute_ec"),
-                          ("clock", "tsc")):
+    for key, expected in (("scope", "compute_ec"), ("clock", "tsc")):
         if fields[key] != expected:
             raise ValueError(f"EC {key} must be {expected}")
     if fields["cycles"] and not fields["scopes"]:
