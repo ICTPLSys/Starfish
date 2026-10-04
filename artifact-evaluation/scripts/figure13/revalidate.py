@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicitly revalidate complete real runs rejected only by a log parser."""
+"""Revalidate complete runs rejected by a known log or Carbink accounting check."""
 import argparse
 import json
 from pathlib import Path

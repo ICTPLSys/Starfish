@@ -51,9 +51,11 @@ def prepare(path: Path, source_type="measured"):
         try:
             workload = canonical(row["workload"], WORKLOADS, "workload")
             system = canonical(row["system"], SYSTEMS, "system")
-            expected_metric = "service" if workload == "kv_b" else "total"
-            if source_type == "measured" and row.get("latency_metric") != expected_metric:
-                raise ValueError(f"measured {workload} requires latency_metric={expected_metric}")
+            metric = row.get("latency_metric", "")
+            if source_type == "measured":
+                allowed_metrics = {"total", "service"} if workload == "kv_b" else {"total"}
+                if metric not in allowed_metrics:
+                    raise ValueError(f"measured {workload} requires latency_metric=total")
             if (row["load_unit"], row["latency_unit"]) != UNITS[workload]:
                 raise ValueError(f"{workload} requires load/latency units {UNITS[workload]}")
             load = float(row["offered_load"])
@@ -65,7 +67,15 @@ def prepare(path: Path, source_type="measured"):
             keys.add(key)
             latency = None
             if row["p99_latency"]:
-                latency = float(row["p99_latency"])
+                if source_type == "measured" and workload == "kv_b":
+                    # Old CSVs also carry total P99 beside their service-valued
+                    # primary column. Never relabel service latency as total.
+                    total = row.get("p99_total_us", "").strip()
+                    if not total:
+                        raise ValueError("measured KV-B requires p99_total_us; service P99 cannot be plotted")
+                    latency = float(total)
+                else:
+                    latency = float(row["p99_latency"])
                 if not math.isfinite(latency) or latency <= 0:
                     raise ValueError("p99_latency must be finite and positive")
                 if row["source_type"] != source_type or not row["source"]:
@@ -76,7 +86,9 @@ def prepare(path: Path, source_type="measured"):
                 if "correctness" in row and row["correctness"].lower() != "pass":
                     raise ValueError("correctness must be pass")
             series[workload, system].append({"offered_load": load, "p99_latency": latency,
-                                             "latency_metric": row.get("latency_metric", "unspecified"),
+                                             "latency_metric": ("total" if source_type == "measured"
+                                                                else row.get("latency_metric", "unspecified")),
+                                             "p99_total_us": row.get("p99_total_us", ""),
                                              "source": row["source"],
                                              "exit_status": row.get("exit_status", "0"),
                                              "measurement_usable": row.get("measurement_usable", ""),
@@ -88,7 +100,7 @@ def prepare(path: Path, source_type="measured"):
         points.sort(key=lambda point: point["offered_load"])
     return {"figure": "figure10", "input": str(path.resolve()), "input_sha256": digest,
             "source_type": source_type, "metric": "P99 latency", "units": UNITS,
-            "metric_by_workload": ({"kv_b": "service: completion minus execution start",
+            "metric_by_workload": ({"kv_b": "total: completion minus planned Poisson arrival",
                                     "nq": "total: completion minus scheduled arrival"}
                                    if source_type == "measured" else {}),
             "series": {f"{workload}/{system}": series[workload, system]
@@ -158,7 +170,7 @@ def draw(data):
             ax.set_yticklabels([r"$10^0$", r"$10^1$", r"$10^2$", r"$10^3$"])
         else:
             ax.set_yticks([])
-        ax.set_ylabel(("P99 service (us)" if data["source_type"] == "measured"
+        ax.set_ylabel(("P99 total (us)" if data["source_type"] == "measured"
                        else "P99 latency (us)") if idx == 0 else "P99 latency (ms)",
                       fontsize=12.5, labelpad=2)
     handles = [Line2D([0], [0], marker=markers[i], linestyle=linestyles[i],

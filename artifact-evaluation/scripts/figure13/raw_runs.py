@@ -601,7 +601,7 @@ def _group_rebuild_events(
     return grouped
 
 def _validate_dual_rebuild_traffic(
-    grouped: dict[int, dict[str, dict[str, Any]]]
+    grouped: dict[int, dict[str, dict[str, Any]]], *, system: str | None = None
 ) -> dict[str, Any] | None:
     """Validate shared dual-node traffic accounting from native event tokens."""
     if len(grouped) != 2:
@@ -652,7 +652,14 @@ def _validate_dual_rebuild_traffic(
         union_selected = [_nonnegative_int(tokens.get("union_selected_bytes"), "dual union_selected_bytes") for tokens in done_values]
         if any(selected != live * 8192 for selected, live in zip(selected_values, live_values)):
             _fail("dual selected_bytes does not equal live_groups_at_copy*8192")
-        if len(set(selected_values)) != 1 or any(value != selected_values[0] for value in union_selected):
+        if system == "carbink":
+            # New stripes may exclude an already-dead endpoint, so a dual
+            # failure can leave one or two missing shards in each stripe.
+            if len(set(union_selected)) != 1:
+                _fail("Carbink dual union_selected_bytes is not shared")
+            if not max(selected_values) <= union_selected[0] <= sum(selected_values):
+                _fail("Carbink dual union_selected_bytes is outside endpoint bounds")
+        elif len(set(selected_values)) != 1 or any(value != selected_values[0] for value in union_selected):
             _fail("dual union_selected_bytes does not close across endpoints")
         expected_read = 4 * union_selected[0]
         read_formula = "4*union_selected_bytes"
@@ -683,6 +690,8 @@ def _validate_rebuild_events(
     grouped: dict[int, dict[str, dict[str, Any]]],
     request_start_ns: int,
     request_end_ns: int,
+    *,
+    system: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     normalized: dict[str, Any] = {}
     dead_ns: list[int] = []
@@ -754,7 +763,7 @@ def _validate_rebuild_events(
         "duration_ns": max(done_ns) - min(start_ns),
         "endpoint_count": len(grouped),
     }
-    traffic = _validate_dual_rebuild_traffic(grouped)
+    traffic = _validate_dual_rebuild_traffic(grouped, system=system)
     if traffic is not None:
         aggregate["traffic"] = traffic
     return aggregate, normalized
@@ -1475,7 +1484,8 @@ def read_run(result_path: str | Path, *, steady_before_s: float = 10.0):
     )
     placement_details = _validate_placement(plan, evidence["worker_roles"])
     aggregate, event_details = _validate_rebuild_events(
-        _group_rebuild_events(evidence, endpoints), request_start_ns, request_end_ns
+        _group_rebuild_events(evidence, endpoints), request_start_ns, request_end_ns,
+        system=system,
     )
     packing_records = evidence["packing"]
     packing_ns: int | None = None

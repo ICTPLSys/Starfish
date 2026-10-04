@@ -243,7 +243,7 @@ def overlay_config(effective: str, profile: Dict[str, Any]) -> str:
         _replace(lines, "ft_rmw_read_failure_fallback", "1")
         _replace(lines, "local_resident_budget_bytes", "3435973836")
     if profile["system"] == "carbink":
-        _replace(lines, "server_buffer_size", "10118758400")
+        _replace(lines, "server_buffer_size", "12884901888")
     return "".join(lines)
 
 
@@ -525,7 +525,8 @@ def validate_run(run_dir: Path, plan: Dict[str, Any],
     failed = [int(value) for value in plan["failed_endpoints"]]
     grouped = raw._group_rebuild_events(evidence, failed)
     aggregate, event_details = raw._validate_rebuild_events(
-        grouped, request_start_ns, request_end_ns)
+        grouped, request_start_ns, request_end_ns,
+        system=str(plan.get("system", "")).lower())
     if not injection.get("owned_identity_verified") or not injection.get(
             "process_stopped"):
         raise ValueError("Figure13 injection ownership evidence is incomplete")

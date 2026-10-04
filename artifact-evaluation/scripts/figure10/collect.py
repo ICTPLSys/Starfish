@@ -112,9 +112,8 @@ def point(directory):
     return {
         "workload": "NQ" if app == "nq" else "KV-B", "system": SYSTEM_LABEL[system],
         "offered_load": spec["offered_load_ops"] / (1e3 if app == "nq" else 1e6),
-        "p99_latency": (int(measured["p99_service_ns"]) if app == "kv-b"
-                        else result["p99_latency_ns"]) / p99_scale,
-        "latency_metric": "service" if app == "kv-b" else "total",
+        "p99_latency": result["p99_latency_ns"] / p99_scale,
+        "latency_metric": "total",
         "p99_total_us": result["p99_latency_ns"] / 1000,
         "load_unit": "Kops" if app == "nq" else "Mops",
         "latency_unit": "ms" if app == "nq" else "us",

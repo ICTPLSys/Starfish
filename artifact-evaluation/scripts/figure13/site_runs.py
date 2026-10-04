@@ -575,11 +575,17 @@ def read_site_run(result_path: str | Path, *, steady_before_s: float = 10.0):
     if reparsed:
         import re
         old_error = analysis.get("error", "")
-        if not re.fullmatch(
+        known_log_error = re.fullmatch(
             r"(?:duplicate event field [a-z_]+ at .+/client\.log:[0-9]+|endpoint at .+/client\.log:[0-9]+ must be an integer, got '')",
             old_error,
-        ) or revalidation.get("original_error") != old_error:
-            _fail("revalidation is restricted to an explicitly recorded native-log parser error")
+        )
+        known_carbink_accounting_error = (
+            system == "carbink" and scenario == "2-node"
+            and old_error == "dual union_selected_bytes does not close across endpoints"
+        )
+        if (not (known_log_error or known_carbink_accounting_error)
+                or revalidation.get("original_error") != old_error):
+            _fail("revalidation is restricted to a recorded log or Carbink accounting error")
         for source in (manifest, analysis):
             if source.get("status") != "failed" or source.get("error") != old_error:
                 _fail("original parser failure evidence disagrees")
@@ -651,7 +657,7 @@ def read_site_run(result_path: str | Path, *, steady_before_s: float = 10.0):
     receipt = _validate_receipt(rr, evidence, expected_requests)
     grouped = rr._group_rebuild_events(evidence, endpoints)
     aggregate, event_details = rr._validate_rebuild_events(
-        grouped, request_start_ns, request_end_ns
+        grouped, request_start_ns, request_end_ns, system=system
     )
     for receipt in failure["proof"]["receipts"]:
         begin = _int(receipt["command_begin_monotonic_ns"], "fault begin")

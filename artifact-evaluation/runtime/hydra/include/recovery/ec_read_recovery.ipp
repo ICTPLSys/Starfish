@@ -148,18 +148,34 @@ inline void ConcurrentArrayCache::note_ec_recovery_error_wc(const ibv_wc &wc) {
                 uthread::notify_all(&background_rebuild_cond_,
                                     &background_rebuild_mutex_);
             }
-            std::cerr << "INFO: ec_recovery endpoint_dead endpoint="
-                      << endpoint_idx << " qp_num=" << wc.qp_num
-                      << " wc_status=" << wc.status << " wr_id=" << wc.wr_id
-                      << " monotonic_ns=" << endpoint_dead_ns
-                      << std::endl;
+            // Rebuild workers can log immediately after notify_all. Publish
+            // every field and the newline together on their stdout stream;
+            // chained cerr insertions can split the measured failure record.
+            char record[512];
+            const int length = std::snprintf(
+                record, sizeof(record),
+                "INFO: ec_recovery endpoint_dead endpoint=%d qp_num=%u "
+                "wc_status=%u wr_id=%llu monotonic_ns=%llu\n",
+                endpoint_idx, wc.qp_num, static_cast<unsigned>(wc.status),
+                static_cast<unsigned long long>(wc.wr_id),
+                static_cast<unsigned long long>(endpoint_dead_ns));
+            ASSERT(length > 0 && static_cast<size_t>(length) < sizeof(record));
+            std::fwrite(record, 1, static_cast<size_t>(length), stdout);
+            std::fflush(stdout);
         }
     } else if (endpoint_idx < 0) {
         static std::atomic<int> unmapped_qp_log{0};
         if (unmapped_qp_log.fetch_add(1, std::memory_order_relaxed) < 10) {
-            std::cerr << "INFO: ec_recovery error_wc_unmapped_qp qp_num="
-                      << wc.qp_num << " wc_status=" << wc.status
-                      << " opcode=" << wc.opcode << std::endl;
+            char record[512];
+            const int length = std::snprintf(
+                record, sizeof(record),
+                "INFO: ec_recovery error_wc_unmapped_qp qp_num=%u "
+                "wc_status=%u opcode=%u\n",
+                wc.qp_num, static_cast<unsigned>(wc.status),
+                static_cast<unsigned>(wc.opcode));
+            ASSERT(length > 0 && static_cast<size_t>(length) < sizeof(record));
+            std::fwrite(record, 1, static_cast<size_t>(length), stdout);
+            std::fflush(stdout);
         }
     }
     // A tagged read failure is one terminal completion of one posted WR, not a
@@ -180,11 +196,16 @@ inline void ConcurrentArrayCache::note_ec_recovery_error_wc(const ibv_wc &wc) {
     ec_recovery_profile().note_segment_completion(false);
     if (event.kind == ec_read_recovery::EcReadTokenEventKind::kRelease) {
         finish_ec_read_context(token_id, event);
-        std::cerr << "INFO: ec_recovery read_abandoned token=" << token_id
-                  << " qp_num=" << wc.qp_num << " wc_status=" << wc.status
-                  << " segment="
-                  << static_cast<unsigned>(segment)
-                  << std::endl;
+        char record[512];
+        const int length = std::snprintf(
+            record, sizeof(record),
+            "INFO: ec_recovery read_abandoned token=%llu qp_num=%u "
+            "wc_status=%u segment=%u\n",
+            static_cast<unsigned long long>(token_id), wc.qp_num,
+            static_cast<unsigned>(wc.status), static_cast<unsigned>(segment));
+        ASSERT(length > 0 && static_cast<size_t>(length) < sizeof(record));
+        std::fwrite(record, 1, static_cast<size_t>(length), stdout);
+        std::fflush(stdout);
     }
 }
 

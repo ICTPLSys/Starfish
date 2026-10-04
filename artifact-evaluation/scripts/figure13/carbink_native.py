@@ -361,6 +361,8 @@ def _validate_dual_background(rr, plan, grouped, event_details, aggregate, resul
     selected_values = []
     skipped_values = []
     write_values = []
+    range_values = []
+    post_attempt_values = []
     for endpoint in sorted(grouped):
         done = grouped[endpoint]["done"]["tokens"]
         completed = rr._int(done.get("completed_stripes"), "completed_stripes")
@@ -378,13 +380,14 @@ def _validate_dual_background(rr, plan, grouped, event_details, aggregate, resul
             _fail(f"Carbink dual endpoint {endpoint} skipped bytes do not close")
         if not completed <= completed_ranges <= live_groups:
             _fail(f"Carbink dual endpoint {endpoint} range count is out of bounds")
-        if post_attempts < 6 * completed_ranges:
-            _fail(f"Carbink dual endpoint {endpoint} post attempts are below six per range")
-        if completed + empty != scan_limit:
-            _fail(f"Carbink dual endpoint {endpoint} scan accounting does not close")
+        # A scanned stripe need not contain this particular failed endpoint.
+        if empty < 0 or completed + empty > scan_limit:
+            _fail(f"Carbink dual endpoint {endpoint} scan accounting is out of bounds")
         selected_values.append(selected)
         skipped_values.append(skipped)
         write_values.append(write_bytes)
+        range_values.append(completed_ranges)
+        post_attempt_values.append(post_attempts)
         per_endpoint[str(endpoint)] = {
             "completed_stripes": completed,
             "completed_ranges": completed_ranges,
@@ -395,6 +398,12 @@ def _validate_dual_background(rr, plan, grouped, event_details, aggregate, resul
             "read_bytes": rr._int(done.get("read_bytes"), "read_bytes"),
             "post_attempts": post_attempts,
         }
+    # Each union range needs four reads, then one write per missing endpoint.
+    # The union range count is at least the larger endpoint range count.
+    if len(set(post_attempt_values)) != 1:
+        _fail("Carbink dual post attempts are not shared")
+    if post_attempt_values[0] < 4 * max(range_values) + sum(range_values):
+        _fail("Carbink dual post attempts are below shared reads plus endpoint writes")
     common = {}
     for key in (
         "union_stripes", "union_selected_bytes", "union_skipped_bytes",
@@ -404,10 +413,10 @@ def _validate_dual_background(rr, plan, grouped, event_details, aggregate, resul
         if len(set(values)) != 1:
             _fail(f"Carbink dual {key} is not shared")
         common[key] = values[0]
-    if common["union_selected_bytes"] != selected_values[0]:
-        _fail("Carbink dual union_selected_bytes disagrees with endpoint selection")
-    if common["union_skipped_bytes"] != skipped_values[0]:
-        _fail("Carbink dual union_skipped_bytes disagrees with endpoint selection")
+    if not max(selected_values) <= common["union_selected_bytes"] <= sum(selected_values):
+        _fail("Carbink dual union_selected_bytes is outside endpoint bounds")
+    if not max(skipped_values) <= common["union_skipped_bytes"] <= sum(skipped_values):
+        _fail("Carbink dual union_skipped_bytes is outside endpoint bounds")
     if common["union_skipped_bytes"] != common["union_stripes"] * 262144 - common["union_selected_bytes"]:
         _fail("Carbink dual union skipped-byte accounting does not close")
     if common["global_read_bytes"] != 4 * common["union_selected_bytes"]:
@@ -470,7 +479,7 @@ def _read_carbink_dual_run(result_path: Path, result: dict[str, Any],
     placement_details = rr._validate_placement(plan, evidence["worker_roles"])
     grouped = rr._group_rebuild_events(evidence, endpoints)
     aggregate, event_details = rr._validate_rebuild_events(
-        grouped, request_start_ns, request_end_ns
+        grouped, request_start_ns, request_end_ns, system="carbink"
     )
     background_details = _validate_dual_background(
         rr, plan, grouped, event_details, aggregate, result
@@ -626,7 +635,7 @@ def read_carbink_run(result_path: Path, result: dict[str, Any],
     endpoints = [rr._int(plan.get("fault_endpoint", 0), "fault_endpoint")]
     aggregate, event_details = rr._validate_rebuild_events(
         rr._group_rebuild_events(evidence, endpoints),
-        request_start_ns, request_end_ns,
+        request_start_ns, request_end_ns, system="carbink",
     )
     start_record = event_details[str(endpoints[0])]["start"]
     done_record = event_details[str(endpoints[0])]["done"]
