@@ -17,7 +17,7 @@ from batch_status import classify_case
 from collect import collect
 from kv_latency import DEFAULT_MAX_QUEUE_DELAY_US as KV_QUEUE_DELAY_US
 from nq_latency import DEFAULT_MAX_QUEUE_DELAY_US as NQ_QUEUE_DELAY_US
-from paper_loads import OFFERED_LOAD_OPS
+from paper_loads import FULL_OFFERED_LOAD_OPS, OFFERED_LOAD_OPS
 
 SYSTEMS = ("nonft", "starfish", "hydra", "carbink")
 APPS = ("kv-b", "nq")
@@ -64,6 +64,9 @@ def plans(args):
                 or len(explicit) != len(set(explicit))):
             raise ValueError("offered loads must be positive, distinct integers")
 
+    full = getattr(args, "full", False)
+    load_grid = FULL_OFFERED_LOAD_OPS if full else OFFERED_LOAD_OPS
+
     # System-major order is intentional: each system completes KV-B, then NQ,
     # before the next system is started.
     for system in systems:
@@ -73,9 +76,10 @@ def plans(args):
                 queue_us = NQ_QUEUE_DELAY_US if app == "nq" else KV_QUEUE_DELAY_US
             recipe = args.recipe or args.config_root / app / f"{system}.config"
             load_source = ("explicit" if explicit is not None else
+                           "ae_short_load_grid" if not full else
                            "ae_selected_load_grid" if app == "nq"
                            else "paper_figure10_x_axis")
-            loads = explicit if explicit is not None else OFFERED_LOAD_OPS[app][system]
+            loads = explicit if explicit is not None else load_grid[app][system]
             for load in loads:
                 for repeat in range(1, args.repeats + 1):
                     run_id = f"{app}-{system}-{load}ops-r{repeat}"
@@ -92,6 +96,9 @@ def plans(args):
                         "--latency-drain-ms", str(args.drain_ms),
                         "--max-queue-delay-us", str(queue_us),
                     ]
+                    if system == "nonft":
+                        # Figure10 KV-B and NQ: backup OFF, Resident ON.
+                        command += ["--baseline-variant", "nonft-backup-off"]
                     yield {"app": app, "system": system, "run_id": run_id,
                            "repeat": repeat, "offered_load_ops": load,
                            "load_source": load_source,
@@ -309,7 +316,10 @@ def main():
     parser.add_argument("--build-root", type=Path, default=AE_ROOT / "build")
     parser.add_argument("--config-root", type=Path, default=AE_ROOT / "configs")
     parser.add_argument("--recipe", type=Path)
-    parser.add_argument("--loads-ops", help="explicit aggregate request rates, comma separated")
+    parser.add_argument("--full", action="store_true",
+                        help="run the full load grid instead of the default short sweep")
+    parser.add_argument("--loads-ops",
+                        help="explicit aggregate request rates, comma separated; overrides either load grid")
     parser.add_argument("--warmup-ms", type=int, default=10000)
     parser.add_argument("--measure-ms", type=int, default=10000)
     parser.add_argument("--drain-ms", type=int, default=60000)

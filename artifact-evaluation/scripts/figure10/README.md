@@ -3,6 +3,8 @@
 The two-panel axes, line order, markers and log-latency scale follow the
 submitted figure. Data comes from the supplied CSV.
 
+We recommend the default short sweep (`bash scripts/figure10/run.sh`, approximately 12 hours for one repetition); add `--full` for the full load grid, which is expected to take more than 24 hours.
+
 Required CSV columns:
 
 `workload,system,offered_load,p99_latency,load_unit,latency_unit,source_type,source`

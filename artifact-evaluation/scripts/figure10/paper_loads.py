@@ -5,10 +5,11 @@
 # Cross-checked against papers/starfish-nsdi/images/eval/eval_figure_02.pdf.
 # Copy ONLY the x-axis points, not the paper's P99 values or measurement claims.
 # KV-B: paper Mops * 1_000_000; axis ticks are not load points.
-# NQ: retain each paper point count, space evenly from 1k QPS to the selected
-# scan limit, and round to 100 QPS (half up). These are not paper load points.
+# NQ: AE-selected points, not paper load points. NonFT/Starfish share the
+# 60k, 70k, 75k, 78k, 80k and 82k high-load points; Starfish has fewer low-load
+# points to avoid extending its full sweep when adding the high-load points.
 # Hydra/Carbink scan limits are provisional, pending offered-load measurements.
-OFFERED_LOAD_OPS = {
+FULL_OFFERED_LOAD_OPS = {
     "kv-b": {
         "hydra": [
             169000, 673000, 1339000, 1972000, 2515000, 2960000,
@@ -34,13 +35,33 @@ OFFERED_LOAD_OPS = {
             12100, 13700, 15300, 16800, 18400, 20000,
         ],
         "starfish": [
-            1000, 4700, 8400, 12100, 15800, 19400, 23100, 26800, 30500,
-            34200, 37900, 41600, 45300, 48900, 52600, 56300, 60000,
+            1000, 8400, 15800, 23100, 30500, 37900, 41600, 45300, 48900,
+            52600, 56300, 60000, 70000, 75000, 78000, 80000, 82000,
         ],
         "nonft": [
             1000, 5900, 10900, 15800, 20800, 25700, 30600, 35600, 40500,
-            45400, 50400, 55300, 60300, 65200, 70100, 75100, 80000,
+            45400, 50400, 55300, 60000, 60300, 65200, 70000, 70100,
+            75000, 75100, 78000, 80000, 82000,
         ],
+    },
+}
+
+# Default short sweep: 12 KV-B points and 20 NQ points, approximately 12 hours
+# at 10 minutes per KV-B point and 30 minutes per NQ point (one repetition).
+# Each short curve is evenly spaced between its full-grid minimum and maximum.
+# Only the load grid changes; workload, timing, capture and checks stay intact.
+OFFERED_LOAD_OPS = {
+    "kv-b": {
+        "hydra": [169000, 2090000, 4011000],
+        "carbink": [117000, 2277500, 4438000],
+        "starfish": [324000, 8889500, 17455000],
+        "nonft": [362000, 9931000, 19500000],
+    },
+    "nq": {
+        "hydra": [1000, 7500, 14000],
+        "carbink": [1000, 10500, 20000],
+        "starfish": [1000, 14500, 28000, 41500, 55000, 68500, 82000],
+        "nonft": [1000, 14500, 28000, 41500, 55000, 68500, 82000],
     },
 }
 
