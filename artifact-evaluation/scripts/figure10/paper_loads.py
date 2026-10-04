@@ -46,16 +46,16 @@ FULL_OFFERED_LOAD_OPS = {
     },
 }
 
-# Default short sweep: 12 KV-B points and 20 NQ points, approximately 12 hours
+# Default short sweep: 20 KV-B points and 20 NQ points, about 13 hours 20 minutes
 # at 10 minutes per KV-B point and 30 minutes per NQ point (one repetition).
 # Each short curve is evenly spaced between its full-grid minimum and maximum.
 # Only the load grid changes; workload, timing, capture and checks stay intact.
 OFFERED_LOAD_OPS = {
     "kv-b": {
-        "hydra": [169000, 2090000, 4011000],
-        "carbink": [117000, 2277500, 4438000],
-        "starfish": [324000, 8889500, 17455000],
-        "nonft": [362000, 9931000, 19500000],
+        "hydra": [169000, 1129500, 2090000, 3050500, 4011000],
+        "carbink": [117000, 1197250, 2277500, 3357750, 4438000],
+        "starfish": [324000, 4606750, 8889500, 13172250, 17455000],
+        "nonft": [362000, 5146500, 9931000, 14715500, 19500000],
     },
     "nq": {
         "hydra": [1000, 7500, 14000],
