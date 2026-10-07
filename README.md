@@ -193,6 +193,14 @@ From `artifact-evaluation/`:
 The Figure 9 runner writes `data/figure9.csv`. Input formats and output files
 are described in the linked figure guides.
 
+### Paper claims evaluated
+
+- **Figure 9:** Starfish outperforms Carbink and Hydra in overall application performance and remains close to Non-FT.
+- **Figure 10:** Starfish outperforms Carbink and Hydra in tail-latency performance under varying offered load and remains close to Non-FT.
+- **Figure 11:** Starfish reduces fetch and eviction traffic compared with Hydra and Carbink, and reduces eviction traffic compared with Non-FT.
+- **Figure 12:** Starfish incurs limited EC computation and metadata overhead compared with Carbink.
+- **Figure 13:** Starfish achieves recovery efficiency comparable to that of Carbink and Hydra.
+
 Runs start and stop memory services: use unused ports and dedicated result
 directories on authorized hosts. Failure injection must target isolated
 services, never production endpoints.
