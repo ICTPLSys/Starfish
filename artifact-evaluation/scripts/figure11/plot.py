@@ -84,12 +84,156 @@ def prepare(path: Path, source_type="measured", *, components=None, workloads=No
                         components=components, workloads=workloads)
 
 
+def _independent_cpu_row(record, *, warning):
+    """Build a raw CPU row when no NonFT normalizer record is available.
+
+    Remote CPU cores are normalized by the record's own elapsed CPU window;
+    unlike traffic and memory, they do not use a NonFT denominator.  Keep the
+    row diagnostic when the cross-run baseline is absent because context cannot
+    be compared.  All record-level validation has already happened in
+    ``collect_records``.
+    """
+    if record["system"] == "nonft" and (
+            record.get("baseline_variant") != "nonft-backup-off"
+            or log_contract.backup_flag(record.get("backup_enabled"))
+            or record.get("off_policy") != log_contract.NONFT_REFERENCE_POLICY
+            or log_contract._integer(
+                record.get("local_resident_budget_bytes"),
+                "local_resident_budget_bytes") <= 0
+            or not log_contract.backup_flag(record.get("resident_enabled"))):
+        raise ValueError("formal Figure 11 NonFT requires verified backup OFF, Resident ON")
+    raw = float(record["remote_cpu_seconds"])
+    normalizer = float(record["remote_cpu_elapsed_s"])
+    if (not math.isfinite(raw) or raw < 0 or
+            not math.isfinite(normalizer) or normalizer <= 0):
+        raise ValueError("remote_cpu_seconds and remote_cpu_elapsed_s must be valid")
+    value = raw / normalizer
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{record['workload']}/{record['system']}: invalid remote_cpu_cores")
+    return {
+        "workload": log_contract.WORKLOADS[record["workload"]],
+        "system": log_contract.SYSTEMS[record["system"]],
+        "component": "remote_cpu_cores",
+        "value": format(value, ".12g"),
+        "unit": "cores",
+        "source_type": "measured",
+        "source": record["_source"],
+        "exit_status": "0",
+        "correctness": "pass",
+        "run_id": record["run_id"],
+        "baseline_run_id": "",
+        "ratio": record["ratio"],
+        "app_workers": record["app_workers"],
+        "repeat": record["repeat"],
+        "environment": record["environment"],
+        "baseline_environment": "",
+        "environment_match": "baseline_missing",
+        "warning": warning,
+        "workload_id": record["workload_id"],
+        "measurement_phase": record["remote_cpu_window"],
+        "aggregation": "sum",
+        "window": record["remote_cpu_window"],
+        "metric": "remote_cpu_seconds",
+        "sampling": "",
+        "samples": "",
+        "origin": "",
+        "work_window_id": "",
+        "end_monotonic_ns": "",
+        "scheduled_samples": "",
+        "missing_samples": "",
+        "expected_samples": "",
+        "work_duration_ns": "",
+        "missing_times_s": "",
+        "end_status": "",
+        "raw_value": raw,
+        "normalizer": normalizer,
+        "raw_unit": "cpu_seconds",
+        "normalizer_unit": "seconds",
+        "scheduled_times_s": "",
+        "sample_times_s": "",
+        "baseline_samples": "",
+        "baseline_sampling": "",
+        "baseline_variant": record.get("baseline_variant", record["system"]),
+        "backup_enabled": str(record["backup_enabled"]).lower()
+            if "backup_enabled" in record else "",
+        "normalizer_variant": "",
+        "off_policy": record.get("off_policy", ""),
+        "local_resident_budget_bytes": record.get("local_resident_budget_bytes", ""),
+        "resident_enabled": record.get("resident_enabled", ""),
+        "normalizer_off_policy": "",
+        "normalizer_resident_budget_bytes": "",
+        "normalizer_resident_enabled": "",
+    }
+
+
+def _collect_log_rows(logs_root, *, pattern, ratio, repeat, components,
+                      allow_unmatched_environments, return_skipped=False):
+    """Collect valid log components independently, preserving partial input.
+
+    ``collect_rows`` intentionally enforces a complete selected component set
+    per run.  Figure 11's plot contract permits missing conditions, so use its
+    strict record parser and context checks while assembling only components
+    that are actually present.  This keeps invalid records as errors and omits
+    normalized values whose NonFT component denominator is absent.
+    """
+    from figure11 import collect
+
+    if ratio != 25:
+        raise ValueError("Figure 11 is fixed at ratio=25; do not substitute another ratio")
+    selected = collect.requested_components(components)
+    collected = collect.collect_records(
+        logs_root, pattern=pattern, ratio=ratio, repeat=repeat,
+        components=selected, skip_unfinalized=True, return_skipped=True)
+    if isinstance(collected, tuple) and len(collected) == 2:
+        records, skipped = collected
+    else:
+        # Keep focused callers that provide a legacy raw collector stub
+        # compatible; the real collector always returns the tuple above.
+        records, skipped = collected, []
+    rows = []
+    for app in collect.WORKLOADS:
+        selected_records = [
+            records[app, system] for system in collect.SYSTEMS
+            if (app, system) in records
+        ]
+        if not selected_records:
+            continue
+        baseline = records.get((app, "nonft"))
+        baseline_components = (set(collect.log_contract.component_names(baseline))
+                               if baseline is not None else set())
+        for record in selected_records:
+            available = set(collect.log_contract.component_names(record))
+            for component in selected:
+                if component not in available:
+                    continue
+                if component != "remote_cpu_cores" and (
+                        baseline is None or component not in baseline_components):
+                    # Traffic and memory are ratios to the same-workload NonFT
+                    # component.  No denominator means no defined plotted value.
+                    continue
+                if baseline is None:
+                    rows.append(_independent_cpu_row(
+                        record,
+                        warning=(
+                            "missing NonFT baseline; raw remote CPU retained "
+                            "without cross-run comparison")))
+                    continue
+                environment_match, warning = collect._context_status(
+                    record, baseline,
+                    allow_unmatched_environments=allow_unmatched_environments)
+                rows.append(collect._make_row(
+                    record, baseline, component, ratio=ratio, repeat=repeat,
+                    environment_match=environment_match, warning=warning))
+    return (rows, skipped) if return_skipped else rows
+
+
 def prepare_logs(logs_root: Path, *, pattern="*.log", ratio=25, repeat=1,
                  components=None, workloads=None, allow_unmatched_environments=False):
-    from figure11.collect import collect_rows
-    rows = collect_rows(logs_root, pattern=pattern, ratio=ratio, repeat=repeat,
-                        components=components,
-                        allow_unmatched_environments=allow_unmatched_environments)
+    rows, skipped = _collect_log_rows(
+        logs_root, pattern=pattern, ratio=ratio, repeat=repeat,
+        components=components,
+        allow_unmatched_environments=allow_unmatched_environments,
+        return_skipped=True)
     digest = hashlib.sha256(
         json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     data = prepare_rows(list(enumerate(rows, 1)), digest,
@@ -98,7 +242,11 @@ def prepare_logs(logs_root: Path, *, pattern="*.log", ratio=25, repeat=1,
     data.update(input_format="figure11_measured_logs",
                 input_hash_scope="canonical_collected_rows",
                 ratio=ratio, repeat=repeat, log_pattern=pattern,
-                collected_rows=rows)
+                collected_rows=rows, skipped_runs=skipped)
+    if skipped:
+        data["warnings"] = sorted(set(data["warnings"]) | {
+            "raw log input skipped unfinished, unselected, or formally "
+            f"ineligible run(s): {len(skipped)}; see skipped_runs"})
     return data
 
 
@@ -205,8 +353,20 @@ def _validate_measured(row, system, component):
     for key in ("run_id", "environment", "workload_id"):
         if not row.get(key):
             raise ValueError(f"measured row is missing {key}")
-    if row.get("environment_match") not in ("matched", "unmatched_allowed"):
+    environment_match = row.get("environment_match")
+    if environment_match not in ("matched", "unmatched_allowed", "baseline_missing"):
         raise ValueError("measured row requires environment-match provenance")
+    if environment_match == "baseline_missing":
+        if (component != "remote_cpu_cores"
+                or row.get("baseline_run_id") not in (None, "")
+                or row.get("baseline_environment") not in (None, "")
+                or row.get("normalizer_variant") not in (None, "")
+                or row.get("normalizer_off_policy") not in (None, "")
+                or row.get("normalizer_resident_budget_bytes") not in (None, "")
+                or row.get("normalizer_resident_enabled") not in (None, "")):
+            raise ValueError(
+                "baseline_missing provenance is restricted to unpaired raw remote CPU rows"
+            )
     raw = float(row["raw_value"])
     normalizer = float(row["normalizer"])
     if not math.isfinite(raw) or raw < 0 or not math.isfinite(normalizer) or normalizer <= 0:
@@ -261,13 +421,18 @@ def prepare_rows(numbered_rows, digest, input_name, source_type="measured",
         raise ValueError("no nonblank values in the selected workloads/components")
     missing = [[w, s, c] for w in selected_workloads for s in SYSTEMS for c in selected_components
                if (w, s, c) not in values]
+    if missing:
+        warnings.add(
+            f"partial Figure 11 input: omitted {len(missing)} missing condition(s)")
     return {"figure": "figure11", "input": input_name, "input_sha256": digest,
             "source_type": source_type,
             "components": {c: COMPONENTS[c] for c in selected_components},
             "workloads": selected_workloads,
             "warnings": sorted(warnings),
-            "diagnostic_only": any(record.get("environment_match") == "unmatched_allowed"
-                                   for record in values.values()),
+            "partial_input": bool(missing),
+            "diagnostic_only": any(record.get("environment_match") in
+                                    ("unmatched_allowed", "baseline_missing")
+                                    for record in values.values()),
             "input_rows": len(numbered_rows), "blank_rows": blanks,
             "missing_conditions": missing,
             "values": {"/".join(key): record for key, record in values.items()}}
@@ -354,6 +519,7 @@ def draw(data):
                              sharex=False, sharey=False)
     x_positions = (np.arange(len(SYSTEMS)) - (len(SYSTEMS) - 1) / 2) * 0.20
     colors = [SYSTEM_STYLES[s]["facecolor"] for s in SYSTEMS]
+    plotted_any = False
     for metric_idx, components in enumerate(row_metrics):
         traffic = components[0] in ("fetch_traffic", "eviction_traffic")
         row_label = (
@@ -370,6 +536,7 @@ def draw(data):
                 # Traffic must have both components; a partial stack is not a total.
                 if any(record is None for record in records):
                     continue
+                plotted_any = True
                 bottom = 0.0
                 for component_idx, record in enumerate(records):
                     value = record["value"]
@@ -400,13 +567,17 @@ def draw(data):
             ax.tick_params(axis="x", direction="in", length=2.5, pad=1.0)
             if app_idx == 0:
                 ax.set_ylabel(row_label, fontsize=fonts["axis_label"], labelpad=4)
+    if not plotted_any:
+        plt.close(fig)
+        raise ValueError("selected Figure 11 data has no drawable conditions")
     handles = [Patch(facecolor=colors[i], edgecolor="black",
                      hatch=SYSTEM_STYLES[s]["hatch"],
                      label=SYSTEM_STYLES[s]["label"])
                for i, s in enumerate(SYSTEMS)]
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(.5, 1.01),
                ncol=4, frameon=False, fontsize=fonts["legend"])
-    fig.subplots_adjust(left=.065, right=.995, bottom=.085, top=.76,
+    left_margin = .12 if len(workloads) < len(WORKLOADS) else .065
+    fig.subplots_adjust(left=left_margin, right=.995, bottom=.085, top=.76,
                         wspace=.30, hspace=.62)
     row_captions = [_row_caption(components) for components in row_metrics]
     left = axes[0, 0].get_position().x0

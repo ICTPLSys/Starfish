@@ -104,17 +104,94 @@ def _collect_final_records(root, *, pattern, ratio, repeat):
 
 
 def _raw_records(root, *, pattern, ratio, repeat, components, raw_collector):
-    if raw_collector is None:
-        raw_collector = raw_runs.collect_records if raw_runs is not None else None
-    if raw_collector is None:
+    records, _ = _raw_records_with_options(
+        root, pattern=pattern, ratio=ratio, repeat=repeat,
+        components=components, raw_collector=raw_collector,
+        skip_unfinalized=False)
+    return records
+
+
+def _raw_records_skip_unfinalized(root, *, pattern, ratio, repeat, components):
+    """Collect raw runs while omitting only clearly unfinished directories.
+
+    The raw adapter remains fail-closed for malformed metadata and finalized
+    run/log corruption.  This opt-in path is used by plotting only: metadata
+    files that are present are parsed first, then a directory missing either
+    required final ``analysis.json`` or ``manifest.json`` is recorded as an
+    unfinished skip before strict run parsing.
+    """
+    if raw_runs is None:
         raise ValueError(
             "no schema-v3 figure11_result records and raw_runs.collect_records "
             "is unavailable; raw collection requires original logs and "
             "remote-cpu.json sidecars")
-    result = raw_collector(
-        root, pattern=pattern, ratio=ratio, repeat=repeat,
-        components=components)
+    records, skipped = [], []
+    for run_dir, paths in raw_runs._discover(Path(root), pattern):
+        documents, files = [], {}
+        for name in ("analysis.json", "result.json", "run-result.json",
+                     "manifest.json", "plan.json"):
+            path = paths.get(name)
+            if path is not None:
+                # Do not classify a malformed present JSON document as merely
+                # unfinished because a sibling final document is absent.
+                documents.append(raw_runs._load(path))
+                files[name] = path
+        missing = [name for name in ("analysis.json", "manifest.json")
+                   if paths.get(name) is None]
+        if missing:
+            skipped.append(
+                f"unfinished run missing {', '.join(missing)}: {run_dir}")
+            continue
+        # Validate complete metadata identity before allowing an unselected
+        # ratio/repeat to bypass strict log parsing.
+        documents, files = raw_runs._documents(run_dir, paths)
+        layers = raw_runs._layers(documents)
+        observed_repeat = raw_runs._observed_repeat(
+            documents, files, layers, run_dir)
+        if observed_repeat != repeat:
+            skipped.append(
+                f"different repeat: {run_dir} (observed={observed_repeat})")
+            continue
+        observed_ratio = raw_runs._first(
+            layers, "ratio", "put_ratio_percent")
+        if observed_ratio is not None:
+            observed_ratio = raw_runs._int(observed_ratio, "ratio")
+            if observed_ratio != ratio:
+                skipped.append(
+                    f"different ratio: {run_dir} (observed={observed_ratio})")
+                continue
+        try:
+            records.append(raw_runs._parse_run(
+                run_dir, paths, components, ratio, repeat))
+        except raw_runs._SkipRun as exc:
+            skipped.append(str(exc))
+    return {"records": records, "skipped": skipped}
+
+
+def _raw_records_with_options(root, *, pattern, ratio, repeat, components,
+                              raw_collector, skip_unfinalized):
+    if raw_collector is None:
+        if skip_unfinalized:
+            result = _raw_records_skip_unfinalized(
+                root, pattern=pattern, ratio=ratio, repeat=repeat,
+                components=components)
+        else:
+            raw_collector = raw_runs.collect_records if raw_runs is not None else None
+            result = None
+    else:
+        result = None
+    if result is None and raw_collector is None:
+        raise ValueError(
+            "no schema-v3 figure11_result records and raw_runs.collect_records "
+            "is unavailable; raw collection requires original logs and "
+            "remote-cpu.json sidecars")
+    if result is None:
+        result = raw_collector(
+            root, pattern=pattern, ratio=ratio, repeat=repeat,
+            components=components)
+    skipped = []
     if isinstance(result, dict):
+        skipped = list(result.get("skipped", ()))
         result = result.get("records", result.values())
     records = {}
     seen_runs = set()
@@ -123,11 +200,12 @@ def _raw_records(root, *, pattern, ratio, repeat, components, raw_collector):
         _accept_record(
             records, seen_runs, record, source,
             ratio=ratio, repeat=repeat)
-    return records
+    return records, skipped
 
 
 def collect_records(logs_root, *, pattern="*.log", ratio=25, repeat=1,
-                    components=None, raw_collector=None):
+                    components=None, raw_collector=None,
+                    skip_unfinalized=False, return_skipped=False):
     """Return selected schema-v3 records keyed by (workload, system)."""
     root = Path(logs_root).resolve()
     if not root.is_dir():
@@ -137,14 +215,19 @@ def collect_records(logs_root, *, pattern="*.log", ratio=25, repeat=1,
     selected = requested_components(components)
     records = _collect_final_records(
         root, pattern=pattern, ratio=ratio, repeat=repeat)
+    skipped = []
     if not records:
-        records = _raw_records(
+        records, skipped = _raw_records_with_options(
             root, pattern=pattern, ratio=ratio, repeat=repeat,
-            components=selected, raw_collector=raw_collector)
+            components=selected, raw_collector=raw_collector,
+            skip_unfinalized=skip_unfinalized)
     if not records:
+        detail = (f"; skipped raw runs: {len(skipped)} ({'; '.join(skipped[:3])})"
+                  if skipped else "")
         raise ValueError(
-            f"no schema-v3 records for ratio={ratio}, repeat={repeat} under {root}")
-    return records
+            f"no schema-v3 records for ratio={ratio}, repeat={repeat} under {root}"
+            + detail)
+    return (records, skipped) if return_skipped else records
 
 
 def _context_status(record, baseline, *, allow_unmatched_environments):

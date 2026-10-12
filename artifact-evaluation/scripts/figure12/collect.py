@@ -124,7 +124,21 @@ def read_run(directory, *, ratio=25, repeat=1, metrics="all", indexed=False):
     return rows
 
 
-def discover_run_dirs(root, *, repeat=1):
+def _skipped_case(case, directory, reason):
+    return {
+        "run_id": case["run_id"], "app": case["app"], "system": case["system"],
+        "reason": reason, "path": str(directory.resolve()),
+    }
+
+
+def skipped_warnings(skipped):
+    return [
+        f"skipped {item['app']}/{item['system']} run {item['run_id']}: {item['reason']}"
+        for item in skipped
+    ]
+
+
+def discover_run_dirs(root, *, repeat=1, include_skips=False):
     root = Path(root)
     if not root.is_dir():
         raise ValueError("logs root must exist")
@@ -133,12 +147,17 @@ def discover_run_dirs(root, *, repeat=1):
         plan = json.loads(index.read_text())
         if not isinstance(plan, list):
             raise ValueError("batch-plan.json must be a case list")
-        directories, seen = [], set()
+        directories, skipped, seen = [], [], set()
         for case in plan:
             if not isinstance(case, dict):
                 raise ValueError("batch plan cases must be objects")
             if case.get("repeat") != repeat:
                 continue
+            if (not isinstance(case.get("app"), str) or
+                    case["app"] not in contract.WORKLOADS or
+                    not isinstance(case.get("system"), str) or
+                    case["system"] not in contract.SYSTEMS):
+                raise ValueError("invalid batch case workload/system")
             run_id = case["run_id"]
             if (not isinstance(run_id, str) or not run_id or
                     Path(run_id).name != run_id or run_id in (".", "..") or
@@ -149,28 +168,51 @@ def discover_run_dirs(root, *, repeat=1):
             # values into an unrelated checkout or another experiment.
             directory = root / "runs" / run_id
             if not directory.is_dir():
-                raise ValueError(f"batch case missing: {directory}")
-            manifest = json.loads((directory / "manifest.json").read_text())
+                skipped.append(_skipped_case(case, directory, "not_run"))
+                continue
+            manifest_path = directory / "manifest.json"
+            if not manifest_path.is_file():
+                skipped.append(_skipped_case(case, directory,
+                                             "unfinalized_missing_manifest"))
+                continue
+            manifest = json.loads(manifest_path.read_text())
+            if not isinstance(manifest, dict):
+                raise ValueError(f"{directory}: manifest must be an object")
             actual = manifest["plan"]
             if any(actual.get(key) != case.get(key)
                    for key in ("run_id", "app", "system")):
                 raise ValueError(f"{directory}: batch/manifest context mismatch")
+            analysis_path = directory / "analysis.json"
+            if not analysis_path.is_file():
+                skipped.append(_skipped_case(case, directory,
+                                             "unfinalized_missing_analysis"))
+                continue
+            analysis = json.loads(analysis_path.read_text())
+            if not isinstance(analysis, dict):
+                raise ValueError(f"{directory}: analysis must be an object")
+            if (manifest.get("status") == "running" and
+                    analysis.get("status") == "running"):
+                skipped.append(_skipped_case(case, directory,
+                                             "unfinalized_running"))
+                continue
             directories.append(directory)
         if not directories:
             raise ValueError(f"batch has no cases for repeat {repeat}")
-        return directories
+        return (directories, skipped) if include_skips else directories
     if repeat != 1:
         raise ValueError("--repeat requires batch-plan.json; use explicit --run-dir "
                          "for older runs, never infer repeats from directory suffixes")
     # Discover manifests, not only successful analyses: unfinished cases must
     # fail validation rather than silently disappear.
-    return [path.parent for path in sorted(root.rglob("manifest.json"))]
+    directories = [path.parent for path in sorted(root.rglob("manifest.json"))]
+    return (directories, []) if include_skips else directories
 
 
-def collect_rows(root, *, ratio=25, repeat=1, metrics="all"):
-    return collect_run_dirs(discover_run_dirs(root, repeat=repeat), ratio=ratio,
-                            repeat=repeat, metrics=metrics,
+def collect_rows(root, *, ratio=25, repeat=1, metrics="all", include_skips=False):
+    directories, skipped = discover_run_dirs(root, repeat=repeat, include_skips=True)
+    rows = collect_run_dirs(directories, ratio=ratio, repeat=repeat, metrics=metrics,
                             indexed=(Path(root) / "batch-plan.json").is_file())
+    return (rows, skipped) if include_skips else rows
 
 
 def main(argv=None):
@@ -198,21 +240,25 @@ def main(argv=None):
         if args.summary and args.summary.resolve() == args.output.resolve():
             raise ValueError("CSV output and JSON summary must be different paths")
         options = dict(ratio=args.ratio, repeat=args.repeat, metrics=args.metrics)
-        rows = (collect_run_dirs(args.run_dir, **options) if args.run_dir else
-                collect_rows(args.logs_root, **options))
+        if args.run_dir:
+            rows, skipped = collect_run_dirs(args.run_dir, **options), []
+        else:
+            rows, skipped = collect_rows(args.logs_root, include_skips=True, **options)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=FIELDS)
             writer.writeheader()
             writer.writerows(rows)
         warnings = sorted({row["measurement_warning"] for row in rows
-                           if row["measurement_warning"]})
+                           if row["measurement_warning"]} |
+                          set(skipped_warnings(skipped)))
         if args.summary:
             args.summary.parent.mkdir(parents=True, exist_ok=True)
             summary = {"schema_version": 3, "figure": "figure12",
                        "metrics": args.metrics, "repeat": rows[0]["repeat"],
                        "cycle_clock": "tsc", "metadata_numerator": "accounted_bytes",
-                       "warnings": warnings, "rows": rows}
+                       "warnings": warnings, "skipped_conditions": skipped,
+                       "rows": rows}
             ec_rows = [row for row in rows if row["metric"] == "local_ec_cpu_cycles"]
             if ec_rows:
                 summary.update(

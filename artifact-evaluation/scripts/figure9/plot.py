@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot paper Figure 9 from explicit CSV measurements."""
+"""Plot paper Figure 9 from verified CSV measurements or completed run logs."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import csv
 from collections import defaultdict
 import hashlib
+import json
 import math
 from pathlib import Path
 import statistics
@@ -17,6 +18,7 @@ import numpy as np
 SCRIPTS = Path(__file__).resolve().parents[1]
 AE_ROOT = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS / "common"))
+sys.path.insert(0, str(SCRIPTS))
 from plotting import SYSTEM_STYLES, export_figure, get_pyplot, read_csv
 
 REQUIRED = {"workload", "system", "ratio", "elapsed_s", "source_type", "source"}
@@ -99,6 +101,33 @@ def run_metadata(row):
 
 def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
             ratios=DEFAULT_RATIOS, source_type="measured"):
+    numbered_rows, digest = read_csv(path, REQUIRED)
+    return prepare_rows(numbered_rows, digest, path, workloads, systems, ratios, source_type)
+
+
+def prepare_logs(logs_root: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
+                 ratios=DEFAULT_RATIOS):
+    """Reuse the collector's acceptance rules without writing a new CSV."""
+    from figure9.collect import collect
+    runs = logs_root / "runs" if (logs_root / "runs").is_dir() else logs_root
+    rows, nonpassed = collect(runs)
+    payload = json.dumps(rows, sort_keys=True, allow_nan=False).encode("utf-8")
+    numbered = [(index + 2, {key: str(value) for key, value in row.items()})
+                for index, row in enumerate(rows)]
+    data = prepare_rows(numbered, hashlib.sha256(payload).hexdigest(), runs,
+                        workloads, systems, ratios, "measured")
+    data.update(input_kind="verified_run_logs",
+                input_sha256_basis="collector rows serialized as sorted-key JSON",
+                nonpassed_execution_count=nonpassed,
+                unfinished_runs=[str(path.parent.relative_to(runs))
+                                 for path in sorted(runs.rglob("manifest.json"))
+                                 if path.with_name("effective.config").is_file()
+                                 and not path.with_name("analysis.json").is_file()])
+    return data
+
+
+def prepare_rows(numbered_rows, digest, path, workloads=DEFAULT_WORKLOADS,
+                 systems=DEFAULT_SYSTEMS, ratios=DEFAULT_RATIOS, source_type="measured"):
     """Validate every row, select the requested matrix, and summarize repetitions."""
     if source_type not in set(SOURCE_TYPES.values()):
         raise ValueError(f"unknown source type: {source_type}")
@@ -120,7 +149,6 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
         (w, NONFT_SOURCE_SYSTEMS[w] if s == "nonft" else s, r)
         for w in workloads for s in systems for r in ratios
     } | {(w, "native", 100) for w in workloads}
-    numbered_rows, digest = read_csv(path, REQUIRED)
     groups = defaultdict(list)
     blank_rows = []
     ignored_backup_off_rows = []
@@ -237,6 +265,9 @@ def prepare(path: Path, workloads=DEFAULT_WORKLOADS, systems=DEFAULT_SYSTEMS,
     for (workload, field), values in contexts.items():
         if len(values) > 1:
             raise ValueError(f"{workload}: mixed {field} values: {sorted(values)}")
+    if not any(point["n"] for point in points) and not any(
+            value["n"] for value in native_baselines.values()):
+        raise ValueError("no verified values in the selected conditions; missing is not zero")
     return {
         "schema_version": 3, "figure": "figure9",
         "input": str(path.resolve()), "input_sha256": digest,
@@ -364,7 +395,10 @@ def draw(data):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=AE_ROOT / "data/figure9.csv")
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--input", type=Path)
+    inputs.add_argument("--logs-root", type=Path,
+                        help="read only finalized, verified cases from a batch or runs directory")
     parser.add_argument("--output-dir", type=Path, default=AE_ROOT / "results/figures/figure9")
     parser.add_argument("--source-type", choices=sorted(set(SOURCE_TYPES.values())), default="measured")
     parser.add_argument("--workloads", nargs="+", default=list(DEFAULT_WORKLOADS))
@@ -373,16 +407,29 @@ def main(argv=None):
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     try:
-        data = prepare(args.input, args.workloads, args.systems, args.ratios, args.source_type)
+        input_path = args.input or AE_ROOT / "data/figure9.csv"
+        if args.logs_root is not None:
+            if args.source_type != "measured":
+                raise ValueError("--logs-root accepts measured records only")
+            data = prepare_logs(args.logs_root, args.workloads, args.systems, args.ratios)
+        else:
+            data = prepare(input_path, args.workloads, args.systems, args.ratios, args.source_type)
         available = len(data["points"]) - len(data["missing_conditions"])
         print(f"validated {data['selected_rows']}/{data['input_rows']} rows, "
               f"{available}/{len(data['points'])} points available, "
               f"source_type={args.source_type}")
+        if data["missing_conditions"]:
+            print(f"warning: Figure 9 is partial: {len(data['missing_conditions'])} "
+                  "conditions missing; available values are plotted without zero filling",
+                  file=sys.stderr)
+        if data.get("unfinished_runs"):
+            print("warning: unfinished runs excluded: " + ", ".join(data["unfinished_runs"]),
+                  file=sys.stderr)
         if args.validate_only:
             return 0
         stem = "figure9" + ("" if args.source_type == "measured" else "-" + args.source_type)
         # Do not overwrite input data even if the caller chooses an odd filename.
-        if args.input.resolve() in [(args.output_dir / (stem + ext)).resolve()
+        if args.logs_root is None and input_path.resolve() in [(args.output_dir / (stem + ext)).resolve()
                                     for ext in (".png", ".pdf", ".json")]:
             raise ValueError("input and output paths must be different")
         data["plot_code_sha256"] = {

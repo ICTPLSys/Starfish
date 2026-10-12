@@ -12,14 +12,18 @@ fi
 has_input=0
 for arg in "$@"; do
   case "$arg" in
-    -h|--help|--input|--input=*) has_input=1 ;;
+    -h|--help|--input|--input=*|--logs-root|--logs-root=*) has_input=1 ;;
   esac
 done
 if ((has_input)); then
-  printf 'plot source: explicit input argument\n'
+  printf 'plot source: explicit input/logs-root argument\n'
 else
   source_path=$("$PYTHON_BIN" "$ROOT/scripts/common/plot_inputs.py" figure9)
   printf 'plot source: %s\n' "$source_path"
-  set -- --input "$source_path" "$@"
+  if [[ -d "$source_path" ]]; then
+    set -- --logs-root "$source_path" "$@"
+  else
+    set -- --input "$source_path" "$@"
+  fi
 fi
 exec "$PYTHON_BIN" "$HERE/plot.py" "$@"

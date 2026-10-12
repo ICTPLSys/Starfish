@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import warnings
 
 sys.dont_write_bytecode = True
 
@@ -89,6 +90,7 @@ def prepare_rows(recovery_rows, trace_rows, recovery_digest, trace_digest,
         raise ValueError("unknown panel selection")
     recovery, definitions, comparison_kinds = {}, set(), set()
     blank_recovery = []
+    plot_warnings = []
     for line, row in recovery_rows:
         try:
             scenario = row["scenario"].lower()
@@ -213,13 +215,17 @@ def prepare_rows(recovery_rows, trace_rows, recovery_digest, trace_digest,
             raise ValueError(f"throughput CSV line {line}: {exc}") from exc
     for system in systems:
         traces[system].sort(key=lambda p: p["elapsed_s"])
+    # Keep event-order checks strict even when another required event is absent.
+    # Missing events make a trace unplottable, but must not turn into guessed
+    # anchors or synthetic recovery points.
     if events["failure"] is not None:
         for system, recovered_at in events["recovered"].items():
             if recovered_at <= events["failure"]:
                 raise ValueError(f"{system} recovered before/at failure")
-            if (system in events["rebuild_start"] and
-                    events["rebuild_start"][system] >= recovered_at):
-                raise ValueError("rebuild must start before completion")
+    for system, recovered_at in events["recovered"].items():
+        if (system in events["rebuild_start"] and
+                events["rebuild_start"][system] >= recovered_at):
+            raise ValueError("rebuild must start before completion")
     if len(definitions) > 1:
         raise ValueError("do not mix background duration and failure-to-completion bars")
     if len(comparison_kinds) > 1:
@@ -227,20 +233,74 @@ def prepare_rows(recovery_rows, trace_rows, recovery_digest, trace_digest,
     missing = [[scenario, system] for scenario in scenarios for system in systems
                if (scenario, system) not in recovery] if panels != "throughput" else []
     if missing:
-        raise ValueError(f"missing recovery conditions: {missing}; select --systems/--scenarios "
-                         "explicitly; missing is not zero")
+        plot_warnings.append(
+            f"omitting {len(missing)} missing recovery condition(s); missing is not zero: "
+            f"{missing}")
+
+    # A throughput line is independently plottable only when its observed
+    # samples have both native event anchors and complete pre/post coverage.
+    # Keep malformed supplied rows strict above; only absent evidence is
+    # tolerated here so valid recovery bars can still be rendered.
+    trace_systems = []
+    omitted_traces = {}
     if panels != "recovery":
         if events["failure"] is None:
-            raise ValueError("throughput panel requires the observed failure event")
-        for system in systems:
-            points = [p for p in traces[system] if p["normalized_throughput"] is not None]
-            if not points or system not in events["recovered"]:
-                raise ValueError(f"missing verified throughput/recovery events for {system}")
-            if not (any(p["elapsed_s"] <= events["failure"] for p in points) and
-                    any(p["elapsed_s"] >= events["recovered"][system] for p in points)):
-                raise ValueError(f"{system} trace must include pre-failure and post-rebuild samples")
+            for system in systems:
+                omitted_traces[system] = "missing observed global failure event"
+        else:
+            for system in systems:
+                points = [p for p in traces[system]
+                          if p["normalized_throughput"] is not None]
+                if not points:
+                    omitted_traces[system] = "missing observed throughput samples"
+                    continue
+                if system not in events["recovered"]:
+                    omitted_traces[system] = "missing observed rebuild-completion event"
+                    continue
+                recovered_at = events["recovered"][system]
+                if not any(p["elapsed_s"] <= events["failure"] for p in points):
+                    omitted_traces[system] = "missing complete pre-failure sample"
+                    continue
+                if not any(p["elapsed_s"] >= recovered_at for p in points):
+                    omitted_traces[system] = "missing complete post-rebuild sample"
+                    continue
+                trace_systems.append(system)
+        for system, reason in omitted_traces.items():
+            plot_warnings.append(f"omitting {system} throughput trace: {reason}")
+
+    recovery_systems = tuple(system for system in systems
+                             if any((scenario, system) in recovery for scenario in scenarios))
+    trace_systems = tuple(trace_systems)
+    has_recovery = bool(recovery)
+    has_throughput = bool(trace_systems)
+    if panels == "recovery":
+        render_panels = "recovery" if has_recovery else None
+    elif panels == "throughput":
+        render_panels = "throughput" if has_throughput else None
+    elif has_recovery and has_throughput:
+        render_panels = "both"
+    elif has_recovery:
+        render_panels = "recovery"
+    elif has_throughput:
+        render_panels = "throughput"
+    else:
+        render_panels = None
+    if render_panels is None:
+        raise ValueError("selected Figure 13 data is empty or has no plottable records")
+    if render_panels != panels:
+        plot_warnings.append(
+            f"requested {panels} panel(s); rendered only {render_panels} from plottable data")
+    if plot_warnings:
+        warnings.warn("Figure 13 partial input: " + " | ".join(plot_warnings),
+                      RuntimeWarning, stacklevel=2)
+    legend_systems = tuple(system for system in systems
+                           if system in recovery_systems or system in trace_systems)
     return {"figure": "figure13", "source_type": source_type,
             "systems": systems, "scenarios": scenarios, "panels": panels,
+            "render_panels": render_panels,
+            "recovery_systems": recovery_systems,
+            "trace_systems": trace_systems,
+            "legend_systems": legend_systems,
             "recovery_definition": next(iter(definitions), None),
             "comparison_kind": next(iter(comparison_kinds), "unspecified"),
             "recovery_input": recovery_name,
@@ -252,7 +312,9 @@ def prepare_rows(recovery_rows, trace_rows, recovery_digest, trace_digest,
             "reference_ops_per_s": reference_ops_per_s,
             "recovery": {"/".join(key): value for key, value in recovery.items()},
             "missing_recovery": missing,
-            "blank_recovery": blank_recovery, "traces": traces, "events": events}
+            "blank_recovery": blank_recovery, "traces": traces, "events": events,
+            "omitted_traces": omitted_traces, "plot_warnings": plot_warnings,
+            "partial_input": bool(plot_warnings)}
 
 
 def display_points(points, reference, average_windows):
@@ -372,9 +434,14 @@ def draw_recovery(ax, data, scale):
     offsets = (np.arange(len(systems)) - (len(systems) - 1) / 2) * width
     observed = []
     for s_idx, system in enumerate(systems):
-        values = [data["recovery"][f"{scenario}/{system}"]["recovery_s"] for scenario in scenarios]
+        present = [(idx, data["recovery"][f"{scenario}/{system}"]["recovery_s"])
+                   for idx, scenario in enumerate(scenarios)
+                   if f"{scenario}/{system}" in data["recovery"]]
+        if not present:
+            continue
+        positions, values = zip(*present)
         observed.extend(values)
-        ax.bar(x + offsets[s_idx], values, width=width,
+        ax.bar(x[list(positions)] + offsets[s_idx], values, width=width,
                color=SYSTEM_STYLES[system]["facecolor"], edgecolor="black",
                linewidth=.6 * scale, hatch=SYSTEM_STYLES[system]["hatch"])
     ax.set_title(r"$\mathbf{(b)}$", fontsize=15 * scale, pad=1.5 * scale)
@@ -390,8 +457,12 @@ def draw_recovery(ax, data, scale):
 def draw_trace(ax, data, scale, view, average_windows, bin_windows=1, display_points_count=None):
     import numpy as np
     from matplotlib.ticker import MaxNLocator
-    failure, recovered = data["events"]["failure"], data["events"]["recovered"]
-    all_times = [p["elapsed_s"] for points in data["traces"].values() for p in points]
+    systems = tuple(data.get("trace_systems", data["systems"]))
+    failure = data["events"]["failure"]
+    recovered = {system: data["events"]["recovered"][system] for system in systems}
+    all_times = [p["elapsed_s"] for system in systems for p in data["traces"][system]]
+    if failure is None or not systems or not all_times:
+        raise ValueError("selected throughput trace has no complete observed event anchors")
     if view == "zoom":
         # Preserve the paper's 18..28 display around a failure at 20 when it
         # fits; extend in 2-second steps for longer observed recovery.
@@ -407,7 +478,7 @@ def draw_trace(ax, data, scale, view, average_windows, bin_windows=1, display_po
                    linestyle="--", linewidth=(.9 if system == "carbink" else .75) * scale)
     visible = []
     markers, linestyles = ("o", "s", "D"), (":", "--", "-")
-    for system in data["systems"]:
+    for system in systems:
         points = (fixed_count_points(data["traces"][system], data["reference_ops_per_s"],
                                      display_points_count, low, high, (failure, recovered[system]))
                   if display_points_count is not None else
@@ -466,7 +537,7 @@ def draw(data, *, view="zoom", average_windows=1, bin_windows=1, display_points_
             display_points_count < 2 or average_windows != 1 or bin_windows != 1):
         raise ValueError("fixed-count display cannot be combined with another smoothing mode")
     scale = 1
-    panels = data["panels"]
+    panels = data.get("render_panels", data["panels"])
     count = 2 if panels == "both" else 1
     # Keep the original two-panel geometry. Standalone panels need enough
     # plotting area for the three-system legend, not a narrow axis under it.
@@ -492,7 +563,9 @@ def draw(data, *, view="zoom", average_windows=1, bin_windows=1, display_points_
     handles = [Patch(facecolor=SYSTEM_STYLES[system]["facecolor"], edgecolor="black",
                      hatch=SYSTEM_STYLES[system]["hatch"],
                      label=SYSTEM_STYLES[system]["label"])
-               for system in data["systems"]]
+               for system in data.get("legend_systems", data["systems"])]
+    if not handles:
+        raise ValueError("selected Figure 13 data has no systems to draw")
     fig.legend(handles=handles, loc="upper center",
                bbox_to_anchor=(.43 if count == 2 else .52, .995),
                ncol=len(handles), frameon=False, fontsize=13.5 * scale,
@@ -500,7 +573,8 @@ def draw(data, *, view="zoom", average_windows=1, bin_windows=1, display_points_
     fig.subplots_adjust(left=.125 if count == 2 else .18, right=.995,
                         bottom=.18 if count == 2 else .19,
                         top=.66 if count == 2 else .74, wspace=.40)
-    data.update(plot_style="paper", view=view, average_windows=average_windows,
+    data.update(plot_style="paper", view=view, rendered_panels=panels,
+                average_windows=average_windows,
                 display_points_target=display_points_count,
                 point_aggregation="none" if display_points_count is None else
                 "fixed_count_nonoverlapping_native_windows_duration_weighted_reset_at_events_and_gaps",

@@ -71,7 +71,12 @@ def resolve(figure: str) -> Path:
         batch = latest_batch(ROOT / "results/figure9", figure)
         path = batch / "figure9.csv"
         if not measured_csv(path, {"workload", "system", "ratio", "elapsed_s"}):
-            fail(figure, f"newest batch has no measured CSV: {batch}")
+            # An interrupted batch may already contain verified cases but
+            # never have reached its final CSV collection step.
+            runs = batch / "runs"
+            if any(runs.rglob("analysis.json")):
+                return runs
+            fail(figure, f"newest batch has no measured CSV or finalized cases: {batch}")
         return path
     if figure == "figure10":
         batch = latest_batch(ROOT / "results/figure10", figure)

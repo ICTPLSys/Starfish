@@ -194,6 +194,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         data = prepare(args.input, args.source_type)
+        if not any(point["p99_latency"] is not None
+                   for points in data["series"].values() for point in points):
+            raise ValueError("no verified latency values to plot; missing is not zero")
+        if data["missing_series"]:
+            print("warning: Figure 10 is partial; missing series: "
+                  + ", ".join(data["missing_series"]), file=sys.stderr)
         if args.validate_only:
             print(f"validated {data['input_rows']} rows")
             return 0

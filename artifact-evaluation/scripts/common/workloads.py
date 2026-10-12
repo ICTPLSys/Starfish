@@ -749,13 +749,40 @@ def _parse_mg(log: str) -> dict:
 
 
 def _wc_result_with_known_interleave(log: str, result: re.Match[str]) -> tuple[int, str]:
-    """Rejoin one known sampler-interleaved WC result without consuming logs."""
+    """Rejoin adjacent WC fragments separated only by complete sampler records.
+
+    A sampler can interrupt any field, key or value, more than once. Preserve
+    fragment whitespace and digits exactly; do not guess a missing separator
+    or search elsewhere in the log for a matching suffix.
+    """
     prefix = result.group(0).rstrip("\r")
-    fields = _fields(prefix)
-    if all(name in fields for name in (
-            "file", "bytes", "threads", "total_words", "unique_words",
-            "hashmap_size", "checksum")):
-        return result.start(), prefix
+    schema = (
+        ("file", r"\S+", r"\S*"),
+        ("bytes", r"\d+", r"\d*"),
+        ("threads", r"\d+", r"\d*"),
+        ("total_words", r"\d+", r"\d*"),
+        ("unique_words", r"\d+", r"\d*"),
+        ("hashmap_size", r"\d+", r"\d*"),
+        ("checksum", r"0x[0-9a-fA-F]+", r"(?:|0|0x[0-9a-fA-F]*)"),
+        ("too_long_words", r"\d+", r"\d*"),
+        ("max_word_len", r"\d+", r"\d*"),
+        ("remote_used_bytes", r"\d+", r"\d*"),
+    )
+    complete_pattern = re.escape("wordcount_far_result")
+    prefix_patterns = [complete_pattern]
+    for key, value_pattern, partial_value in schema:
+        literal = " " + key + "="
+        # Partial keys are valid too: e.g. "remote_used_" / "bytes=123".
+        prefix_patterns.extend(
+            complete_pattern + re.escape(literal[:length])
+            for length in range(1, len(literal)))
+        prefix_patterns.append(
+            complete_pattern + re.escape(literal) + partial_value)
+        complete_pattern += re.escape(literal) + value_pattern
+    complete = re.compile(complete_pattern)
+    partial = re.compile("|".join(prefix_patterns))
+    if not partial.fullmatch(prefix):
+        raise ValueError("WC result: malformed result fragment")
 
     lines = log.splitlines(keepends=True)
     line_index = log.count("\n", 0, result.start())
@@ -814,53 +841,40 @@ def _wc_result_with_known_interleave(log: str, result: re.Match[str]) -> tuple[i
         # Unknown additive key=value fields remain allowed for forward
         # compatibility; required fields and duplicate keys stay strict.
         return set(required) <= fields.keys()
-    end = line_index + 1
-    sampler_records = 0
-    while end < len(lines):
-        line = lines[end].strip()
-        if not line:
-            end += 1
-            continue
-        if is_known_sampler(line):
+    cursor = line_index + 1
+    assembled = prefix
+    while cursor < len(lines):
+        sampler_records = 0
+        while cursor < len(lines):
+            line = lines[cursor].strip()
+            # The sampler emits blank framing lines. They are only ignored
+            # as part of a block that contains at least one validated record.
+            if not line:
+                cursor += 1
+                continue
+            if not is_known_sampler(line):
+                break
             sampler_records += 1
-            end += 1
-            continue
-        break
-    if sampler_records == 0 or end >= len(lines):
-        return result.start(), prefix
-
-    prefix_complete = re.fullmatch(
-        r"wordcount_far_result file=\S+ bytes=\d+ threads=\d+ "
-        r"total_words=\d+ unique_words=\d+ hashmap_size=\d+",
-        prefix)
-    prefix_unique_split = re.fullmatch(
-        r"wordcount_far_result file=\S+ bytes=\d+ threads=\d+ "
-        r"total_words=\d+ unique_words=",
-        prefix)
-    suffix = lines[end].strip()
-    suffix_checksum = re.compile(
-        r"checksum=0x[0-9a-fA-F]+ too_long_words=\d+ "
-        r"max_word_len=\d+ remote_used_bytes=\d+$")
-    suffix_unique = re.compile(
-        r"\d+ hashmap_size=\d+ checksum=0x[0-9a-fA-F]+ "
-        r"too_long_words=\d+ max_word_len=\d+ remote_used_bytes=\d+$")
-    suffix_candidates = []
-    for line in lines:
-        candidate = line.strip()
-        if suffix_checksum.fullmatch(candidate):
-            suffix_candidates.append(("checksum", candidate))
-        if suffix_unique.fullmatch(candidate):
-            suffix_candidates.append(("unique", candidate))
-    if len(suffix_candidates) != 1:
-        raise ValueError("WC result: expected exactly one complete suffix")
-    suffix_kind, suffix_candidate = suffix_candidates[0]
-    if suffix_candidate != suffix:
-        return result.start(), prefix
-    if prefix_complete and suffix_kind == "checksum":
-        return result.start(), prefix + " " + suffix
-    if prefix_unique_split and suffix_kind == "unique":
-        return result.start(), prefix + suffix
-    return result.start(), prefix
+            cursor += 1
+        if sampler_records == 0:
+            if complete.fullmatch(assembled):
+                return result.start(), assembled
+            raise ValueError("WC result: interrupted by an unknown record")
+        if cursor >= len(lines):
+            break
+        continuation = assembled + lines[cursor].rstrip("\r\n")
+        cursor += 1
+        if not partial.fullmatch(continuation):
+            # A complete result can be followed by sampler diagnostics and an
+            # unrelated next record. Conversely, a partial final numeric value
+            # already matches the complete grammar: extend it when possible.
+            if complete.fullmatch(assembled):
+                return result.start(), assembled
+            raise ValueError("WC result: malformed result continuation")
+        assembled = continuation
+    if complete.fullmatch(assembled):
+        return result.start(), assembled
+    raise ValueError("WC result: incomplete sampler-interleaved result")
 
 
 def _parse_wc(log: str, expected_checksum: str | None) -> dict:

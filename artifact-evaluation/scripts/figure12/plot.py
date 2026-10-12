@@ -47,12 +47,16 @@ def prepare(path: Path, source_type="measured", *, apps=WORKLOADS, metrics="all"
 
 
 def prepare_logs(logs_root: Path, *, ratio=25, repeat=1, apps=WORKLOADS, metrics="all"):
-    from figure12.collect import collect_rows
-    rows = collect_rows(logs_root, ratio=ratio, repeat=repeat, metrics=metrics)
+    from figure12.collect import collect_rows, skipped_warnings
+    rows, skipped = collect_rows(logs_root, ratio=ratio, repeat=repeat,
+                                 metrics=metrics, include_skips=True)
     digest = hashlib.sha256(
         json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     data = prepare_rows(list(enumerate(rows, 1)), digest,
                         str(logs_root.resolve()), "measured", apps=apps, metrics=metrics)
+    data["skipped_conditions"] = skipped
+    data["warnings"] = sorted(set(data.get("warnings", ())) |
+                              set(skipped_warnings(skipped)))
     data.update(input_format="ae_run_directories",
                 input_hash_scope="canonical_collected_rows",
                 ratio=ratio, repeat=repeat,
@@ -234,17 +238,19 @@ def prepare_rows(numbered_rows, digest, input_name, source_type="measured",
                            **ec_record}
         except (KeyError, ValueError) as exc:
             raise ValueError(f"input row {line}: {exc}") from exc
-    missing = [[w, s, m] for w in apps for s in SYSTEMS
-               for m in selected if (w, s, m) not in values]
-    if missing:
-        raise ValueError(f"missing {len(missing)} selected conditions: {missing}; "
-                         "select --apps/--metrics explicitly; missing is not zero")
+    expected = [(w, s, m) for w in apps for s in SYSTEMS for m in selected]
+    missing = [[w, s, m] for w, s, m in expected if (w, s, m) not in values]
+    if not values:
+        raise ValueError("no nonblank values in the selected workloads/metrics")
+    warnings = ([f"{len(missing)} selected conditions missing; "
+                 "omitted rather than treated as zero"] if missing else [])
     result = {"figure": "figure12", "input": input_name, "input_sha256": digest,
               "source_type": source_type, "metric_units": {m: METRICS[m] for m in selected},
               "workloads": apps, "metrics": selected, "cycle_clock": "tsc",
               "input_rows": len(numbered_rows), "blank_rows": blanks,
               "missing_conditions": missing,
-              "values": {"/".join(key): record for key, record in values.items()}}
+              "values": {"/".join(key): values.get(key) for key in expected},
+              "warnings": warnings}
     if "local_ec_cpu_cycles" in selected:
         result.update(
             ec_measurement_basis=(next(iter(ec_bases)) if len(ec_bases) == 1 else None),
@@ -273,24 +279,50 @@ def draw(data):
                                 1.2, [0, .5, 1]),
         "metadata_space_pct": ("Metadata space", "% app memory", 10., [0, 5, 10]),
     }
-    displayed = {}
+    displayed = {
+        f"{workload}/{system}/{metric}": None
+        for workload in apps for system in SYSTEMS for metric in metrics
+    }
     denominators = {}
+    missing_baselines = []
+    warnings = set(data.get("warnings", ()))
     for ax, metric in zip(axes, metrics):
         title, ylabel, upper, ticks = labels[metric]
         maximum = 0.
+        plotted = False
+        ec_denominators = {}
+        if metric == "local_ec_cpu_cycles":
+            for workload in apps:
+                baseline = data["values"].get(f"{workload}/carbink/{metric}")
+                if baseline is None:
+                    missing_baselines.append(workload)
+                    warnings.add(
+                        f"{workload}: Carbink EC baseline is missing; "
+                        "EC bars omitted")
+                    continue
+                denominator = baseline["value"]
+                if denominator <= 0:
+                    plt.close(fig)
+                    raise ValueError(f"{workload}: Carbink EC cycles must be positive for normalization")
+                ec_denominators[workload] = denominator
+                denominators[workload] = denominator
         for s_idx, system in enumerate(SYSTEMS):
             for app_idx, workload in enumerate(apps):
-                record = data["values"][f"{workload}/{system}/{metric}"]
+                key = f"{workload}/{system}/{metric}"
+                record = data["values"].get(key)
+                if record is None:
+                    continue
                 value = record["value"]
                 if metric == "local_ec_cpu_cycles":
-                    denominator = data["values"][f"{workload}/carbink/{metric}"]["value"]
-                    if denominator <= 0:
-                        plt.close(fig)
-                        raise ValueError(f"{workload}: Carbink EC cycles must be positive for normalization")
-                    denominators[workload] = denominator
+                    denominator = ec_denominators.get(workload)
+                    if denominator is None:
+                        # A Starfish point cannot be normalized without its
+                        # same-workload Carbink baseline; missing is not zero.
+                        continue
                     value /= denominator
                 maximum = max(maximum, value)
-                displayed[f"{workload}/{system}/{metric}"] = value
+                displayed[key] = value
+                plotted = True
                 position = x[app_idx] + (-width / 2 if s_idx == 0 else width / 2)
                 ax.bar(position, value, width=width,
                        color=SYSTEM_STYLES[system]["facecolor"],
@@ -304,9 +336,15 @@ def draw(data):
             spine.set_linewidth(1.4)
             spine.set_color("black")
         ax.set_ylim(0, upper)
-        ax.set_yticks(ticks)
-        ax.grid(axis="y", linestyle="--", alpha=.5, linewidth=1.)
-        ax.axhline(1., color="#555555", linewidth=.8, linestyle="--", zorder=0)
+        if plotted:
+            ax.set_yticks(ticks)
+            ax.grid(axis="y", linestyle="--", alpha=.5, linewidth=1.)
+            ax.axhline(1., color="#555555", linewidth=.8, linestyle="--", zorder=0)
+        else:
+            # Keep the selected panel and units visible without implying a
+            # zero-valued measurement when no displayable point exists.
+            ax.set_yticks([])
+            ax.grid(axis="y", visible=False)
         ax.set_axisbelow(True)
         ax.set_ylabel(ylabel, fontsize=11, labelpad=3)
         ax.set_title(title, fontsize=11, pad=2)
@@ -322,6 +360,13 @@ def draw(data):
                    ncol=2, frameon=False, fontsize=10.5)
     fig.subplots_adjust(left=.19, right=.995, bottom=.25, top=.82, hspace=.45)
     data["display_values"] = displayed
+    data["warnings"] = sorted(warnings)
+    data["ec_display_missing_baselines"] = missing_baselines
+    data["ec_display_omitted_conditions"] = [
+        f"{workload}/{system}/local_ec_cpu_cycles"
+        for workload in missing_baselines for system in SYSTEMS
+        if data["values"].get(f"{workload}/{system}/local_ec_cpu_cycles") is not None
+    ]
     data["ec_display_normalization"] = "same_workload_carbink_ec_cycles"
     data["ec_display_denominator_bases"] = {
         workload: data["values"][f"{workload}/carbink/local_ec_cpu_cycles"].get(
@@ -358,11 +403,15 @@ def main(argv=None):
         else:
             data = prepare(args.input, args.source_type, apps=apps, metrics=args.metrics)
         if args.validate_only:
+            for warning in data.get("warnings", ()):
+                print(f"warning: {warning}", file=sys.stderr)
             print(f"validated {data['input_rows']} rows")
             return 0
         data["plot_code_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         fig = draw(data)
         try:
+            for warning in data.get("warnings", ()):
+                print(f"warning: {warning}", file=sys.stderr)
             stem = "figure12" + ("" if args.source_type == "measured"
                                 else "-" + args.source_type)
             for output in export_figure(fig, args.output_dir, stem, data):
