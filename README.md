@@ -40,9 +40,9 @@ prepared artifact directory and site configuration in the AE discussion.
 
 The [`Starfish/`](Starfish) Git submodule points to
 [SSK015/Starfish](https://github.com/SSK015/Starfish), the standalone Starfish
-runtime. It does not include the baselines or the complete evaluation environment.
-The full paper artifact remains under `artifact-evaluation/`; its existing files
-are unchanged by the runtime extraction.
+runtime repository. We plan to keep developing and maintaining it over the long
+term. The `artifact-evaluation/` directory preserves the code used for the
+ATC 2026 artifact evaluation.
 
 Clone the repository with its runtime submodule:
 
