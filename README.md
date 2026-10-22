@@ -5,6 +5,15 @@ and Performance Overhead** (ATC 2026; paper supplied with the AE submission).
 By Yanwen Xia, Benyong Deng, Hong Huang, Yuzheng Wang, Quanxi Li, Xingda Wei,
 Xiaobing Feng, Huimin Cui, and Chenxi Wang.
 
+<p>
+  <a href="https://sysartifacts.github.io/atc2026/results"><img src="https://sysartifacts.github.io/images/acm_available_1.1.png" alt="Artifacts Available" width="100"></a>
+  <a href="https://sysartifacts.github.io/atc2026/results"><img src="https://sysartifacts.github.io/images/acm_functional_1.1.png" alt="Artifacts Evaluated - Functional" width="100"></a>
+  <a href="https://sysartifacts.github.io/atc2026/results"><img src="https://sysartifacts.github.io/images/acm_reproduced_1.1.png" alt="Results Reproduced" width="100"></a>
+</p>
+
+The ATC 2026 artifact received **Available, Functional, and Reproduced** badges.
+See the [official results](https://sysartifacts.github.io/atc2026/results).
+
 Our code uses [Apache-2.0](LICENSE); third-party code and inputs retain their
 own licenses, including GPL-3.0 for libfibre.
 
@@ -26,6 +35,26 @@ matching private key on your own machine; never post or upload it. If the key
 is not a default SSH identity, configure `IdentityFile` for both the jump host
 and compute host in your local SSH config. The authors will provide the
 prepared artifact directory and site configuration in the AE discussion.
+
+## Standalone runtime
+
+The [`Starfish/`](Starfish) Git submodule points to
+[SSK015/Starfish](https://github.com/SSK015/Starfish), the standalone Starfish
+runtime. It does not include the baselines or the complete evaluation environment.
+The full paper artifact remains under `artifact-evaluation/`; its existing files
+are unchanged by the runtime extraction.
+
+Clone the repository with its runtime submodule:
+
+```bash
+git clone --recurse-submodules https://github.com/ICTPLSys/Starfish.git
+```
+
+For an existing checkout, initialize the runtime submodule with:
+
+```bash
+git submodule update --init Starfish
+```
 
 ## Overview
 
